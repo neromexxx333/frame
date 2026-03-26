@@ -5,8 +5,12 @@ Jalankan dengan:
     streamlit run streamlit_app.py
 """
 
-import os
 import io
+import base64
+import html
+import json
+import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from main import PortalReliabilityAnalysis
 from modules.excel_reader import ExcelReader
@@ -35,6 +40,7 @@ BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
     / CALIBRATION_REFERENCE_NUM_SIMULATIONS,
     1e-9
 )
+ZOOMABLE_PLOT_VIEWER_HEIGHT = 540
 
 HEADER_GROUP_PALETTES = {
     'default': {
@@ -1687,9 +1693,422 @@ def run_analysis_dashboard(input_file: str,
     return analysis
 
 
-def render_plot(fig):
+def sanitize_dom_id(value: str) -> str:
+    """Ubah key menjadi DOM id yang aman untuk HTML/JS."""
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', str(value).strip())
+    sanitized = sanitized.strip('-')
+    return sanitized or "zoomable-plot"
+
+
+def figure_to_png_data_uri(fig,
+                           image_dpi: int = 220,
+                           tight_bbox: bool = True) -> str:
+    """Konversi figure matplotlib menjadi PNG data URI resolusi tinggi."""
+    image_buffer = io.BytesIO()
+    save_kwargs = {
+        'format': 'png',
+        'dpi': image_dpi,
+        'facecolor': 'white'
+    }
+    if tight_bbox:
+        save_kwargs['bbox_inches'] = 'tight'
+    fig.savefig(image_buffer, **save_kwargs)
+    image_buffer.seek(0)
+    image_bytes = image_buffer.getvalue()
+    return "data:image/png;base64," + base64.b64encode(image_bytes).decode('ascii')
+
+
+def render_zoomable_plot(fig,
+                         viewer_key: str,
+                         alt_text: str = "Plot simulasi terakhir",
+                         viewer_height: int = ZOOMABLE_PLOT_VIEWER_HEIGHT,
+                         tight_bbox: bool = True) -> None:
+    """Render plot sebagai viewer interaktif dengan zoom/pan untuk desktop dan HP."""
+    viewer_id = sanitize_dom_id(viewer_key)
+    image_src = figure_to_png_data_uri(fig, tight_bbox=tight_bbox)
+    safe_alt_text = html.escape(alt_text, quote=True)
+    viewer_markup = f"""
+    <!DOCTYPE html>
+    <html lang="id">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <style>
+        html, body {{
+          margin: 0;
+          padding: 0;
+          height: 100%;
+          overflow: hidden;
+          background: #ffffff;
+          font-family: "Segoe UI", sans-serif;
+        }}
+        .plot-viewer-root {{
+          height: 100%;
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
+          padding: 0.1rem 0;
+          box-sizing: border-box;
+          color: #111827;
+        }}
+        .plot-viewer-toolbar {{
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.5rem;
+          font-size: 0.88rem;
+        }}
+        .plot-viewer-toolbar strong {{
+          font-weight: 700;
+        }}
+        .plot-viewer-buttons {{
+          display: flex;
+          align-items: center;
+          gap: 0.35rem;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }}
+        .plot-viewer-button {{
+          border: 1px solid #cbd5e1;
+          background: #f8fafc;
+          color: #0f172a;
+          border-radius: 0.6rem;
+          min-width: 2.2rem;
+          height: 2.1rem;
+          padding: 0 0.7rem;
+          font-size: 0.92rem;
+          font-weight: 600;
+          cursor: pointer;
+        }}
+        .plot-viewer-button:active {{
+          background: #e2e8f0;
+        }}
+        .plot-viewer-viewport {{
+          position: relative;
+          flex: 1 1 auto;
+          min-height: 0;
+          overflow: hidden;
+          border: 1px solid #d1d5db;
+          border-radius: 0.9rem;
+          background:
+            linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
+          touch-action: none;
+          user-select: none;
+          cursor: grab;
+        }}
+        .plot-viewer-viewport.is-dragging {{
+          cursor: grabbing;
+        }}
+        .plot-viewer-anchor {{
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          transform: translate(-50%, -50%);
+        }}
+        .plot-viewer-stage {{
+          transform-origin: center center;
+          will-change: transform;
+        }}
+        .plot-viewer-stage img {{
+          display: block;
+          max-width: none;
+          width: auto;
+          height: auto;
+          user-select: none;
+          -webkit-user-drag: none;
+          pointer-events: none;
+        }}
+        .plot-viewer-hint {{
+          font-size: 0.76rem;
+          color: #6b7280;
+          line-height: 1.35;
+        }}
+      </style>
+    </head>
+    <body>
+      <div id="{viewer_id}" class="plot-viewer-root">
+        <div class="plot-viewer-toolbar">
+          <div>Zoom: <strong class="plot-viewer-zoom-label">100%</strong></div>
+          <div class="plot-viewer-buttons">
+            <button type="button" class="plot-viewer-button" data-action="zoom-out">-</button>
+            <button type="button" class="plot-viewer-button" data-action="zoom-in">+</button>
+            <button type="button" class="plot-viewer-button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="plot-viewer-viewport">
+          <div class="plot-viewer-anchor">
+            <div class="plot-viewer-stage">
+              <img src="{image_src}" alt="{safe_alt_text}" draggable="false" />
+            </div>
+          </div>
+        </div>
+        <div class="plot-viewer-hint">
+          Desktop: scroll mouse untuk zoom, drag untuk geser, double click untuk reset.
+          HP: pinch untuk zoom, geser untuk pan, tombol Reset untuk kembali ke ukuran awal.
+        </div>
+      </div>
+      <script>
+        (() => {{
+          const root = document.getElementById({json.dumps(viewer_id)});
+          if (!root) return;
+
+          const viewport = root.querySelector('.plot-viewer-viewport');
+          const stage = root.querySelector('.plot-viewer-stage');
+          const img = root.querySelector('img');
+          const zoomLabel = root.querySelector('.plot-viewer-zoom-label');
+          const zoomInButton = root.querySelector('[data-action="zoom-in"]');
+          const zoomOutButton = root.querySelector('[data-action="zoom-out"]');
+          const resetButton = root.querySelector('[data-action="reset"]');
+          const maxUserScale = 8;
+
+          let fitScale = 1;
+          let userScale = 1;
+          let translateX = 0;
+          let translateY = 0;
+          let isMouseDragging = false;
+          let mouseStartX = 0;
+          let mouseStartY = 0;
+          let mouseStartTranslateX = 0;
+          let mouseStartTranslateY = 0;
+          let lastTouchX = 0;
+          let lastTouchY = 0;
+          let pinchDistance = null;
+          let pinchCenter = null;
+
+          function clamp(value, minValue, maxValue) {{
+            return Math.min(maxValue, Math.max(minValue, value));
+          }}
+
+          function getDistance(touchA, touchB) {{
+            return Math.hypot(
+              touchB.clientX - touchA.clientX,
+              touchB.clientY - touchA.clientY
+            );
+          }}
+
+          function getTouchCenter(touchA, touchB) {{
+            return {{
+              x: (touchA.clientX + touchB.clientX) / 2,
+              y: (touchA.clientY + touchB.clientY) / 2
+            }};
+          }}
+
+          function getViewportCenter() {{
+            const rect = viewport.getBoundingClientRect();
+            return {{
+              x: rect.left + rect.width / 2,
+              y: rect.top + rect.height / 2
+            }};
+          }}
+
+          function getDisplayedMetrics(scaleValue = userScale) {{
+            const rect = viewport.getBoundingClientRect();
+            const naturalWidth = img.naturalWidth || 1;
+            const naturalHeight = img.naturalHeight || 1;
+            const totalScale = fitScale * scaleValue;
+            return {{
+              rect,
+              width: naturalWidth * totalScale,
+              height: naturalHeight * totalScale,
+              totalScale
+            }};
+          }}
+
+          function constrainTranslation() {{
+            const metrics = getDisplayedMetrics();
+            const maxX = Math.max((metrics.width - metrics.rect.width) / 2, 0);
+            const maxY = Math.max((metrics.height - metrics.rect.height) / 2, 0);
+            translateX = clamp(translateX, -maxX, maxX);
+            translateY = clamp(translateY, -maxY, maxY);
+          }}
+
+          function updateStage() {{
+            constrainTranslation();
+            const totalScale = fitScale * userScale;
+            stage.style.transform = `translate(${{translateX}}px, ${{translateY}}px) scale(${{totalScale}})`;
+            zoomLabel.textContent = `${{Math.round(userScale * 100)}}%`;
+          }}
+
+          function recomputeFitScale() {{
+            const rect = viewport.getBoundingClientRect();
+            const naturalWidth = img.naturalWidth || 1;
+            const naturalHeight = img.naturalHeight || 1;
+            if (rect.width <= 0 || rect.height <= 0) {{
+              return;
+            }}
+            fitScale = Math.min(
+              rect.width / naturalWidth,
+              rect.height / naturalHeight
+            );
+          }}
+
+          function resetView() {{
+            recomputeFitScale();
+            userScale = 1;
+            translateX = 0;
+            translateY = 0;
+            updateStage();
+          }}
+
+          function setScaleAt(nextScale, clientX, clientY) {{
+            const rect = viewport.getBoundingClientRect();
+            const clampedScale = clamp(nextScale, 1, maxUserScale);
+            const previousScale = userScale;
+            if (Math.abs(clampedScale - previousScale) < 1e-6) {{
+              return;
+            }}
+
+            const previousTotalScale = fitScale * previousScale;
+            const nextTotalScale = fitScale * clampedScale;
+            const offsetX = clientX - rect.left - (rect.width / 2) - translateX;
+            const offsetY = clientY - rect.top - (rect.height / 2) - translateY;
+            const scaleRatio = nextTotalScale / previousTotalScale;
+
+            translateX -= offsetX * (scaleRatio - 1);
+            translateY -= offsetY * (scaleRatio - 1);
+            userScale = clampedScale;
+            updateStage();
+          }}
+
+          function stopMouseDrag() {{
+            isMouseDragging = false;
+            viewport.classList.remove('is-dragging');
+          }}
+
+          img.addEventListener('load', resetView);
+          zoomInButton.addEventListener('click', () => {{
+            const center = getViewportCenter();
+            setScaleAt(userScale * 1.25, center.x, center.y);
+          }});
+          zoomOutButton.addEventListener('click', () => {{
+            const center = getViewportCenter();
+            setScaleAt(userScale / 1.25, center.x, center.y);
+          }});
+          resetButton.addEventListener('click', resetView);
+
+          viewport.addEventListener('wheel', (event) => {{
+            event.preventDefault();
+            const wheelFactor = event.deltaY < 0 ? 1.12 : (1 / 1.12);
+            setScaleAt(userScale * wheelFactor, event.clientX, event.clientY);
+          }}, {{ passive: false }});
+
+          viewport.addEventListener('mousedown', (event) => {{
+            event.preventDefault();
+            isMouseDragging = true;
+            mouseStartX = event.clientX;
+            mouseStartY = event.clientY;
+            mouseStartTranslateX = translateX;
+            mouseStartTranslateY = translateY;
+            viewport.classList.add('is-dragging');
+          }});
+
+          window.addEventListener('mousemove', (event) => {{
+            if (!isMouseDragging) {{
+              return;
+            }}
+            translateX = mouseStartTranslateX + (event.clientX - mouseStartX);
+            translateY = mouseStartTranslateY + (event.clientY - mouseStartY);
+            updateStage();
+          }});
+
+          window.addEventListener('mouseup', stopMouseDrag);
+          viewport.addEventListener('mouseleave', stopMouseDrag);
+          viewport.addEventListener('dblclick', resetView);
+
+          viewport.addEventListener('touchstart', (event) => {{
+            if (event.touches.length === 1) {{
+              const touch = event.touches[0];
+              lastTouchX = touch.clientX;
+              lastTouchY = touch.clientY;
+              pinchDistance = null;
+              pinchCenter = null;
+            }} else if (event.touches.length >= 2) {{
+              const [touchA, touchB] = event.touches;
+              pinchDistance = getDistance(touchA, touchB);
+              pinchCenter = getTouchCenter(touchA, touchB);
+            }}
+          }}, {{ passive: true }});
+
+          viewport.addEventListener('touchmove', (event) => {{
+            event.preventDefault();
+
+            if (event.touches.length === 1) {{
+              const touch = event.touches[0];
+              translateX += touch.clientX - lastTouchX;
+              translateY += touch.clientY - lastTouchY;
+              lastTouchX = touch.clientX;
+              lastTouchY = touch.clientY;
+              updateStage();
+              return;
+            }}
+
+            if (event.touches.length >= 2) {{
+              const [touchA, touchB] = event.touches;
+              const center = getTouchCenter(touchA, touchB);
+              const nextDistance = getDistance(touchA, touchB);
+
+              if (pinchDistance !== null && pinchCenter !== null && pinchDistance > 0) {{
+                const pinchFactor = nextDistance / pinchDistance;
+                setScaleAt(userScale * pinchFactor, center.x, center.y);
+                translateX += center.x - pinchCenter.x;
+                translateY += center.y - pinchCenter.y;
+                updateStage();
+              }}
+
+              pinchDistance = nextDistance;
+              pinchCenter = center;
+            }}
+          }}, {{ passive: false }});
+
+          viewport.addEventListener('touchend', (event) => {{
+            if (event.touches.length === 1) {{
+              const touch = event.touches[0];
+              lastTouchX = touch.clientX;
+              lastTouchY = touch.clientY;
+            }} else if (event.touches.length === 0) {{
+              pinchDistance = null;
+              pinchCenter = null;
+            }}
+          }});
+
+          if (window.ResizeObserver) {{
+            const resizeObserver = new ResizeObserver(() => {{
+              const previousUserScale = userScale;
+              recomputeFitScale();
+              userScale = previousUserScale;
+              updateStage();
+            }});
+            resizeObserver.observe(viewport);
+          }}
+
+          if (img.complete) {{
+            resetView();
+          }}
+        }})();
+      </script>
+    </body>
+    </html>
+    """
+    components.html(viewer_markup, height=viewer_height, scrolling=False)
+
+
+def render_plot(fig,
+                interactive: bool = False,
+                viewer_key: Optional[str] = None,
+                alt_text: str = "Plot simulasi terakhir",
+                viewer_height: int = ZOOMABLE_PLOT_VIEWER_HEIGHT,
+                tight_bbox: bool = True) -> None:
     """Tampilkan plot matplotlib dan tutup figure setelah dirender."""
-    st.pyplot(fig, clear_figure=True, use_container_width=True)
+    if interactive:
+        render_zoomable_plot(
+            fig,
+            viewer_key=viewer_key or f"plot-{id(fig)}",
+            alt_text=alt_text,
+            viewer_height=viewer_height,
+            tight_bbox=tight_bbox
+        )
+    else:
+        st.pyplot(fig, clear_figure=True, use_container_width=True)
     plt.close(fig)
 
 
@@ -2442,14 +2861,34 @@ def build_interaction_diagram_figure(input_data: Dict,
                 label='Boundary exact (c)'
             )
 
+    full_view_x_values = moment_values + [max_moment, line_target_moment]
+    full_view_y_values = axial_values + [demand_axial, line_target_axial]
+    if exact_boundary_moment is not None and exact_boundary_axial is not None:
+        full_view_x_values.append(exact_boundary_moment)
+        full_view_y_values.append(exact_boundary_axial)
+
+    full_x_min = min(0.0, min(full_view_x_values))
+    full_x_max = max(full_view_x_values)
+    full_y_min = min(0.0, min(full_view_y_values))
+    full_y_max = max(full_view_y_values)
+    full_x_span = max(full_x_max - full_x_min, 1.0)
+    full_y_span = max(full_y_max - full_y_min, 1.0)
+    full_x_padding = max(15.0, 0.08 * full_x_span)
+    full_y_padding = max(60.0, 0.08 * full_y_span)
+    axes[0].set_xlim(max(0.0, full_x_min - full_x_padding), full_x_max + full_x_padding)
+    axes[0].set_ylim(full_y_min - full_y_padding, full_y_max + full_y_padding)
+
     line_mid_x = 0.5 * line_target_moment
     line_mid_y = 0.5 * line_target_axial
     axes[0].annotate(
         f"Demand\nM={max_moment:.2f} kN.m\nP={demand_axial:.2f} kN",
         xy=(max_moment, demand_axial),
-        xytext=(max_moment + max(12.0, 0.08 * max(moment_values or [1.0])), demand_axial),
+        xytext=(12, 12),
+        textcoords='offset points',
         arrowprops=dict(arrowstyle='->', color='#d62828', lw=1.0),
-        fontsize=8
+        fontsize=8,
+        ha='left',
+        va='bottom'
     )
     if exact_boundary_moment is not None and exact_boundary_axial is not None and c_boundary_exact is not None:
         axes[0].annotate(
@@ -2460,12 +2899,12 @@ def build_interaction_diagram_figure(input_data: Dict,
                 f"c={c_boundary_exact:.3f} mm"
             ),
             xy=(exact_boundary_moment, exact_boundary_axial),
-            xytext=(
-                exact_boundary_moment - max(35.0, 0.10 * max(moment_values or [1.0])),
-                exact_boundary_axial + max(60.0, 0.08 * max(abs(value) for value in axial_values or [1.0]))
-            ),
+            xytext=(-14, 14),
+            textcoords='offset points',
             arrowprops=dict(arrowstyle='->', color='#7c3aed', lw=1.0),
-            fontsize=8
+            fontsize=8,
+            ha='right',
+            va='bottom'
         )
     axes[0].text(
         line_mid_x,
@@ -2477,7 +2916,7 @@ def build_interaction_diagram_figure(input_data: Dict,
         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85, edgecolor='#9ca3af')
     )
     axes[0].set_title(f'Diagram Interaksi Elemen {elem_id}')
-    axes[0].legend(loc='best', fontsize=8)
+    axes[0].legend(loc='upper right', fontsize=8)
 
     zoom_x_values = [max_moment, line_target_moment]
     zoom_y_values = [demand_axial, line_target_axial]
@@ -2536,7 +2975,7 @@ def build_interaction_diagram_figure(input_data: Dict,
         fontsize=11,
         y=0.98
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.subplots_adjust(left=0.07, right=0.98, bottom=0.11, top=0.89, wspace=0.18)
 
     return {
         'figure': fig,
@@ -2820,15 +3259,23 @@ analysis_input_data = (
     input_data
 )
 
-tab_input, tab_output, tab_plot, tab_interaction, tab_report = st.tabs([
+dashboard_tabs = [
     "Input",
     "Output",
     "Plot Simulasi Terakhir",
     "Kurva Interaksi",
     "Laporan"
-])
+]
+active_dashboard_tab = st.radio(
+    "Navigasi Dashboard",
+    options=dashboard_tabs,
+    index=0,
+    horizontal=True,
+    key="active_dashboard_tab",
+    label_visibility="collapsed"
+)
 
-with tab_input:
+if active_dashboard_tab == "Input":
     input_plot_nodes = preview_portal_nodes if preview_portal_nodes is not None else portal_nodes
     input_plot_elements = preview_portal_elements if preview_portal_elements is not None else portal_elements
 
@@ -2944,7 +3391,7 @@ with tab_input:
             else:
                 render_input_table(live_load_df)
 
-with tab_output:
+elif active_dashboard_tab == "Output":
     if latest_result is None:
         st.info("Output akan tersedia setelah analisis dijalankan.")
     else:
@@ -3096,7 +3543,7 @@ with tab_output:
                 styler=style_limit_state_performance_df(table_df)
             )
 
-with tab_plot:
+elif active_dashboard_tab == "Plot Simulasi Terakhir":
     if latest_result is None:
         st.info("Plot hasil analisis akan tersedia setelah analisis dijalankan.")
     else:
@@ -3108,22 +3555,33 @@ with tab_plot:
         max_displacement = PortalPlotter.get_max_translational_displacement(
             latest_result['displacements']
         )
+        persisted_scale_multiplier = float(
+            st.session_state.get('plot_scale_multiplier', 1.0)
+        )
         scale_multiplier = st.slider(
             "Pengali skala otomatis",
             min_value=0.1,
             max_value=5.0,
-            value=1.0,
-            step=0.1
+            value=persisted_scale_multiplier,
+            step=0.1,
+            key="plot_scale_multiplier_widget"
         )
+        st.session_state['plot_scale_multiplier'] = scale_multiplier
         scale_factor = auto_scale * scale_multiplier
+        persisted_show_result_labels = bool(
+            st.session_state.get('plot_show_result_labels', True)
+        )
         show_result_labels = st.checkbox(
             "Tampilkan label nilai hasil pada gambar",
-            value=True
+            value=persisted_show_result_labels,
+            key="plot_show_result_labels_widget"
         )
+        st.session_state['plot_show_result_labels'] = show_result_labels
         st.caption(
             "Empat gambar simulasi terakhir ditampilkan langsung di bawah. "
             f"Perpindahan maksimum = {max_displacement:.6f} mm, "
-            f"skala plot aktual = {scale_factor:,.0f}x."
+            f"skala plot aktual = {scale_factor:,.0f}x. "
+            "Gunakan scroll mouse atau pinch untuk memperbesar gambar."
         )
 
         top_left, top_right = st.columns(2)
@@ -3138,7 +3596,12 @@ with tab_plot:
                 scale_factor=scale_factor,
                 show_result_labels=show_result_labels
             )
-            render_plot(deformed_fig)
+            render_plot(
+                deformed_fig,
+                interactive=True,
+                viewer_key="last-simulation-deformation",
+                alt_text="Plot deformasi simulasi terakhir"
+            )
 
         with top_right:
             st.markdown("#### Diagram Axial")
@@ -3148,7 +3611,12 @@ with tab_plot:
                 force_type='axial',
                 show_result_labels=show_result_labels
             )
-            render_plot(axial_fig)
+            render_plot(
+                axial_fig,
+                interactive=True,
+                viewer_key="last-simulation-axial",
+                alt_text="Diagram axial simulasi terakhir"
+            )
 
         with bottom_left:
             st.markdown("#### Diagram Shear")
@@ -3158,7 +3626,12 @@ with tab_plot:
                 force_type='shear',
                 show_result_labels=show_result_labels
             )
-            render_plot(shear_fig)
+            render_plot(
+                shear_fig,
+                interactive=True,
+                viewer_key="last-simulation-shear",
+                alt_text="Diagram shear simulasi terakhir"
+            )
 
         with bottom_right:
             st.markdown("#### Diagram Momen")
@@ -3169,9 +3642,14 @@ with tab_plot:
                 relative_to_chord=False,
                 show_result_labels=show_result_labels
             )
-            render_plot(moment_fig)
+            render_plot(
+                moment_fig,
+                interactive=True,
+                viewer_key="last-simulation-moment",
+                alt_text="Diagram momen simulasi terakhir"
+            )
 
-with tab_interaction:
+elif active_dashboard_tab == "Kurva Interaksi":
     if latest_result is None:
         st.info("Kurva interaksi akan tersedia setelah analisis dijalankan.")
     else:
@@ -3207,22 +3685,30 @@ with tab_interaction:
                     int(elem_id)
                 )
             )
-            default_index = interaction_element_ids.index(default_elem_id)
+
+            persisted_interaction_elem = int(
+                st.session_state.get('selected_interaction_elem', default_elem_id)
+            )
+            if persisted_interaction_elem not in interaction_element_ids:
+                persisted_interaction_elem = int(default_elem_id)
 
             selected_interaction_elem = st.selectbox(
                 "Pilih elemen kolom",
                 options=interaction_element_ids,
-                index=default_index,
+                index=interaction_element_ids.index(persisted_interaction_elem),
                 format_func=lambda elem_id: (
                     f"E{int(elem_id)} | "
                     f"g={format_metric(get_by_element_value(axial_moment_values, elem_id), 4)}"
-                )
+                ),
+                key="selected_interaction_elem_widget"
             )
+            st.session_state['selected_interaction_elem'] = int(selected_interaction_elem)
             st.caption(
                 "Kurva dibentuk dari snapshot material simulasi yang sedang ditampilkan. "
                 "Panel kiri menampilkan kurva penuh, panel kanan fokus pada titik kontrol. "
                 "Titik `Demand`, `Boundary exact (c)`, dan `Garis lambda` "
-                "diberi label langsung pada gambar."
+                "diberi label langsung pada gambar. "
+                "Gunakan scroll mouse atau pinch untuk memperbesar gambar."
             )
 
             try:
@@ -3272,14 +3758,21 @@ with tab_interaction:
                     "Kontrol",
                     str(interaction_plot['controlling_state']).replace('-', ' ').title()
                 )
-                render_plot(interaction_plot['figure'])
+                render_plot(
+                    interaction_plot['figure'],
+                    interactive=True,
+                    viewer_key=f"interaction-curve-e{int(selected_interaction_elem)}",
+                    alt_text=f"Kurva interaksi elemen {int(selected_interaction_elem)}",
+                    viewer_height=620,
+                    tight_bbox=False
+                )
             except Exception as exc:
                 st.error(
                     "Kurva interaksi tidak bisa ditampilkan: "
                     f"{format_error_message(exc)}"
                 )
 
-with tab_report:
+elif active_dashboard_tab == "Laporan":
     if not results_bundle:
         st.info("Laporan baru tersedia setelah analisis dijalankan.")
     else:
