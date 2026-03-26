@@ -3022,11 +3022,22 @@ def render_progress_percentage(target,
 
 
 st.set_page_config(
-    page_title="Portal 2D Reliability Dashboard",
+    page_title="Analisis Keandalan Struktur Portal 2D",
     layout="wide"
 )
 
-st.title("Portal 2D Reliability Dashboard")
+st.title("Analisis Keandalan Struktur Portal 2D")
+st.markdown(
+    """
+    <p style="font-size: 2rem; font-weight: 600; margin-bottom: 0.1rem;">
+        Pengembang: Ir. Darmansyah Tjitradi, M.T., IPU
+    </p>
+    <p style="font-size: 2rem; margin-top: 0;">
+        Fakultas Teknik Universitas Lambung Mangkurat
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
 st.caption("Menampilkan input, output simulasi terakhir, Pf, Beta, deformasi, dan gaya dalam.")
 
 preview_input_data = None
