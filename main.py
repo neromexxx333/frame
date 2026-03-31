@@ -1797,49 +1797,70 @@ class PortalReliabilityAnalysis:
                 performance_key='performance_axial_moment'
             )
 
-            report += "\nMaterial Properties Statistics:\n"
-            report += f"  Bias Ec per elemen: {self._summarize_random_variable_group('fb_', '(-)')}\n"
-            report += f"  Concrete per elemen: {self._summarize_random_variable_group('fc_', 'MPa')}\n"
-            report += f"  Steel tarik per elemen: {self._summarize_random_variable_group('fy_tarik_', 'MPa')}\n"
-            report += f"  Steel tekan per elemen: {self._summarize_random_variable_group('fy_tekan_', 'MPa')}\n"
-            report += f"  Steel geser per elemen: {self._summarize_random_variable_group('fy_geser_', 'MPa')}\n"
-
-            report += "\nLoad Statistics:\n"
-            report += f"  Dead Load per elemen: {self._summarize_random_variable_group('qDL_', 'kN/m')}\n"
-            report += f"  Live Load per elemen: {self._summarize_random_variable_group('qLL_', 'kN/m')}\n"
-
-            report += "\nLatest Simulation Limit States:\n"
+            report += "\nRingkasan Parameter Material Acak:\n"
             report += (
-                f"  - Minimum g momen: {min_g_moment:.4f} kN.m\n"
+                f"  Faktor bias modulus elastisitas beton per elemen: "
+                f"{self._summarize_random_variable_group('fb_', '(-)')}\n"
+            )
+            report += (
+                f"  Kuat tekan beton per elemen: "
+                f"{self._summarize_random_variable_group('fc_', 'MPa')}\n"
+            )
+            report += (
+                f"  Tegangan leleh baja tarik per elemen: "
+                f"{self._summarize_random_variable_group('fy_tarik_', 'MPa')}\n"
+            )
+            report += (
+                f"  Tegangan leleh baja tekan per elemen: "
+                f"{self._summarize_random_variable_group('fy_tekan_', 'MPa')}\n"
+            )
+            report += (
+                f"  Tegangan leleh baja geser per elemen: "
+                f"{self._summarize_random_variable_group('fy_geser_', 'MPa')}\n"
+            )
+
+            report += "\nRingkasan Parameter Pembebanan Acak:\n"
+            report += (
+                f"  Beban mati terdistribusi per elemen: "
+                f"{self._summarize_random_variable_group('qDL_', 'kN/m')}\n"
+            )
+            report += (
+                f"  Beban hidup terdistribusi per elemen: "
+                f"{self._summarize_random_variable_group('qLL_', 'kN/m')}\n"
+            )
+
+            report += "\nRingkasan Evaluasi Kondisi Batas pada Simulasi yang Ditampilkan:\n"
+            report += (
+                f"  - Nilai minimum g lentur: {min_g_moment:.4f} kN.m\n"
                 if min_g_moment is not None else
-                "  - Minimum g momen: -\n"
+                "  - Nilai minimum g lentur: -\n"
             )
             report += (
-                f"  - Minimum g geser: {min_g_shear:.4f} kN\n"
+                f"  - Nilai minimum g geser: {min_g_shear:.4f} kN\n"
                 if min_g_shear is not None else
-                "  - Minimum g geser: -\n"
+                "  - Nilai minimum g geser: -\n"
             )
             report += (
-                f"  - Minimum g aksial: {min_g_axial:.4f} kN\n"
+                f"  - Nilai minimum g aksial: {min_g_axial:.4f} kN\n"
                 if min_g_axial is not None else
-                "  - Minimum g aksial: -\n"
+                "  - Nilai minimum g aksial: -\n"
             )
             report += (
-                f"  - Minimum g aksial+momen kolom: {min_g_axial_moment:.4f} (-)\n"
+                f"  - Nilai minimum g aksial-lentur kolom: {min_g_axial_moment:.4f} (-)\n"
                 if min_g_axial_moment is not None else
-                "  - Minimum g aksial+momen kolom: -\n"
+                "  - Nilai minimum g aksial-lentur kolom: -\n"
             )
 
-            report += "\nCritical Elements by Overall Reliability:\n"
+            report += "\nElemen Kritis Berdasarkan Keandalan Keseluruhan:\n"
             top_elements = self._get_top_element_reliability('overall', top_n=5)
             if top_elements:
                 for elem_id, values in top_elements:
                     report += (
-                        f"  - E{elem_id}: Pf={values['Pf']:.6f}, "
-                        f"Beta={values['Beta']:.4f}, failures={values['failures']}\n"
+                        f"  - Elemen E{elem_id}: Pf={values['Pf']:.6f}, "
+                        f"Beta={values['Beta']:.4f}, jumlah kegagalan={values['failures']}\n"
                     )
             else:
-                report += "  - Data reliability per elemen belum tersedia\n"
+                report += "  - Data keandalan per elemen belum tersedia\n"
         else:
             latest_result = self.get_latest_simulation_data().get('analysis_result')
             min_g_moment = self._get_min_performance_value(
@@ -1868,38 +1889,39 @@ class PortalReliabilityAnalysis:
                 if min_g_axial_moment is not None else
                 "-"
             )
-            status_text = "-" if is_safe is None else ("SAFE" if is_safe else "UNSAFE")
+            status_text = "-" if is_safe is None else ("AMAN" if is_safe else "TIDAK AMAN")
 
             report = f"""
 {'='*60}
-DETERMINISTIC STRUCTURAL ANALYSIS REPORT
+LAPORAN ANALISIS STRUKTUR DETERMINISTIK
 {'='*60}
 
-Analysis Basis:
-  - Analysis mode: Deterministic
-  - Structural response computed once using deterministic input values per elemen
-  - Probability of Failure (Pf): N/A
-  - Reliability Index (Beta): N/A
+Dasar Analisis:
+  - Mode analisis: Deterministik
+  - Respons struktur dihitung satu kali menggunakan parameter deterministik pada setiap elemen
+  - Probabilitas kegagalan, Pf: Tidak berlaku
+  - Indeks keandalan, Beta: Tidak berlaku
 
-Results:
-  - Number of analyses: 1
-  - Minimum g momen (Capacity - Demand): {min_g_moment_text} kN.m
-  - Minimum g geser (Capacity - Demand): {min_g_shear_text} kN
-  - Minimum g aksial (Capacity - Demand): {min_g_axial_text} kN
-  - Minimum g aksial+momen kolom: {min_g_axial_moment_text} (-)
-  - Status: {status_text}
+Ringkasan Hasil Analisis:
+  - Jumlah analisis struktur: 1
+  - Nilai minimum fungsi kinerja lentur, g(x): {min_g_moment_text} kN.m
+  - Nilai minimum fungsi kinerja geser, g(x): {min_g_shear_text} kN
+  - Nilai minimum fungsi kinerja aksial, g(x): {min_g_axial_text} kN
+  - Nilai minimum fungsi kinerja aksial-lentur kolom, g(x): {min_g_axial_moment_text} (-)
+  - Status kinerja keamanan struktur: {status_text}
 
-Reference Deterministic Values:
-  - Concrete strength fc per elemen: {self._get_group_sample_summary(reference_sample, self.data['concrete'].get('by_element', {}), 'fc', 'deterministic', 'MPa')}
-  - Steel yield fy tarik per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_tarik', 'tarik_deterministic', 'MPa')}
-  - Steel yield fy tekan per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_tekan', 'tekan_deterministic', 'MPa')}
-  - Steel yield fy geser per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_geser', 'geser_deterministic', 'MPa')}
-  - Dead load per elemen: {self._get_group_sample_summary(reference_sample, self.data['dead_load'].get('by_element', {}), 'qDL', 'deterministic', 'kN/m')}
-  - Live load per elemen: {self._get_group_sample_summary(reference_sample, self.data['live_load'].get('by_element', {}), 'qLL', 'deterministic', 'kN/m')}
+Parameter Acuan Deterministik:
+  - Kuat tekan beton per elemen: {self._get_group_sample_summary(reference_sample, self.data['concrete'].get('by_element', {}), 'fc', 'deterministic', 'MPa')}
+  - Tegangan leleh baja tarik per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_tarik', 'tarik_deterministic', 'MPa')}
+  - Tegangan leleh baja tekan per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_tekan', 'tekan_deterministic', 'MPa')}
+  - Tegangan leleh baja geser per elemen: {self._get_group_sample_summary(reference_sample, self.data['steel'].get('by_element', {}), 'fy_geser', 'geser_deterministic', 'MPa')}
+  - Beban mati terdistribusi per elemen: {self._get_group_sample_summary(reference_sample, self.data['dead_load'].get('by_element', {}), 'qDL', 'deterministic', 'kN/m')}
+  - Beban hidup terdistribusi per elemen: {self._get_group_sample_summary(reference_sample, self.data['live_load'].get('by_element', {}), 'qLL', 'deterministic', 'kN/m')}
 
-Interpretation:
-  - Deterministic mode does not perform random sampling.
-  - Safety status is based on whether all element g momen, g geser, g aksial, dan g aksial+momen kolom remain non-negative.
+Interpretasi Rekayasa:
+  - Mode deterministik tidak melibatkan pengambilan sampel acak maupun evaluasi probabilistik.
+  - Status kinerja keamanan ditetapkan berdasarkan tanda fungsi kinerja seluruh kondisi batas, yaitu lentur, geser, aksial, dan aksial-lentur kolom.
+  - Struktur dinyatakan aman apabila seluruh nilai fungsi kinerja, g(x), bernilai tidak negatif.
 
 {'='*60}
 """
