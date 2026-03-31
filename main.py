@@ -8,7 +8,7 @@ Penggunaan:
 
 import sys
 import numpy as np
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 import os
 import json
 from datetime import datetime
@@ -215,12 +215,20 @@ class PortalReliabilityAnalysis:
 
     def _get_random_variable_definitions(self) -> Dict[str, Dict[str, float]]:
         """Bangun definisi variabel random per elemen dari data input."""
+        geometry_data = self.data['geometry']
         concrete_data = self.data['concrete']
         steel_data = self.data['steel']
         dead_load_data = self.data['dead_load']
         live_load_data = self.data['live_load']
 
         definitions = {}
+
+        for elem_id, props in geometry_data.get('fb_by_element', {}).items():
+            definitions[self._element_var_name('fb', elem_id)] = {
+                'distribution': 'lognormal',
+                'mean': float(props.get('mean', 1.0)),
+                'stddev': float(props.get('stddev', 0.0))
+            }
 
         for elem_id, props in concrete_data.get('by_element', {}).items():
             definitions[self._element_var_name('fc', elem_id)] = {
@@ -261,6 +269,58 @@ class PortalReliabilityAnalysis:
             }
 
         return definitions
+
+    def _build_sampled_element_moduli(self,
+                                      random_samples: Optional[Dict[str, float]] = None) -> Dict[int, float]:
+        """Hitung Ec sampel per elemen untuk analisis struktur probabilistik."""
+        geometry = self.data.get('geometry', {})
+        base_elements = np.asarray(
+            geometry.get('elements_mean', geometry.get('elements', [])),
+            dtype=float
+        )
+        if base_elements.size == 0:
+            return {}
+
+        bias_source = geometry.get('fb_by_element', {})
+        bias_values = (
+            self._get_element_values_from_sample(
+                random_samples,
+                bias_source,
+                prefix='fb',
+                fallback_key='mean'
+            )
+            if bias_source else
+            {}
+        )
+
+        sampled_moduli = {}
+        default_modulus = float(geometry.get('E_mean', 30000.0))
+        for elem in base_elements:
+            elem_id = int(elem[0])
+            base_modulus = (
+                float(elem[5])
+                if len(elem) >= 6 and np.isfinite(float(elem[5])) else
+                default_modulus
+            )
+            bias_factor = float(bias_values.get(elem_id, 1.0))
+            sampled_moduli[elem_id] = base_modulus * bias_factor
+
+        return sampled_moduli
+
+    def _apply_structural_modulus_sample(self,
+                                         random_samples: Optional[Dict[str, float]] = None) -> None:
+        """Update portal aktif dengan Ec hasil sampel bias sebelum analisis DSM."""
+        if not self.is_probabilistic or self.portal is None:
+            return
+
+        sampled_moduli = self._build_sampled_element_moduli(random_samples)
+        if not sampled_moduli:
+            return
+
+        self.portal.update_element_moduli(
+            sampled_moduli,
+            default_E=self.data['geometry'].get('E_mean', 30000.0)
+        )
 
     def _build_reference_sample(self) -> Dict[str, float]:
         """Bangun sampel acuan deterministik per elemen."""
@@ -989,6 +1049,7 @@ class PortalReliabilityAnalysis:
         print(f"  [OK] Random variables defined: {len(self.random_variables)}")
         print(
             "  [OK] Grup variabel: "
+            f"fb={len([k for k in self.random_variables if k.startswith('fb_')])}, "
             f"fc={len([k for k in self.random_variables if k.startswith('fc_')])}, "
             f"fy_tarik={len([k for k in self.random_variables if k.startswith('fy_tarik_')])}, "
             f"fy_tekan={len([k for k in self.random_variables if k.startswith('fy_tekan_')])}, "
@@ -1388,6 +1449,7 @@ class PortalReliabilityAnalysis:
         
         # Run analisis
         try:
+            self._apply_structural_modulus_sample(random_samples)
             results = self.analysis.analyze(
                 dead_load_dict,
                 live_load_dict,
@@ -1485,7 +1547,9 @@ class PortalReliabilityAnalysis:
 
         return deterministic_result
     
-    def run_monte_carlo(self):
+    def run_monte_carlo(self,
+                        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                        progress_interval: Optional[int] = None):
         """Jalankan simulasi Monte Carlo"""
         print(f"\n[4/6] Running Monte Carlo Simulation ({self.num_mc_simulations} samples)...")
         
@@ -1497,7 +1561,9 @@ class PortalReliabilityAnalysis:
         self.mc_results = mc.run_simulation(
             self.analysis_function,
             self.random_variables,
-            performance_function
+            performance_function,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval
         )
 
         latest_simulation = self.get_latest_simulation_data()
@@ -1732,6 +1798,7 @@ class PortalReliabilityAnalysis:
             )
 
             report += "\nMaterial Properties Statistics:\n"
+            report += f"  Bias Ec per elemen: {self._summarize_random_variable_group('fb_', '(-)')}\n"
             report += f"  Concrete per elemen: {self._summarize_random_variable_group('fc_', 'MPa')}\n"
             report += f"  Steel tarik per elemen: {self._summarize_random_variable_group('fy_tarik_', 'MPa')}\n"
             report += f"  Steel tekan per elemen: {self._summarize_random_variable_group('fy_tekan_', 'MPa')}\n"
