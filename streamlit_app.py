@@ -859,7 +859,6 @@ def build_internal_force_df(latest_result: Dict, input_data: Optional[Dict] = No
             'Element_ID (-)': elem_id,
             'Kode': code,
             'Jenis_Elemen': get_element_type_label(code),
-            'w_local_y (kN/m)': force.get('transverse_local_load'),
             'Axial_Start (kN)': force['axial_start'],
             'Axial_End_Joint (kN)': force['axial_end'],
             'Axial_End_Internal (kN)': force.get('axial_end_internal'),
@@ -877,6 +876,41 @@ def build_internal_force_df(latest_result: Dict, input_data: Optional[Dict] = No
             'X_Max_Moment (m)': force.get('x_max_moment')
         })
     return pd.DataFrame(rows)
+
+
+def build_internal_force_component_df(internal_force_df: pd.DataFrame,
+                                      component: str) -> pd.DataFrame:
+    """Ambil tabel gaya dalam per komponen dengan kolom identitas tetap."""
+    component_columns = {
+        'moment': [
+            'Moment_Start (kN.m)',
+            'Moment_End_Joint (kN.m)',
+            'Moment_End_Internal (kN.m)',
+            'Max_Moment (kN.m)',
+            'X_Max_Moment (m)'
+        ],
+        'shear': [
+            'Shear_Start (kN)',
+            'Shear_End_Joint (kN)',
+            'Shear_End_Internal (kN)',
+            'Max_Shear (kN)',
+            'X_Max_Shear (m)'
+        ],
+        'axial': [
+            'Axial_Start (kN)',
+            'Axial_End_Joint (kN)',
+            'Axial_End_Internal (kN)',
+            'Max_Axial (kN)',
+            'X_Max_Axial (m)'
+        ]
+    }
+    identity_columns = ['Element_ID (-)', 'Kode', 'Jenis_Elemen']
+    selected_columns = identity_columns + component_columns.get(component, [])
+    selected_columns = [
+        column for column in selected_columns
+        if column in internal_force_df.columns
+    ]
+    return internal_force_df.loc[:, selected_columns].copy()
 
 
 def build_internal_force_sign_guide_figure():
@@ -1169,7 +1203,6 @@ def style_internal_force_df(df: pd.DataFrame):
         df,
         {
             'identity': ['Element_ID (-)', 'Kode', 'Jenis_Elemen'],
-            'load': ['w_local_y (kN/m)'],
             'axial': [
                 'Axial_Start (kN)',
                 'Axial_End_Joint (kN)',
@@ -1707,9 +1740,26 @@ def build_performance_df(latest_result: Dict,
     return pd.DataFrame(rows)
 
 
+def compute_limit_state_safety_factor(capacity: Any,
+                                      demand: Any) -> Optional[float]:
+    """Hitung safety factor SF = R / S bila kapasitas dan demand valid."""
+    try:
+        capacity_value = float(capacity)
+        demand_value = float(demand)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(capacity_value) or not np.isfinite(demand_value):
+        return None
+    if abs(demand_value) <= 1e-12:
+        return float('inf') if capacity_value > 0.0 else None
+    return float(capacity_value / demand_value)
+
+
 def build_limit_state_performance_tables(latest_result: Dict,
                                          input_data: Optional[Dict] = None,
-                                         element_reliability: Optional[Dict] = None) -> Dict[str, pd.DataFrame]:
+                                         element_reliability: Optional[Dict] = None,
+                                         is_probabilistic: bool = True) -> Dict[str, pd.DataFrame]:
     """Pisahkan tabel nilai g per elemen per limit state."""
     max_forces_values = latest_result.get('max_forces', {})
     moment_values = latest_result.get('performance', {})
@@ -1806,17 +1856,22 @@ def build_limit_state_performance_tables(latest_result: Dict,
         if capacity is None and demand is not None and g_value is not None:
             capacity = g_value + demand
         reliability = get_reliability('moment', elem_id)
-        moment_rows.append({
+        row_data = {
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN.m)': capacity,
-            'S dari Analisis Struktur (kN.m)': demand,
-            'g(x) (kN.m)': g_value,
-            'Jumlah Gagal (-)': reliability.get('failures'),
-            'Pf (-)': reliability.get('Pf'),
-            'Beta (-)': reliability.get('Beta'),
-            'Status': get_status(g_value)
-        })
+            'S dari Analisis Struktur (kN.m)': demand
+        }
+        if is_probabilistic:
+            row_data['Jumlah Gagal (-)'] = reliability.get('failures')
+            row_data['g(x) (kN.m)'] = g_value
+            row_data['Pf (-)'] = reliability.get('Pf')
+            row_data['Beta (-)'] = reliability.get('Beta')
+        else:
+            row_data['g(x) (kN.m)'] = g_value
+            row_data['SF = R/S (-)'] = compute_limit_state_safety_factor(capacity, demand)
+        row_data['Status'] = get_status(g_value)
+        moment_rows.append(row_data)
 
     shear_rows = []
     for elem_id in collect_element_ids(
@@ -1834,17 +1889,22 @@ def build_limit_state_performance_tables(latest_result: Dict,
             g_value + demand
         )
         reliability = get_reliability('shear', elem_id)
-        shear_rows.append({
+        row_data = {
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN)': capacity,
-            'S dari Analisis Struktur (kN)': demand,
-            'g(x) (kN)': g_value,
-            'Jumlah Gagal (-)': reliability.get('failures'),
-            'Pf (-)': reliability.get('Pf'),
-            'Beta (-)': reliability.get('Beta'),
-            'Status': get_status(g_value)
-        })
+            'S dari Analisis Struktur (kN)': demand
+        }
+        if is_probabilistic:
+            row_data['Jumlah Gagal (-)'] = reliability.get('failures')
+            row_data['g(x) (kN)'] = g_value
+            row_data['Pf (-)'] = reliability.get('Pf')
+            row_data['Beta (-)'] = reliability.get('Beta')
+        else:
+            row_data['g(x) (kN)'] = g_value
+            row_data['SF = R/S (-)'] = compute_limit_state_safety_factor(capacity, demand)
+        row_data['Status'] = get_status(g_value)
+        shear_rows.append(row_data)
 
     axial_rows = []
     for elem_id in collect_element_ids(
@@ -1883,17 +1943,22 @@ def build_limit_state_performance_tables(latest_result: Dict,
             capacity = g_value + demand
 
         reliability = get_reliability('axial', elem_id)
-        axial_rows.append({
+        row_data = {
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN)': capacity,
-            'S dari Analisis Struktur (kN)': demand,
-            'g(x) (kN)': g_value,
-            'Jumlah Gagal (-)': reliability.get('failures'),
-            'Pf (-)': reliability.get('Pf'),
-            'Beta (-)': reliability.get('Beta'),
-            'Status': get_status(g_value)
-        })
+            'S dari Analisis Struktur (kN)': demand
+        }
+        if is_probabilistic:
+            row_data['Jumlah Gagal (-)'] = reliability.get('failures')
+            row_data['g(x) (kN)'] = g_value
+            row_data['Pf (-)'] = reliability.get('Pf')
+            row_data['Beta (-)'] = reliability.get('Beta')
+        else:
+            row_data['g(x) (kN)'] = g_value
+            row_data['SF = R/S (-)'] = compute_limit_state_safety_factor(capacity, demand)
+        row_data['Status'] = get_status(g_value)
+        axial_rows.append(row_data)
 
     axial_moment_rows = []
     for elem_id in collect_element_ids(
@@ -1907,17 +1972,22 @@ def build_limit_state_performance_tables(latest_result: Dict,
         capacity = normalize_numeric(meta.get('lambda'))
         demand = 1.0 if capacity is not None or g_value is not None else None
         reliability = get_reliability('axial_moment', elem_id)
-        axial_moment_rows.append({
+        row_data = {
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (-)': capacity,
-            'S dari Analisis Struktur (-)': demand,
-            'g(x) (-)': g_value,
-            'Jumlah Gagal (-)': reliability.get('failures'),
-            'Pf (-)': reliability.get('Pf'),
-            'Beta (-)': reliability.get('Beta'),
-            'Status': get_status(g_value)
-        })
+            'S dari Analisis Struktur (-)': demand
+        }
+        if is_probabilistic:
+            row_data['Jumlah Gagal (-)'] = reliability.get('failures')
+            row_data['g(x) (-)'] = g_value
+            row_data['Pf (-)'] = reliability.get('Pf')
+            row_data['Beta (-)'] = reliability.get('Beta')
+        else:
+            row_data['g(x) (-)'] = g_value
+            row_data['SF = R/S (-)'] = compute_limit_state_safety_factor(capacity, demand)
+        row_data['Status'] = get_status(g_value)
+        axial_moment_rows.append(row_data)
 
     return {
         'lentur': pd.DataFrame(moment_rows),
@@ -1927,9 +1997,15 @@ def build_limit_state_performance_tables(latest_result: Dict,
     }
 
 
-def style_limit_state_performance_df(df: pd.DataFrame):
+def style_limit_state_performance_df(df: pd.DataFrame,
+                                     is_probabilistic: bool = True):
     """Styling sederhana untuk tabel limit state terpisah."""
     styler = style_input_dataframe(df)
+    reliability_columns = (
+        ['Jumlah Gagal (-)', 'Pf (-)', 'Beta (-)', 'Status']
+        if is_probabilistic else
+        ['Status']
+    )
     return apply_grouped_header_styles(
         styler,
         df,
@@ -1940,19 +2016,16 @@ def style_limit_state_performance_df(df: pd.DataFrame):
                 for column in df.columns
                 if column.startswith('Kapasitas R')
                 or column.startswith('S dari Analisis Struktur')
+                or column == 'SF = R/S (-)'
                 or column.startswith('g(x)')
             ],
-            'reliability': [
-                'Jumlah Gagal (-)',
-                'Pf (-)',
-                'Beta (-)',
-                'Status'
-            ]
+            'reliability': reliability_columns
         }
     )
 
 
-def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame],
+                                is_probabilistic: bool = True) -> pd.DataFrame:
     """Ringkas hasil pengontrol per elemen dari tabel limit state terpisah."""
     state_specs = [
         ('lentur', 'Lentur', 'kN.m'),
@@ -1998,6 +2071,7 @@ def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame]) -> 
                     (col for col in table_df.columns if col.startswith('S dari Analisis Struktur')),
                     None
                 )),
+                'SF = R/S (-)': row.get('SF = R/S (-)'),
                 'g(x)': row.get(next(
                     (col for col in table_df.columns if col.startswith('g(x)')),
                     None
@@ -2044,34 +2118,49 @@ def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame]) -> 
                     )
                 )
 
-        rows.append({
+        row_data = {
             'Elemen (-)': governing.get('Elemen (-)'),
             'Kode': governing.get('Kode'),
             'Limit State Kontrol': governing.get('Limit State Kontrol'),
             'Satuan': governing.get('Satuan'),
             'Kapasitas R': governing.get('Kapasitas R'),
-            'S dari Analisis Struktur': governing.get('S dari Analisis Struktur'),
-            'g(x)': governing.get('g(x)'),
-            'Jumlah Gagal (-)': governing.get('Jumlah Gagal (-)'),
-            'Pf (-)': governing.get('Pf (-)'),
-            'Beta (-)': governing.get('Beta (-)'),
-            'Status': governing.get('Status')
-        })
+            'S dari Analisis Struktur': governing.get('S dari Analisis Struktur')
+        }
+        if is_probabilistic:
+            row_data['Jumlah Gagal (-)'] = governing.get('Jumlah Gagal (-)')
+            row_data['g(x)'] = governing.get('g(x)')
+            row_data['Pf (-)'] = governing.get('Pf (-)')
+            row_data['Beta (-)'] = governing.get('Beta (-)')
+        else:
+            row_data['g(x)'] = governing.get('g(x)')
+            row_data['SF = R/S (-)'] = governing.get('SF = R/S (-)')
+        row_data['Status'] = governing.get('Status')
+        rows.append(row_data)
 
     return pd.DataFrame(rows)
 
 
-def style_limit_state_resume_df(df: pd.DataFrame):
+def style_limit_state_resume_df(df: pd.DataFrame,
+                                is_probabilistic: bool = True):
     """Styling tabel resume limit state pengontrol."""
     styler = style_input_dataframe(df)
+    performance_columns = ['Kapasitas R', 'S dari Analisis Struktur']
+    if 'SF = R/S (-)' in df.columns:
+        performance_columns.append('SF = R/S (-)')
+    performance_columns.append('g(x)')
+    reliability_columns = (
+        ['Jumlah Gagal (-)', 'Pf (-)', 'Beta (-)', 'Status']
+        if is_probabilistic else
+        ['Status']
+    )
     return apply_grouped_header_styles(
         styler,
         df,
         {
             'identity': ['Elemen (-)', 'Kode'],
             'control': ['Limit State Kontrol', 'Satuan'],
-            'performance': ['Kapasitas R', 'S dari Analisis Struktur', 'g(x)'],
-            'reliability': ['Jumlah Gagal (-)', 'Pf (-)', 'Beta (-)', 'Status']
+            'performance': performance_columns,
+            'reliability': reliability_columns
         }
     )
 
@@ -4648,12 +4737,12 @@ analysis_input_data = (
 
 dashboard_tabs = [
     "Input",
-    "Output",
+    "Output Analisis Struktur",
     "Output Reliability",
-    "Output Sensitivitas",
+    "Output Sensitivitas Probabilistik",
     "Output Sensitivitas Deterministik",
     "Plot Simulasi Terakhir",
-    "Kurva Interaksi",
+    "Kurva Interasi P-M",
     "Laporan"
 ]
 active_dashboard_tab = st.radio(
@@ -4802,7 +4891,7 @@ if active_dashboard_tab == "Input":
             else:
                 render_input_table(live_load_df)
 
-elif active_dashboard_tab == "Output":
+elif active_dashboard_tab == "Output Analisis Struktur":
     if latest_result is None:
         st.info("Output akan tersedia setelah analisis dijalankan.")
     else:
@@ -4855,6 +4944,10 @@ elif active_dashboard_tab == "Output":
             "absolut grup Kolom per kolom, termasuk identitas elemen yang mengontrol nilai tersebut. "
             "Jika ada nilai maksimum yang sama, semuanya ikut ditandai."
         )
+        st.caption(
+            "Setiap tabel mempertahankan kolom identitas `Element_ID`, `Kode`, dan "
+            "`Jenis_Elemen`, lalu dipisahkan menjadi komponen momen lentur, geser, dan aksial."
+        )
         if SPECIAL_BEAM_JOINT_RAW_SIGN_NODE_IDS:
             special_nodes_text = ", ".join(
                 str(node_id) for node_id in sorted(SPECIAL_BEAM_JOINT_RAW_SIGN_NODE_IDS)
@@ -4864,14 +4957,28 @@ elif active_dashboard_tab == "Output":
                 "ditampilkan mengikuti tanda aksi joint solver."
             )
         st.caption(
-            "Warna header membedakan grup beban merata, aksial, geser, dan momen "
+            "Warna header dan highlight maksimum absolut per grup `B/K` tetap dipertahankan "
             "agar pembacaan tabel lebih cepat."
         )
         internal_force_df = build_internal_force_df(latest_result, input_data=input_data)
-        render_input_table(
-            internal_force_df,
-            styler=style_internal_force_df(internal_force_df)
-        )
+        internal_force_tables = [
+            ("Tabel Gaya Momen Lentur", 'moment'),
+            ("Tabel Gaya Geser", 'shear'),
+            ("Tabel Gaya Aksial", 'axial')
+        ]
+        for table_title, component_key in internal_force_tables:
+            st.markdown(f"##### {table_title}")
+            component_df = build_internal_force_component_df(
+                internal_force_df,
+                component_key
+            )
+            if component_df.empty:
+                st.info(f"Data {table_title.lower()} belum tersedia.")
+                continue
+            render_input_table(
+                component_df,
+                styler=style_internal_force_df(component_df)
+            )
         with st.expander("Panduan Visual Tanda Gaya Dalam", expanded=False):
             st.caption(
                 "Panduan ini membantu membaca arti tanda positif dan negatif pada tabel gaya dalam, "
@@ -4906,37 +5013,36 @@ elif active_dashboard_tab == "Output Reliability":
     if latest_result is None:
         st.info("Tabel output akan tersedia setelah analisis dijalankan.")
     else:
-        st.markdown("#### Reliabilitas Sistem Portal Gabungan")
-        st.caption(
-            "Portal dianggap tersusun seri antara subsistem Balok dan subsistem Kolom, "
-            "sehingga portal gagal bila salah satu subsistem gagal."
-        )
-        st.caption(
-            "Kasus 1: Balok = sistem paralel, Kolom = sistem seri. "
-            "Kasus 2: Balok = sistem seri, Kolom = sistem seri."
-        )
         if is_probabilistic:
+            st.markdown("#### Reliabilitas Sistem Portal Gabungan")
+            st.caption(
+                "Portal dianggap tersusun seri antara subsistem Balok dan subsistem Kolom, "
+                "sehingga portal gagal bila salah satu subsistem gagal."
+            )
+            st.caption(
+                "Kasus 1: Balok = sistem paralel, Kolom = sistem seri. "
+                "Kasus 2: Balok = sistem seri, Kolom = sistem seri."
+            )
             st.caption(
                 "`Pf/Beta` dihitung langsung dari seluruh simulasi Monte Carlo berdasarkan "
                 "kejadian gagal subsistem per simulasi."
             )
-        else:
-            st.caption(
-                "Pada mode deterministik, kolom `Pf/Beta` tidak berlaku dan status diambil "
-                "dari hasil satu kali analisis deterministik."
+            portal_system_df = build_portal_system_reliability_df(
+                results_bundle.get('portal_system_reliability', [])
             )
-        portal_system_df = build_portal_system_reliability_df(
-            results_bundle.get('portal_system_reliability', [])
-        )
-        if portal_system_df.empty:
-            st.info("Data reliabilitas sistem portal gabungan belum tersedia.")
-        else:
-            render_input_table(
-                portal_system_df,
-                styler=style_portal_system_reliability_df(portal_system_df)
-            )
+            if portal_system_df.empty:
+                st.info("Data reliabilitas sistem portal gabungan belum tersedia.")
+            else:
+                render_input_table(
+                    portal_system_df,
+                    styler=style_portal_system_reliability_df(portal_system_df)
+                )
 
-        st.markdown("#### Nilai g per Elemen")
+        st.markdown(
+            "#### Nilai g per Elemen"
+            if is_probabilistic else
+            "#### Hasil Analisis Deterministik"
+        )
         st.caption(
             "Tabel dipisah per limit state: lentur, geser, aksial, dan aksial-lentur. "
             "Kolom `R`, `S`, dan `g(x)` ditampilkan terpisah agar perhitungan tiap cek "
@@ -4953,8 +5059,9 @@ elif active_dashboard_tab == "Output Reliability":
             )
         else:
             st.caption(
-                "Pada mode deterministik, kolom `Jumlah Gagal/Pf/Beta` tidak berlaku "
-                "dan status ditentukan dari tanda `g(x)`."
+                "Pada mode deterministik, tabel hanya menampilkan field yang relevan "
+                "dengan satu kali analisis, termasuk `SF = R/S`, dan status ditentukan "
+                "dari tanda `g(x)`."
             )
         st.caption(
             "Untuk cek aksial-lentur, `R` merepresentasikan `lambda_boundary`, "
@@ -4963,20 +5070,34 @@ elif active_dashboard_tab == "Output Reliability":
         limit_state_tables = build_limit_state_performance_tables(
             latest_result,
             input_data=input_data,
-            element_reliability=results_bundle.get('element_reliability', {})
+            element_reliability=results_bundle.get('element_reliability', {}),
+            is_probabilistic=is_probabilistic
         )
-        resume_df = build_limit_state_resume_df(limit_state_tables)
+        resume_df = build_limit_state_resume_df(
+            limit_state_tables,
+            is_probabilistic=is_probabilistic
+        )
         st.markdown("##### Resume Pengontrol")
-        st.caption(
-            "Limit state pengontrol per elemen dipilih dengan kriteria `Pf` maksimum, "
-            "lalu `Beta` minimum. Jika `Pf/Beta` tidak tersedia, fallback memakai `g(x)` minimum."
-        )
+        if is_probabilistic:
+            st.caption(
+                "Limit state pengontrol per elemen dipilih dengan kriteria `Pf` maksimum, "
+                "lalu `Beta` minimum. Jika `Pf/Beta` tidak tersedia, fallback memakai `g(x)` minimum."
+            )
+        else:
+            st.caption(
+                "Pada mode deterministik, limit state pengontrol dipilih dari `g(x)` minimum. "
+                "Nilai `SF = R/S` ikut ditampilkan; untuk cek aksial-lentur, nilainya sama "
+                "dengan `lambda` karena `S = 1.0`."
+            )
         if resume_df.empty:
             st.info("Data resume limit state pengontrol belum tersedia.")
         else:
             render_input_table(
                 resume_df,
-                styler=style_limit_state_resume_df(resume_df)
+                styler=style_limit_state_resume_df(
+                    resume_df,
+                    is_probabilistic=is_probabilistic
+                )
             )
         limit_state_specs = [
             ("Lentur", 'lentur'),
@@ -4992,10 +5113,13 @@ elif active_dashboard_tab == "Output Reliability":
                 continue
             render_input_table(
                 table_df,
-                styler=style_limit_state_performance_df(table_df)
+                styler=style_limit_state_performance_df(
+                    table_df,
+                    is_probabilistic=is_probabilistic
+                )
             )
 
-elif active_dashboard_tab == "Output Sensitivitas":
+elif active_dashboard_tab == "Output Sensitivitas Probabilistik":
     if not results_bundle:
         st.info("Output sensitivitas akan tersedia setelah analisis dijalankan.")
     else:
@@ -5135,7 +5259,7 @@ elif active_dashboard_tab == "Plot Simulasi Terakhir":
                 alt_text="Diagram momen simulasi terakhir"
             )
 
-elif active_dashboard_tab == "Kurva Interaksi":
+elif active_dashboard_tab == "Kurva Interasi P-M":
     if latest_result is None:
         st.info("Kurva interaksi akan tersedia setelah analisis dijalankan.")
     else:
