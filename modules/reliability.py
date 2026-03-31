@@ -1385,6 +1385,16 @@ class ReliabilityAssessment:
         else:
             return "Risky"
 
+    def get_safety_class_formal_id(self) -> str:
+        """Padanan bahasa Indonesia formal untuk kelas keandalan."""
+        mapping = {
+            "Very Safe": "Sangat Aman",
+            "Safe": "Aman",
+            "Acceptable": "Dapat Diterima",
+            "Risky": "Berisiko"
+        }
+        return mapping.get(self.get_safety_class(), self.get_safety_class())
+
     def get_target_reliability(self, limit_state: str = "ultimate") -> float:
         """
         Dapatkan target reliability index berdasarkan limit state
@@ -1418,31 +1428,44 @@ class ReliabilityAssessment:
 
     def get_report(self) -> str:
         """Generate laporan keandalan"""
+        safety_status = "AMAN" if self.is_safe('ultimate') else "TIDAK AMAN"
         report = f"""
 {'='*60}
-RELIABILITY ASSESSMENT REPORT
+LAPORAN PENILAIAN KEANDALAN STRUKTUR
 {'='*60}
 
-Simulation Statistics:
-  - Number of simulations: {self.mc_results['num_simulations']}
-  - Number of failures: {self.mc_results['failures']}
+Ikhtisar Simulasi Monte Carlo:
+  - Jumlah sampel simulasi: {self.mc_results['num_simulations']}
+  - Jumlah kejadian gagal teramati: {self.mc_results['failures']}
 
-Results:
-  - Probability of Failure (Pf): {self.Pf:.6f} ({self.Pf*100:.4f}%)
-  - Reliability Index (Beta): {self.Beta:.4f}
-  - Safety Classification: {self.get_safety_class()}
-  - Target Beta (ULS): {self.get_target_reliability('ultimate')}
-  - Safety Status: {'SAFE' if self.is_safe('ultimate') else 'UNSAFE'}
+Ringkasan Hasil Penilaian:
+  - Probabilitas kegagalan, Pf: {self.Pf:.6f} ({self.Pf*100:.4f}%)
+  - Indeks keandalan, Beta: {self.Beta:.4f}
+  - Kelas keandalan struktur: {self.get_safety_class_formal_id()}
+  - Nilai target indeks keandalan untuk kondisi batas ultimit (ULS): {self.get_target_reliability('ultimate')}
+  - Status kinerja keamanan struktur: {safety_status}
 
-Interpretation:
+Interpretasi Rekayasa:
 """
 
         if self.Pf == 0:
-            report += "  - No failures observed in all simulations\n"
+            report += (
+                "  - Tidak teramati kejadian gagal pada seluruh sampel simulasi Monte Carlo, "
+                "sehingga struktur menunjukkan tingkat keandalan yang sangat tinggi dalam ruang "
+                "acak yang dianalisis.\n"
+            )
         else:
-            report += f"  - Expected 1 failure in every {1/self.Pf:.0f} structures\n"
+            report += (
+                f"  - Secara statistik, kejadian gagal diperkirakan terjadi sekitar "
+                f"satu kali pada setiap {1/self.Pf:.0f} realisasi struktur dengan "
+                f"karakteristik acak yang sebanding.\n"
+            )
 
-        report += f"  - Structure is {self.get_safety_class()} relative to target\n"
+        report += (
+            f"  - Berdasarkan perbandingan terhadap target keandalan yang ditetapkan, "
+            f"tingkat keandalan struktur berada dalam kategori "
+            f"{self.get_safety_class_formal_id()}.\n"
+        )
         report += f"\n{'='*60}\n"
 
         return report
