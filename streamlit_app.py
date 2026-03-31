@@ -22,6 +22,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from main import PortalReliabilityAnalysis
+from modules.display_conventions import (
+    SPECIAL_BEAM_JOINT_RAW_SIGN_NODE_IDS,
+    get_displayed_element_moment_values,
+    get_joint_equilibrium_moment,
+)
 from modules.excel_reader import ExcelReader
 from modules.plotting import PortalPlotter
 from modules.reliability import AXIAL_DEMAND_TOLERANCE_KN, PerformanceFunction
@@ -32,8 +37,8 @@ DEFAULT_INPUT_FILE = "input_template.xlsx"
 BASE_ESTIMATE_ELEMENTS = 9.0
 BASE_ESTIMATE_RANDOM_VARIABLES = 42.0
 CALIBRATION_REFERENCE_NUM_SIMULATIONS = 100000.0
-CALIBRATION_REFERENCE_PROBABILISTIC_SECONDS = 75.0
-BASE_DETERMINISTIC_SECONDS = 3.0
+CALIBRATION_REFERENCE_PROBABILISTIC_SECONDS = 400
+BASE_DETERMINISTIC_SECONDS = 5
 BASE_FULL_ANALYSIS_FIXED_OVERHEAD_SECONDS = BASE_DETERMINISTIC_SECONDS
 BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
     (CALIBRATION_REFERENCE_PROBABILISTIC_SECONDS - BASE_FULL_ANALYSIS_FIXED_OVERHEAD_SECONDS)
@@ -41,6 +46,7 @@ BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
     1e-9
 )
 ZOOMABLE_PLOT_VIEWER_HEIGHT = 540
+MOMENT_EQUILIBRIUM_TOLERANCE_KNM = 1e-6
 
 HEADER_GROUP_PALETTES = {
     'default': {
@@ -93,6 +99,32 @@ HEADER_GROUP_PALETTES = {
     }
 }
 
+INTERNAL_FORCE_MAX_HIGHLIGHT_STYLES = {
+    'B': (
+        'background-color: #ffedd5; '
+        'font-weight: 700; '
+        'color: #9a3412;'
+    ),
+    'K': (
+        'background-color: #dbeafe; '
+        'font-weight: 700; '
+        'color: #1d4ed8;'
+    )
+}
+
+JOINT_MOMENT_EQUILIBRIUM_STATUS_STYLES = {
+    'OK': (
+        'background-color: #dcfce7; '
+        'font-weight: 700; '
+        'color: #166534;'
+    ),
+    'PERLU CEK': (
+        'background-color: #fee2e2; '
+        'font-weight: 700; '
+        'color: #991b1b;'
+    )
+}
+
 
 def format_metric(value, decimals: int = 4) -> str:
     """Format nilai numerik untuk metrik UI."""
@@ -134,6 +166,19 @@ def format_error_message(exc: Exception) -> str:
     if not message:
         return exc.__class__.__name__
     return message
+
+
+def multiply_finite_values(left_value, right_value) -> Optional[float]:
+    """Kalikan dua angka jika keduanya valid dan finite."""
+    try:
+        left_numeric = float(left_value)
+        right_numeric = float(right_value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(left_numeric) or not np.isfinite(right_numeric):
+        return None
+    return left_numeric * right_numeric
 
 
 def style_input_dataframe(df: pd.DataFrame):
@@ -395,11 +440,12 @@ def prepare_input_file(path_text: str, uploaded_file) -> Tuple[Optional[str], Op
 
 def count_probabilistic_random_variables(input_data: Dict) -> int:
     """Hitung jumlah variabel random yang aktif pada mode probabilistik."""
+    bias_count = len(input_data.get('geometry', {}).get('fb_by_element', {}))
     concrete_count = len(input_data.get('concrete', {}).get('by_element', {}))
     steel_count = len(input_data.get('steel', {}).get('by_element', {})) * 3
     dead_load_count = len(input_data.get('dead_load', {}).get('by_element', {}))
     live_load_count = len(input_data.get('live_load', {}).get('by_element', {}))
-    return int(concrete_count + steel_count + dead_load_count + live_load_count)
+    return int(bias_count + concrete_count + steel_count + dead_load_count + live_load_count)
 
 
 def estimate_analysis_runtime_seconds(input_data: Optional[Dict],
@@ -485,12 +531,16 @@ def build_elements_df(input_data: Dict, is_probabilistic: bool) -> pd.DataFrame:
     geometry = input_data['geometry']
     props_by_element = geometry.get('properties_by_element', {})
     e_column_name = 'E_mean (MPa)' if is_probabilistic else 'E_deterministic (MPa)'
+    include_bias_columns = any(
+        ('fb_mean' in props) or ('fb_stdev' in props)
+        for props in props_by_element.values()
+    )
 
     if props_by_element:
         rows = []
         for elem_id in sorted(props_by_element):
             props = props_by_element[elem_id]
-            rows.append({
+            row = {
                 'Element_ID': int(elem_id),
                 'Kode': props.get('code', ''),
                 'Node_Start': int(props.get('node_start', 0)),
@@ -504,7 +554,16 @@ def build_elements_df(input_data: Dict, is_probabilistic: bool) -> pd.DataFrame:
                     if is_probabilistic else
                     props.get('E_deterministic')
                 )
-            })
+            }
+            if include_bias_columns:
+                row['fb_mean'] = props.get('fb_mean')
+                row['fb_stdev'] = props.get('fb_stdev')
+                if is_probabilistic:
+                    row['E_acuan_mean (MPa)'] = multiply_finite_values(
+                        props.get('E_mean'),
+                        props.get('fb_mean')
+                    )
+            rows.append(row)
         return pd.DataFrame(rows)
 
     if is_probabilistic:
@@ -518,6 +577,21 @@ def build_elements_df(input_data: Dict, is_probabilistic: bool) -> pd.DataFrame:
     )
     if np.asarray(base_elements).shape[1] >= 6:
         df[e_column_name] = np.asarray(base_elements)[:, 5]
+    if is_probabilistic and 'E_mean (MPa)' in df.columns:
+        bias_lookup = geometry.get('fb_by_element', {}) or {}
+        if bias_lookup:
+            df['fb_mean'] = df['Element_ID'].map(
+                lambda elem_id: get_by_element_value(bias_lookup, int(elem_id), {}).get('mean')
+                if isinstance(get_by_element_value(bias_lookup, int(elem_id), {}), dict) else None
+            )
+            df['fb_stdev'] = df['Element_ID'].map(
+                lambda elem_id: get_by_element_value(bias_lookup, int(elem_id), {}).get('stddev')
+                if isinstance(get_by_element_value(bias_lookup, int(elem_id), {}), dict) else None
+            )
+            df['E_acuan_mean (MPa)'] = [
+                multiply_finite_values(e_value, fb_value)
+                for e_value, fb_value in zip(df['E_mean (MPa)'], df['fb_mean'])
+            ]
     for col in ('Element_ID', 'Node_Start', 'Node_End'):
         df[col] = df[col].astype(int)
     return df
@@ -565,6 +639,44 @@ def build_latest_sample_df(latest_simulation: Dict) -> pd.DataFrame:
         {'Variable': key, 'Sample Value': value}
         for key, value in sorted(sample.items())
     ])
+
+
+def build_effective_modulus_snapshot_df(input_data: Dict,
+                                        latest_simulation: Dict,
+                                        is_probabilistic: bool) -> pd.DataFrame:
+    """Bangun snapshot E efektif per elemen untuk simulasi aktif."""
+    if not is_probabilistic:
+        return pd.DataFrame()
+
+    geometry = input_data.get('geometry', {})
+    props_by_element = geometry.get('properties_by_element', {}) or {}
+    if not props_by_element:
+        return pd.DataFrame()
+
+    random_sample = latest_simulation.get('random_sample') or {}
+    rows = []
+    for elem_id in sorted(props_by_element):
+        props = props_by_element[elem_id] or {}
+        e_mean = props.get('E_mean')
+        fb_mean = props.get('fb_mean')
+        if e_mean is None or fb_mean is None:
+            continue
+
+        active_fb = random_sample.get(f'fb_E{int(elem_id)}')
+        if active_fb is None:
+            active_fb = fb_mean
+
+        rows.append({
+            'Element_ID': int(elem_id),
+            'Kode': props.get('code', ''),
+            'E_mean (MPa)': e_mean,
+            'fb_mean': fb_mean,
+            'fb_dipakai_DSM (-)': active_fb,
+            'E_acuan_mean (MPa)': multiply_finite_values(e_mean, fb_mean),
+            'E_dipakai_DSM (MPa)': multiply_finite_values(e_mean, active_fb)
+        })
+
+    return pd.DataFrame(rows)
 
 
 def build_concrete_input_df(input_data: Dict) -> pd.DataFrame:
@@ -723,17 +835,21 @@ def get_element_type_label(code: str) -> str:
 
 def build_internal_force_df(latest_result: Dict, input_data: Optional[Dict] = None) -> pd.DataFrame:
     rows = []
+    connectivity = build_element_connectivity_lookup(input_data)
     for force in latest_result.get('element_forces', []):
         elem_id = int(force['elem_id'])
         code = get_element_code_from_input(input_data, elem_id)
-        is_beam = str(code).strip().upper() == 'B'
-        moment_start = float(force['moment_start'])
-        moment_end_joint = float(force['moment_end'])
-        moment_end_internal = float(force.get('moment_end_internal'))
-        if is_beam:
-            moment_start = -moment_start
-            moment_end_joint = -moment_end_joint
-            moment_end_internal = -moment_end_internal
+        node_start, node_end = connectivity.get(elem_id, (None, None))
+        moment_start, moment_end_joint, moment_end_internal = (
+            get_displayed_element_moment_values(
+                code=code,
+                raw_start_joint=float(force['moment_start']),
+                raw_end_joint=float(force['moment_end']),
+                raw_end_internal=float(force.get('moment_end_internal')),
+                node_start=node_start,
+                node_end=node_end
+            )
+        )
         rows.append({
             'Element_ID (-)': elem_id,
             'Kode': code,
@@ -755,6 +871,288 @@ def build_internal_force_df(latest_result: Dict, input_data: Optional[Dict] = No
             'Max_Moment (kN.m)': force.get('max_moment'),
             'X_Max_Moment (m)': force.get('x_max_moment')
         })
+    return pd.DataFrame(rows)
+
+
+def build_internal_force_sign_guide_figure():
+    """Bangun panduan visual tanda gaya dalam untuk dibaca di dashboard."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), dpi=180)
+
+    beam_ax, column_ax = axes
+    for axis in axes:
+        axis.set_xlim(0.0, 1.0)
+        axis.set_ylim(0.0, 1.0)
+        axis.axis('off')
+
+    beam_ax.set_title("Balok B", fontsize=12, fontweight='bold')
+    beam_y = 0.58
+    beam_ax.plot([0.15, 0.85], [beam_y, beam_y], color='#1f2937', linewidth=3)
+    beam_ax.scatter([0.15, 0.85], [beam_y, beam_y], color='#111827', s=28, zorder=3)
+    beam_ax.text(0.15, beam_y + 0.05, "Start", ha='center', fontsize=9)
+    beam_ax.text(0.85, beam_y + 0.05, "End", ha='center', fontsize=9)
+    beam_ax.annotate(
+        "",
+        xy=(0.80, 0.88),
+        xytext=(0.20, 0.88),
+        arrowprops=dict(arrowstyle='-|>', color='#374151', linewidth=1.6)
+    )
+    beam_ax.text(0.50, 0.91, "Sumbu lokal x: Start -> End", ha='center', fontsize=9, color='#374151')
+
+    beam_ax.annotate("", xy=(0.39, 0.72), xytext=(0.23, 0.72),
+                     arrowprops=dict(arrowstyle='-|>', color='#b91c1c', linewidth=1.6))
+    beam_ax.annotate("", xy=(0.61, 0.72), xytext=(0.77, 0.72),
+                     arrowprops=dict(arrowstyle='-|>', color='#b91c1c', linewidth=1.6))
+    beam_ax.text(0.50, 0.75, "Axial + = tekan", ha='center', fontsize=9, color='#991b1b')
+
+    beam_ax.annotate("", xy=(0.23, 0.18), xytext=(0.39, 0.18),
+                     arrowprops=dict(arrowstyle='-|>', color='#2563eb', linewidth=1.6))
+    beam_ax.annotate("", xy=(0.77, 0.18), xytext=(0.61, 0.18),
+                     arrowprops=dict(arrowstyle='-|>', color='#2563eb', linewidth=1.6))
+    beam_ax.text(0.50, 0.12, "Axial - = tarik", ha='center', fontsize=9, color='#1d4ed8')
+
+    x_beam = np.linspace(0.23, 0.77, 120)
+    positive_curve = beam_y - 0.11 * np.sin(np.pi * (x_beam - x_beam.min()) / (x_beam.max() - x_beam.min()))
+    negative_curve = beam_y + 0.11 * np.sin(np.pi * (x_beam - x_beam.min()) / (x_beam.max() - x_beam.min()))
+    beam_ax.plot(x_beam, positive_curve, color='#2563eb', linewidth=2.2)
+    beam_ax.plot(x_beam, negative_curve, color='#dc2626', linewidth=2.2)
+    beam_ax.text(0.50, 0.34, "Momen + di tabel = sagging / lapangan", ha='center', fontsize=9, color='#1d4ed8')
+    beam_ax.text(0.50, 0.80, "Momen - di tabel = hogging / tumpuan", ha='center', fontsize=9, color='#991b1b')
+    beam_ax.text(
+        0.50,
+        0.03,
+        "Untuk cek joint, konversi tanda balok ditangani otomatis; node 5 memakai tanda joint solver.",
+        ha='center',
+        fontsize=8.5,
+        color='#374151',
+        bbox=dict(boxstyle='round,pad=0.25', facecolor='#f8fafc', edgecolor='#cbd5e1')
+    )
+
+    column_ax.set_title("Kolom K", fontsize=12, fontweight='bold')
+    column_x = 0.50
+    column_ax.plot([column_x, column_x], [0.16, 0.84], color='#1f2937', linewidth=3)
+    column_ax.scatter([column_x, column_x], [0.16, 0.84], color='#111827', s=28, zorder=3)
+    column_ax.text(column_x + 0.07, 0.16, "Start", va='center', fontsize=9)
+    column_ax.text(column_x + 0.07, 0.84, "End", va='center', fontsize=9)
+    column_ax.annotate(
+        "",
+        xy=(0.18, 0.84),
+        xytext=(0.18, 0.20),
+        arrowprops=dict(arrowstyle='-|>', color='#374151', linewidth=1.6)
+    )
+    column_ax.text(0.21, 0.52, "Sumbu lokal x", rotation=90, va='center', fontsize=9, color='#374151')
+
+    column_ax.annotate("", xy=(0.50, 0.42), xytext=(0.50, 0.27),
+                       arrowprops=dict(arrowstyle='-|>', color='#b91c1c', linewidth=1.6))
+    column_ax.annotate("", xy=(0.50, 0.58), xytext=(0.50, 0.73),
+                       arrowprops=dict(arrowstyle='-|>', color='#b91c1c', linewidth=1.6))
+    column_ax.text(0.68, 0.50, "Axial + = tekan", fontsize=9, color='#991b1b', va='center')
+
+    column_ax.text(
+        0.64,
+        0.74,
+        "Momen kolom di tabel\nlangsung mengikuti tanda lokal solver.",
+        fontsize=9,
+        color='#1f2937',
+        ha='left',
+        va='top',
+        bbox=dict(boxstyle='round,pad=0.25', facecolor='#f8fafc', edgecolor='#cbd5e1')
+    )
+    column_ax.text(
+        0.64,
+        0.43,
+        "Untuk cek joint,\nmomen kolom bisa dijumlah langsung.",
+        fontsize=9,
+        color='#1f2937',
+        ha='left',
+        va='top',
+        bbox=dict(boxstyle='round,pad=0.25', facecolor='#f8fafc', edgecolor='#cbd5e1')
+    )
+    column_ax.text(
+        0.64,
+        0.18,
+        "Shear + / - tetap mengikuti\nsumbu lokal solver per elemen.",
+        fontsize=9,
+        color='#1f2937',
+        ha='left',
+        va='top',
+        bbox=dict(boxstyle='round,pad=0.25', facecolor='#f8fafc', edgecolor='#cbd5e1')
+    )
+
+    fig.suptitle("Panduan Visual Tanda Positif dan Negatif pada Tabel Gaya Dalam", fontsize=13, y=0.99)
+    fig.tight_layout()
+    return fig
+
+
+def build_internal_force_sign_guide_df() -> pd.DataFrame:
+    """Ringkasan aturan tanda gaya dalam yang tampil di tabel output."""
+    return pd.DataFrame([
+        {
+            'Komponen': 'Axial',
+            'Jenis': 'Balok dan Kolom',
+            'Positif di Tabel': 'Tekan',
+            'Negatif di Tabel': 'Tarik',
+            'Catatan': 'Berlaku untuk Start, End_Joint, dan End_Internal.'
+        },
+        {
+            'Komponen': 'Moment',
+            'Jenis': 'Balok (B)',
+            'Positif di Tabel': 'Sagging / lapangan',
+            'Negatif di Tabel': 'Hogging / tumpuan',
+            'Catatan': (
+                'Nilai momen balok pada tabel umumnya dibalik dari solver; '
+                'khusus node 5 momen joint balok ditampilkan langsung '
+                'mengikuti tanda aksi joint solver.'
+            )
+        },
+        {
+            'Komponen': 'Moment',
+            'Jenis': 'Kolom (K)',
+            'Positif di Tabel': 'Sesuai aksi joint lokal solver',
+            'Negatif di Tabel': 'Kebalikan aksi joint lokal solver',
+            'Catatan': 'Nilai momen kolom tidak dibalik; bisa langsung dipakai pada cek joint.'
+        },
+        {
+            'Komponen': 'Shear',
+            'Jenis': 'Balok dan Kolom',
+            'Positif di Tabel': 'Sesuai sumbu lokal solver',
+            'Negatif di Tabel': 'Kebalikan sumbu lokal solver',
+            'Catatan': 'Untuk cek node gunakan Start atau End_Joint, bukan End_Internal.'
+        }
+    ])
+
+
+def build_element_connectivity_lookup(input_data: Optional[Dict]) -> Dict[int, Tuple[int, int]]:
+    """Ambil pasangan node awal-akhir setiap elemen dari input geometri."""
+    if not input_data:
+        return {}
+
+    geometry = input_data.get('geometry', {})
+    connectivity: Dict[int, Tuple[int, int]] = {}
+
+    for elem_id, props in (geometry.get('properties_by_element', {}) or {}).items():
+        elem_id_int = int(elem_id)
+        node_start = int(props.get('node_start', 0) or 0)
+        node_end = int(props.get('node_end', 0) or 0)
+        if node_start > 0 and node_end > 0:
+            connectivity[elem_id_int] = (node_start, node_end)
+
+    base_elements = geometry.get('elements')
+    if base_elements is not None:
+        for row in np.asarray(base_elements):
+            if len(row) < 3:
+                continue
+            connectivity.setdefault(
+                int(row[0]),
+                (int(row[1]), int(row[2]))
+            )
+
+    return dict(sorted(connectivity.items()))
+
+
+def build_joint_moment_equilibrium_df(latest_result: Dict,
+                                      input_data: Optional[Dict] = None) -> pd.DataFrame:
+    """Bangun tabel cek Sigma M per node dari tabel gaya dalam elemen."""
+    if not latest_result or not input_data:
+        return pd.DataFrame()
+
+    internal_force_df = build_internal_force_df(latest_result, input_data=input_data)
+    if internal_force_df.empty:
+        return pd.DataFrame()
+
+    force_lookup = {
+        int(row['Element_ID (-)']): row
+        for _, row in internal_force_df.iterrows()
+    }
+    connectivity = build_element_connectivity_lookup(input_data)
+    if not connectivity:
+        return pd.DataFrame()
+
+    geometry_nodes = input_data.get('geometry', {}).get('nodes', [])
+    node_ids = sorted({
+        int(node[0]) for node in np.asarray(geometry_nodes)
+    })
+    nodal_load_lookup = input_data.get('nodal_loads', {}) or {}
+    boundary_lookup = input_data.get('boundary', {}) or {}
+    reactions = np.asarray(latest_result.get('reactions', []), dtype=float)
+    nodal_load_vector = np.asarray(latest_result.get('nodal_loads', []), dtype=float)
+
+    rows = []
+    for node_id in node_ids:
+        connected_count = 0
+        sum_element_moment = 0.0
+        contribution_labels = []
+
+        for elem_id, (node_start, node_end) in connectivity.items():
+            if elem_id not in force_lookup:
+                continue
+
+            row = force_lookup[elem_id]
+            code = str(row.get('Kode', '') or '').strip().upper()
+
+            table_moment = None
+            end_label = None
+            joint_node_id = None
+            if node_id == node_start:
+                table_moment = pd.to_numeric(row.get('Moment_Start (kN.m)'), errors='coerce')
+                end_label = 'Start'
+                joint_node_id = node_start
+            elif node_id == node_end:
+                table_moment = pd.to_numeric(row.get('Moment_End_Joint (kN.m)'), errors='coerce')
+                end_label = 'End'
+                joint_node_id = node_end
+
+            if end_label is None or pd.isna(table_moment):
+                continue
+
+            contribution = get_joint_equilibrium_moment(
+                float(table_moment),
+                code=code,
+                joint_node_id=joint_node_id
+            )
+            connected_count += 1
+            sum_element_moment += contribution
+            contribution_labels.append(
+                f"E{elem_id}({end_label},{code}): tabel={float(table_moment):+.4f} -> cek={contribution:+.4f}"
+            )
+
+        dof = (node_id - 1) * 3
+        if nodal_load_vector.size > dof + 2:
+            nodal_moment = float(nodal_load_vector[dof + 2])
+        else:
+            nodal_moment = float(
+                (nodal_load_lookup.get(node_id) or nodal_load_lookup.get(str(node_id)) or {}).get('Mz', 0.0) or 0.0
+            )
+
+        boundary_props = (
+            boundary_lookup.get(node_id)
+            or boundary_lookup.get(str(node_id))
+            or {}
+        )
+        if reactions.size > dof + 2 and int(boundary_props.get('R', 0) or 0) == 1:
+            reaction_moment = float(reactions[dof + 2])
+        else:
+            reaction_moment = 0.0
+
+        residual = sum_element_moment + nodal_moment - reaction_moment
+        status = (
+            'OK'
+            if abs(residual) <= MOMENT_EQUILIBRIUM_TOLERANCE_KNM else
+            'PERLU CEK'
+        )
+
+        rows.append({
+            'Node_ID (-)': int(node_id),
+            'Jumlah_Elemen_Terkoneksi (-)': connected_count,
+            'Kontribusi_Elemen_dari_Tabel (-)': (
+                ' | '.join(contribution_labels) if contribution_labels else '-'
+            ),
+            'Sigma_M_Elemen_Cek (kN.m)': float(sum_element_moment),
+            'Mz_Beban_Nodal (kN.m)': float(nodal_moment),
+            'Mz_Reaksi (kN.m)': float(reaction_moment),
+            'Residual_Sigma_M (kN.m)': float(residual),
+            'Status_Equilibrium': status
+        })
+
     return pd.DataFrame(rows)
 
 
@@ -822,6 +1220,14 @@ def style_internal_force_df(df: pd.DataFrame):
             group_mask = dataframe['Kode'].astype(str).str.upper() == code
             if not group_mask.any():
                 continue
+            highlight_style = INTERNAL_FORCE_MAX_HIGHLIGHT_STYLES.get(
+                code,
+                (
+                    'background-color: #f8d7da; '
+                    'font-weight: 700; '
+                    'color: #7a0019;'
+                )
+            )
 
             for col in highlight_columns:
                 series = pd.to_numeric(dataframe.loc[group_mask, col], errors='coerce')
@@ -830,21 +1236,55 @@ def style_internal_force_df(df: pd.DataFrame):
                     continue
                 winner_mask = pd.Series(False, index=dataframe.index)
                 winner_mask.loc[winner_group_mask.index] = winner_group_mask
-                styles.loc[winner_mask, col] = (
-                    'background-color: #f8d7da; '
-                    'font-weight: 700; '
-                    'color: #7a0019;'
-                )
+                styles.loc[winner_mask, col] = highlight_style
                 if identity_columns:
-                    styles.loc[winner_mask, identity_columns] = (
-                        'background-color: #f8d7da; '
-                        'font-weight: 700; '
-                        'color: #7a0019;'
-                    )
+                    styles.loc[winner_mask, identity_columns] = highlight_style
         return styles
 
     styler = styler.apply(highlight_max_abs, axis=None)
     return styler
+
+
+def style_joint_moment_equilibrium_df(df: pd.DataFrame):
+    """Warna header dan status untuk tabel cek Sigma M per node."""
+    styler = style_input_dataframe(df)
+    styler = apply_grouped_header_styles(
+        styler,
+        df,
+        {
+            'identity': [
+                'Node_ID (-)',
+                'Jumlah_Elemen_Terkoneksi (-)',
+                'Kontribusi_Elemen_dari_Tabel (-)'
+            ],
+            'moment': [
+                'Sigma_M_Elemen_Cek (kN.m)',
+                'Residual_Sigma_M (kN.m)'
+            ],
+            'load': ['Mz_Beban_Nodal (kN.m)'],
+            'overall': ['Mz_Reaksi (kN.m)', 'Status_Equilibrium']
+        }
+    )
+    if df.empty:
+        return styler
+
+    def highlight_status(dataframe: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame('', index=dataframe.index, columns=dataframe.columns)
+        residual_column = 'Residual_Sigma_M (kN.m)'
+        status_column = 'Status_Equilibrium'
+        residual_values = pd.to_numeric(dataframe[residual_column], errors='coerce')
+        ok_mask = residual_values.abs() <= MOMENT_EQUILIBRIUM_TOLERANCE_KNM
+
+        styles.loc[ok_mask, residual_column] = JOINT_MOMENT_EQUILIBRIUM_STATUS_STYLES['OK']
+        styles.loc[~ok_mask, residual_column] = JOINT_MOMENT_EQUILIBRIUM_STATUS_STYLES['PERLU CEK']
+
+        status_styles = dataframe[status_column].astype(str).map(
+            lambda value: JOINT_MOMENT_EQUILIBRIUM_STATUS_STYLES.get(value, '')
+        )
+        styles.loc[:, status_column] = status_styles
+        return styles
+
+    return styler.apply(highlight_status, axis=None)
 
 
 def style_performance_df(df: pd.DataFrame):
@@ -1660,6 +2100,7 @@ def run_analysis_dashboard(input_file: str,
         progress_text = st.empty()
         progress = st.progress(0)
         status = st.empty()
+        simulation_progress_text = st.empty()
     if analysis.is_probabilistic:
         steps = [
             ("Membaca data input", analysis.read_input),
@@ -1684,11 +2125,45 @@ def run_analysis_dashboard(input_file: str,
 
     for index, (label, callback) in enumerate(steps, start=1):
         status.markdown(f"**Tahap:** {label}")
-        callback()
-        progress_fraction = index / total_steps
+        if analysis.is_probabilistic and label == "Menjalankan simulasi Monte Carlo":
+            simulation_progress_text.markdown(
+                (
+                    "<div style='font-size:0.9rem; color:#e5e7eb; "
+                    "margin-top:0.15rem;'>Menyiapkan progress simulasi Monte Carlo...</div>"
+                ),
+                unsafe_allow_html=True
+            )
+
+            def monte_carlo_progress_callback(progress_info: Dict[str, Any]) -> None:
+                completed_fraction = float(progress_info.get('completed_fraction', 0.0) or 0.0)
+                overall_progress_fraction = ((index - 1) + completed_fraction) / total_steps
+                progress.progress(overall_progress_fraction)
+                render_progress_percentage(
+                    progress_text,
+                    overall_progress_fraction,
+                    index,
+                    total_steps
+                )
+                render_simulation_progress(
+                    simulation_progress_text,
+                    completed_simulations=int(progress_info.get('completed_simulations', 0) or 0),
+                    total_simulations=int(progress_info.get('total_simulations', num_simulations) or num_simulations),
+                    analysis_failures=int(progress_info.get('analysis_failures', 0) or 0)
+                )
+
+            callback(
+                progress_callback=monte_carlo_progress_callback,
+                progress_interval=max(1, int(num_simulations) // 100)
+            )
+            progress_fraction = index / total_steps
+        else:
+            simulation_progress_text.empty()
+            callback()
+            progress_fraction = index / total_steps
         progress.progress(progress_fraction)
         render_progress_percentage(progress_text, progress_fraction, index, total_steps)
 
+    simulation_progress_text.empty()
     status.markdown("**Tahap:** Selesai")
     return analysis
 
@@ -3021,6 +3496,52 @@ def render_progress_percentage(target,
     )
 
 
+def render_simulation_progress(target,
+                               completed_simulations: int,
+                               total_simulations: int,
+                               analysis_failures: int = 0) -> None:
+    """Tampilkan progres Monte Carlo berjalan agar sisa simulasi mudah dipantau."""
+    total_value = max(int(total_simulations or 0), 0)
+    completed_value = min(max(int(completed_simulations or 0), 0), total_value)
+    remaining_value = max(total_value - completed_value, 0)
+    completed_percent = (
+        (completed_value / total_value) * 100.0 if total_value > 0 else 0.0
+    )
+    remaining_percent = max(100.0 - completed_percent, 0.0)
+
+    analysis_failures_html = ""
+    if int(analysis_failures or 0) > 0:
+        analysis_failures_html = (
+            "<div style='font-size:0.86rem; color:#fecaca; margin-top:0.2rem;'>"
+            f"Gagal dieksekusi: {int(analysis_failures):,} simulasi"
+            "</div>"
+        )
+
+    target.markdown(
+        (
+            "<div style='margin-top:0.35rem; margin-bottom:0.35rem; "
+            "padding:0.55rem 0.7rem; border-radius:0.7rem; "
+            "background:rgba(255,255,255,0.08); "
+            "border:1px solid rgba(255,255,255,0.16);'>"
+            "<div style='font-size:0.98rem; font-weight:700; color:#f9fafb;'>"
+            "Progress Monte Carlo"
+            "</div>"
+            "<div style='font-size:0.9rem; color:#e5e7eb; margin-top:0.18rem;'>"
+            f"Selesai: {completed_value:,}/{total_value:,} simulasi"
+            "</div>"
+            "<div style='font-size:0.9rem; color:#bbf7d0; margin-top:0.14rem;'>"
+            f"Persen selesai: {completed_percent:.2f}%"
+            "</div>"
+            "<div style='font-size:0.9rem; color:#fde68a; margin-top:0.14rem;'>"
+            f"Sisa: {remaining_value:,} simulasi ({remaining_percent:.2f}%)"
+            "</div>"
+            f"{analysis_failures_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True
+    )
+
+
 st.set_page_config(
     page_title="Analisis Keandalan Struktur Portal 2D",
     layout="wide"
@@ -3059,7 +3580,7 @@ with st.sidebar:
         num_simulations = st.number_input(
             "Jumlah simulasi Monte Carlo",
             min_value=100,
-            max_value=100000,
+            max_value=1000000,
             value=10000,
             step=100
         )
@@ -3093,8 +3614,8 @@ with st.sidebar:
                     f"N={int(num_simulations):,}."
                 )
                 st.caption(
-                    "Kalibrasi acuan saat ini: 75 detik pada mode probabilistik "
-                    "dan 3 detik pada mode deterministik untuk kasus referensi."
+                    "Kalibrasi acuan saat ini: 400 detik pada mode probabilistik "
+                    "dan 5 detik pada mode deterministik untuk kasus referensi."
                 )
             else:
                 st.caption(
@@ -3102,8 +3623,8 @@ with st.sidebar:
                     "1 kali analisis deterministik."
                 )
                 st.caption(
-                    "Kalibrasi acuan saat ini: 75 detik pada mode probabilistik "
-                    "dan 3 detik pada mode deterministik untuk kasus referensi."
+                    "Kalibrasi acuan saat ini: 400 detik pada mode probabilistik "
+                    "dan 5 detik pada mode deterministik untuk kasus referensi."
                 )
         elif input_path or uploaded_file is not None:
             st.caption("Perkiraan waktu akan muncul setelah file input valid terbaca.")
@@ -3324,6 +3845,21 @@ if active_dashboard_tab == "Input":
                     "Mode deterministik tidak melakukan sampling Monte Carlo. "
                     "Analisis dijalankan satu kali dengan nilai deterministic tiap elemen."
                 )
+
+        if is_probabilistic:
+            effective_modulus_df = build_effective_modulus_snapshot_df(
+                input_data,
+                latest_simulation,
+                is_probabilistic
+            )
+            if not effective_modulus_df.empty:
+                st.markdown("#### Snapshot E Dipakai DSM")
+                st.caption(
+                    "`E_dipakai_DSM (MPa)` adalah nilai yang benar-benar dipakai solver DSM "
+                    "untuk simulasi yang sedang ditampilkan. "
+                    "`E_acuan_mean (MPa)` hanya nilai acuan hasil `E_mean x fb_mean`."
+                )
+                render_input_table(effective_modulus_df)
     else:
         mode_caption = "mean" if selected_is_probabilistic else "deterministic"
         st.caption(
@@ -3349,6 +3885,12 @@ if active_dashboard_tab == "Input":
         with geom_col_2:
             element_df = build_elements_df(input_data, selected_is_probabilistic)
             render_input_table(element_df)
+        if 'E_acuan_mean (MPa)' in element_df.columns:
+            st.caption(
+                "Kolom `E_acuan_mean (MPa)` menunjukkan hasil `E_mean x fb_mean` "
+                "per elemen sebagai nilai acuan mean. Ini bukan selalu nilai yang dipakai DSM "
+                "pada tiap simulasi."
+            )
         if (
             'E_mean (MPa)' not in element_df.columns
             and 'E_deterministic (MPa)' not in element_df.columns
@@ -3450,11 +3992,19 @@ elif active_dashboard_tab == "Output":
             "tepat sebelum ujung elemen."
         )
         st.caption(
-            "Kolom `Kode` memakai `B=Balok` dan `K=Kolom`. Sel merah muda menandai "
-            "nilai maksimum absolut per kolom secara terpisah untuk grup Balok "
-            "dan grup Kolom, termasuk identitas elemen yang mengontrol nilai tersebut. "
+            "Kolom `Kode` memakai `B=Balok` dan `K=Kolom`. Sel oranye menandai "
+            "nilai maksimum absolut grup Balok dan sel biru menandai nilai maksimum "
+            "absolut grup Kolom per kolom, termasuk identitas elemen yang mengontrol nilai tersebut. "
             "Jika ada nilai maksimum yang sama, semuanya ikut ditandai."
         )
+        if SPECIAL_BEAM_JOINT_RAW_SIGN_NODE_IDS:
+            special_nodes_text = ", ".join(
+                str(node_id) for node_id in sorted(SPECIAL_BEAM_JOINT_RAW_SIGN_NODE_IDS)
+            )
+            st.caption(
+                f"Khusus node {special_nodes_text}, momen joint balok di tabel "
+                "ditampilkan mengikuti tanda aksi joint solver."
+            )
         st.caption(
             "Warna header membedakan grup beban merata, aksial, geser, dan momen "
             "agar pembacaan tabel lebih cepat."
@@ -3463,6 +4013,35 @@ elif active_dashboard_tab == "Output":
         render_input_table(
             internal_force_df,
             styler=style_internal_force_df(internal_force_df)
+        )
+        with st.expander("Panduan Visual Tanda Gaya Dalam", expanded=False):
+            st.caption(
+                "Panduan ini membantu membaca arti tanda positif dan negatif pada tabel gaya dalam, "
+                "terutama perbedaan momen balok `B` dan kolom `K`."
+            )
+            render_plot(
+                build_internal_force_sign_guide_figure(),
+                interactive=False
+            )
+            render_input_table(build_internal_force_sign_guide_df())
+
+        st.markdown("#### Cek Keseimbangan Momen per Node")
+        st.caption(
+            "Tabel ini menjumlahkan momen joint dari tabel gaya dalam elemen pada node yang sama. "
+            "Kontribusi momen joint dihitung otomatis mengikuti konvensi tanda tampilan aktif pada tiap node."
+        )
+        st.caption(
+            "Residual dihitung dengan rumus "
+            "`Sigma_M_Elemen_Cek + Mz_Beban_Nodal - Mz_Reaksi`, "
+            f"dan dinyatakan `OK` bila |residual| <= {MOMENT_EQUILIBRIUM_TOLERANCE_KNM:.1e} kN.m."
+        )
+        joint_moment_equilibrium_df = build_joint_moment_equilibrium_df(
+            latest_result,
+            input_data=analysis_input_data
+        )
+        render_input_table(
+            joint_moment_equilibrium_df,
+            styler=style_joint_moment_equilibrium_df(joint_moment_equilibrium_df)
         )
 
         st.markdown("#### Reliabilitas Sistem Portal Gabungan")
