@@ -45,6 +45,7 @@ class PortalReliabilityAnalysis:
         self.reliability_assessment = None
         self.random_variables = {}
         self.sensitivity_results = {}
+        self.deterministic_sensitivity_results = {}
         self.latest_simulation_result = None
         self.latest_random_sample = None
         self.latest_simulation_index = None
@@ -272,45 +273,79 @@ class PortalReliabilityAnalysis:
 
     def _build_sampled_element_moduli(self,
                                       random_samples: Optional[Dict[str, float]] = None) -> Dict[int, float]:
-        """Hitung Ec sampel per elemen untuk analisis struktur probabilistik."""
+        """Hitung modulus elastisitas aktif per elemen sesuai mode analisis."""
         geometry = self.data.get('geometry', {})
+        if self.is_probabilistic:
+            base_elements = np.asarray(
+                geometry.get('elements_mean', geometry.get('elements', [])),
+                dtype=float
+            )
+            if base_elements.size == 0:
+                return {}
+
+            bias_source = geometry.get('fb_by_element', {})
+            bias_values = (
+                self._get_element_values_from_sample(
+                    random_samples,
+                    bias_source,
+                    prefix='fb',
+                    fallback_key='mean'
+                )
+                if bias_source else
+                {}
+            )
+
+            sampled_moduli = {}
+            default_modulus = float(geometry.get('E_mean', 30000.0))
+            for elem in base_elements:
+                elem_id = int(elem[0])
+                base_modulus = (
+                    float(elem[5])
+                    if len(elem) >= 6 and np.isfinite(float(elem[5])) else
+                    default_modulus
+                )
+                bias_factor = float(bias_values.get(elem_id, 1.0))
+                sampled_moduli[elem_id] = base_modulus * bias_factor
+            return sampled_moduli
+
         base_elements = np.asarray(
-            geometry.get('elements_mean', geometry.get('elements', [])),
+            geometry.get('elements_deterministic', geometry.get('elements', [])),
             dtype=float
         )
         if base_elements.size == 0:
             return {}
 
-        bias_source = geometry.get('fb_by_element', {})
-        bias_values = (
-            self._get_element_values_from_sample(
-                random_samples,
-                bias_source,
-                prefix='fb',
-                fallback_key='mean'
-            )
-            if bias_source else
-            {}
+        default_modulus = float(
+            geometry.get('E_deterministic', geometry.get('E_mean', 30000.0))
         )
-
         sampled_moduli = {}
-        default_modulus = float(geometry.get('E_mean', 30000.0))
         for elem in base_elements:
             elem_id = int(elem[0])
-            base_modulus = (
-                float(elem[5])
-                if len(elem) >= 6 and np.isfinite(float(elem[5])) else
-                default_modulus
-            )
-            bias_factor = float(bias_values.get(elem_id, 1.0))
-            sampled_moduli[elem_id] = base_modulus * bias_factor
+            sample_key = self._element_var_name('E', elem_id)
+            sample_value = (random_samples or {}).get(sample_key)
+
+            if sample_value is not None:
+                try:
+                    modulus_value = float(sample_value)
+                except (TypeError, ValueError):
+                    modulus_value = default_modulus
+                if not np.isfinite(modulus_value) or modulus_value <= 0.0:
+                    modulus_value = default_modulus
+            else:
+                modulus_value = (
+                    float(elem[5])
+                    if len(elem) >= 6 and np.isfinite(float(elem[5])) else
+                    default_modulus
+                )
+
+            sampled_moduli[elem_id] = float(modulus_value)
 
         return sampled_moduli
 
     def _apply_structural_modulus_sample(self,
                                          random_samples: Optional[Dict[str, float]] = None) -> None:
-        """Update portal aktif dengan Ec hasil sampel bias sebelum analisis DSM."""
-        if not self.is_probabilistic or self.portal is None:
+        """Update portal aktif dengan modulus elastisitas per elemen."""
+        if self.portal is None:
             return
 
         sampled_moduli = self._build_sampled_element_moduli(random_samples)
@@ -319,7 +354,14 @@ class PortalReliabilityAnalysis:
 
         self.portal.update_element_moduli(
             sampled_moduli,
-            default_E=self.data['geometry'].get('E_mean', 30000.0)
+            default_E=(
+                self.data['geometry'].get('E_mean', 30000.0)
+                if self.is_probabilistic else
+                self.data['geometry'].get(
+                    'E_deterministic',
+                    self.data['geometry'].get('E_mean', 30000.0)
+                )
+            )
         )
 
     def _build_reference_sample(self) -> Dict[str, float]:
@@ -651,6 +693,43 @@ class PortalReliabilityAnalysis:
         )
 
     @staticmethod
+    def _get_limit_state_display_mapping() -> Dict[str, Dict[str, str]]:
+        """Label dan satuan tiap key limit-state."""
+        return {
+            'performance': {
+                'label': 'Momen',
+                'unit': 'kN.m'
+            },
+            'performance_shear': {
+                'label': 'Geser',
+                'unit': 'kN'
+            },
+            'performance_axial': {
+                'label': 'Aksial',
+                'unit': 'kN'
+            },
+            'performance_axial_moment': {
+                'label': 'Aksial+Momen',
+                'unit': '(-)'
+            }
+        }
+
+    @staticmethod
+    def _compute_cov_value(mean_value: Any, stddev_value: Any) -> Optional[float]:
+        """Hitung COV = stddev / |mean| jika data valid."""
+        try:
+            mean_numeric = float(mean_value)
+            stddev_numeric = float(stddev_value)
+        except (TypeError, ValueError):
+            return None
+
+        if not np.isfinite(mean_numeric) or not np.isfinite(stddev_numeric):
+            return None
+        if abs(mean_numeric) <= 1e-12 or stddev_numeric < 0.0:
+            return None
+        return float(stddev_numeric / abs(mean_numeric))
+
+    @staticmethod
     def _get_limit_state_key_mapping() -> Dict[str, str]:
         """Mapping nama limit state ringkas ke key output analisis."""
         return {
@@ -659,6 +738,329 @@ class PortalReliabilityAnalysis:
             'axial': 'performance_axial',
             'axial_moment': 'performance_axial_moment'
         }
+
+    def _get_governing_deterministic_limit_state(self,
+                                                 analysis_result: Optional[Dict]) -> Dict[str, Any]:
+        """Tentukan limit-state pengontrol dari hasil deterministik baseline."""
+        candidates = []
+        display_mapping = self._get_limit_state_display_mapping()
+        for order, performance_key in enumerate(self._get_performance_keys()):
+            min_g_value = self._get_min_performance_value(
+                analysis_result,
+                performance_key=performance_key
+            )
+            if min_g_value is None:
+                continue
+            display_info = display_mapping.get(performance_key, {})
+            candidates.append({
+                'performance_key': performance_key,
+                'limit_state_label': display_info.get('label', performance_key),
+                'unit': display_info.get('unit', '-'),
+                'g_value': float(min_g_value),
+                'order': order
+            })
+
+        if not candidates:
+            return {}
+
+        return min(
+            candidates,
+            key=lambda item: (item['g_value'], item['order'])
+        )
+
+    @staticmethod
+    def _compute_safety_factor(capacity: Any,
+                               demand: Any) -> Optional[float]:
+        """Hitung safety factor SF = R / S jika kapasitas dan demand valid."""
+        try:
+            capacity_value = float(capacity)
+            demand_value = float(demand)
+        except (TypeError, ValueError):
+            return None
+
+        if not np.isfinite(capacity_value) or not np.isfinite(demand_value):
+            return None
+        if abs(demand_value) <= 1e-12:
+            return float('inf') if capacity_value > 0.0 else None
+        return float(capacity_value / demand_value)
+
+    def _get_min_limit_state_response_entry(self,
+                                            analysis_result: Optional[Dict],
+                                            performance_key: str) -> Dict[str, Any]:
+        """Ambil entry pengontrol minimum untuk satu limit-state lengkap dengan SF."""
+        if not analysis_result:
+            return {}
+
+        max_forces_values = analysis_result.get('max_forces', {}) or {}
+
+        if performance_key == 'performance':
+            performance_values = analysis_result.get('performance', {}) or {}
+            metadata_values = analysis_result.get('performance_metadata', {}) or {}
+            entries = []
+            element_ids = sorted({
+                int(elem_id)
+                for elem_id in (
+                    list(max_forces_values.keys())
+                    + list(performance_values.keys())
+                    + list(metadata_values.keys())
+                )
+            })
+            for elem_id in element_ids:
+                max_forces_entry = max_forces_values.get(elem_id, {}) or {}
+                demand = max_forces_entry.get('max_moment')
+                demand = abs(float(demand)) if demand is not None else None
+                g_value = performance_values.get(elem_id)
+                meta = metadata_values.get(elem_id, {}) or {}
+                capacity = meta.get('phi_Mn')
+                if capacity is None and demand is not None and g_value is not None:
+                    capacity = float(g_value) + float(demand)
+                entries.append({
+                    'elem_id': int(elem_id),
+                    'g_value': None if g_value is None else float(g_value),
+                    'capacity': capacity,
+                    'demand': demand,
+                    'sf_value': self._compute_safety_factor(capacity, demand)
+                })
+        elif performance_key == 'performance_shear':
+            performance_values = analysis_result.get('performance_shear', {}) or {}
+            entries = []
+            element_ids = sorted({
+                int(elem_id)
+                for elem_id in (
+                    list(max_forces_values.keys())
+                    + list(performance_values.keys())
+                )
+            })
+            for elem_id in element_ids:
+                max_forces_entry = max_forces_values.get(elem_id, {}) or {}
+                demand = max_forces_entry.get('max_shear')
+                demand = abs(float(demand)) if demand is not None else None
+                g_value = performance_values.get(elem_id)
+                capacity = (
+                    None
+                    if demand is None or g_value is None else
+                    float(g_value) + float(demand)
+                )
+                entries.append({
+                    'elem_id': int(elem_id),
+                    'g_value': None if g_value is None else float(g_value),
+                    'capacity': capacity,
+                    'demand': demand,
+                    'sf_value': self._compute_safety_factor(capacity, demand)
+                })
+        elif performance_key == 'performance_axial':
+            performance_values = analysis_result.get('performance_axial', {}) or {}
+            metadata_values = analysis_result.get('performance_axial_metadata', {}) or {}
+            entries = []
+            element_ids = sorted({
+                int(elem_id)
+                for elem_id in (
+                    list(max_forces_values.keys())
+                    + list(performance_values.keys())
+                    + list(metadata_values.keys())
+                )
+            })
+            for elem_id in element_ids:
+                max_forces_entry = max_forces_values.get(elem_id, {}) or {}
+                force_data = max_forces_entry.get('forces', {}) or {}
+                demands = self._get_axial_demand_components(force_data)
+                g_value = performance_values.get(elem_id)
+                meta = metadata_values.get(elem_id, {}) or {}
+                controlling_state = str(meta.get('controlling_state', '') or '').strip().lower()
+                phi_pn = meta.get('phi_Pn')
+
+                if controlling_state == 'absolute-axial':
+                    demand = meta.get('demand_axial_abs')
+                    if demand is None:
+                        demand = max(
+                            float(demands['compression']),
+                            float(demands['tension'])
+                        )
+                    capacity = (
+                        meta.get('phi_Pn_tekan')
+                        if meta.get('phi_Pn_tekan') is not None else
+                        phi_pn
+                    )
+                elif controlling_state == 'tension':
+                    demand = float(demands['tension'])
+                    capacity = max(-float(phi_pn), 0.0) if phi_pn is not None else None
+                else:
+                    demand = float(demands['compression'])
+                    capacity = phi_pn
+
+                if capacity is None and demand is not None and g_value is not None:
+                    capacity = float(g_value) + float(demand)
+
+                entries.append({
+                    'elem_id': int(elem_id),
+                    'g_value': None if g_value is None else float(g_value),
+                    'capacity': capacity,
+                    'demand': demand,
+                    'sf_value': self._compute_safety_factor(capacity, demand)
+                })
+        elif performance_key == 'performance_axial_moment':
+            performance_values = analysis_result.get('performance_axial_moment', {}) or {}
+            metadata_values = analysis_result.get('performance_axial_moment_metadata', {}) or {}
+            entries = []
+            element_ids = sorted({
+                int(elem_id)
+                for elem_id in (
+                    list(performance_values.keys())
+                    + list(metadata_values.keys())
+                )
+            })
+            for elem_id in element_ids:
+                g_value = performance_values.get(elem_id)
+                meta = metadata_values.get(elem_id, {}) or {}
+                capacity = meta.get('lambda')
+                demand = 1.0 if capacity is not None or g_value is not None else None
+                entries.append({
+                    'elem_id': int(elem_id),
+                    'g_value': None if g_value is None else float(g_value),
+                    'capacity': capacity,
+                    'demand': demand,
+                    'sf_value': self._compute_safety_factor(capacity, demand)
+                })
+        else:
+            return {}
+
+        valid_entries = [
+            entry for entry in entries
+            if entry.get('g_value') is not None and np.isfinite(float(entry['g_value']))
+        ]
+        if not valid_entries:
+            return {}
+
+        return min(
+            valid_entries,
+            key=lambda item: (float(item['g_value']), int(item['elem_id']))
+        )
+
+    def _get_deterministic_sensitivity_variable_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Bangun daftar variabel deterministik yang diperturbasi berdasarkan COV."""
+        definitions = {}
+
+        geometry_properties = self.data.get('geometry', {}).get('properties_by_element', {})
+        for elem_id, props in geometry_properties.items():
+            baseline_value = props.get('E_deterministic', props.get('E_mean'))
+            base_mean = props.get('E_mean')
+            fb_mean = props.get('fb_mean')
+            fb_stddev = props.get('fb_stdev')
+            cov_value = self._compute_cov_value(fb_mean, fb_stddev)
+
+            try:
+                baseline_value = float(baseline_value)
+                base_mean = float(base_mean)
+                fb_mean = float(fb_mean)
+                fb_stddev = float(fb_stddev)
+            except (TypeError, ValueError):
+                continue
+
+            if not np.isfinite(baseline_value) or baseline_value <= 0.0:
+                continue
+            if cov_value is None or not np.isfinite(cov_value) or cov_value <= 0.0:
+                continue
+
+            active_mean = base_mean * fb_mean
+            active_stddev = base_mean * fb_stddev
+            definitions[self._element_var_name('E', int(elem_id))] = {
+                'baseline_value': float(baseline_value),
+                'mean_value': float(active_mean),
+                'stddev_value': float(active_stddev),
+                'cov_value': float(cov_value),
+                'unit': 'MPa'
+            }
+
+        for elem_id, props in self.data.get('concrete', {}).get('by_element', {}).items():
+            baseline_value = props.get('deterministic', props.get('mean'))
+            mean_value = props.get('mean')
+            stddev_value = props.get('stddev')
+            cov_value = self._compute_cov_value(mean_value, stddev_value)
+
+            try:
+                baseline_value = float(baseline_value)
+                mean_value = float(mean_value)
+                stddev_value = float(stddev_value)
+            except (TypeError, ValueError):
+                continue
+
+            if not np.isfinite(baseline_value) or baseline_value <= 0.0:
+                continue
+            if cov_value is None or not np.isfinite(cov_value) or cov_value <= 0.0:
+                continue
+
+            definitions[self._element_var_name('fc', int(elem_id))] = {
+                'baseline_value': float(baseline_value),
+                'mean_value': float(mean_value),
+                'stddev_value': float(stddev_value),
+                'cov_value': float(cov_value),
+                'unit': 'MPa'
+            }
+
+        steel_keys = (
+            ('fy_tarik', 'tarik_deterministic', 'tarik_mean', 'tarik_stddev'),
+            ('fy_tekan', 'tekan_deterministic', 'tekan_mean', 'tekan_stddev'),
+            ('fy_geser', 'geser_deterministic', 'geser_mean', 'geser_stddev')
+        )
+        for elem_id, props in self.data.get('steel', {}).get('by_element', {}).items():
+            for prefix, deterministic_key, mean_key, stddev_key in steel_keys:
+                baseline_value = props.get(deterministic_key, props.get(mean_key))
+                mean_value = props.get(mean_key)
+                stddev_value = props.get(stddev_key)
+                cov_value = self._compute_cov_value(mean_value, stddev_value)
+
+                try:
+                    baseline_value = float(baseline_value)
+                    mean_value = float(mean_value)
+                    stddev_value = float(stddev_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if not np.isfinite(baseline_value) or baseline_value <= 0.0:
+                    continue
+                if cov_value is None or not np.isfinite(cov_value) or cov_value <= 0.0:
+                    continue
+
+                definitions[self._element_var_name(prefix, int(elem_id))] = {
+                    'baseline_value': float(baseline_value),
+                    'mean_value': float(mean_value),
+                    'stddev_value': float(stddev_value),
+                    'cov_value': float(cov_value),
+                    'unit': 'MPa'
+                }
+
+        load_sources = (
+            ('qDL', self.data.get('dead_load', {})),
+            ('qLL', self.data.get('live_load', {}))
+        )
+        for prefix, load_data in load_sources:
+            for elem_id, props in load_data.get('by_element', {}).items():
+                baseline_value = props.get('deterministic', props.get('mean'))
+                mean_value = props.get('mean')
+                stddev_value = props.get('stddev')
+                cov_value = self._compute_cov_value(mean_value, stddev_value)
+
+                try:
+                    baseline_value = float(baseline_value)
+                    mean_value = float(mean_value)
+                    stddev_value = float(stddev_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if not np.isfinite(baseline_value) or abs(baseline_value) <= 1e-12:
+                    continue
+                if cov_value is None or not np.isfinite(cov_value) or cov_value <= 0.0:
+                    continue
+
+                definitions[self._element_var_name(prefix, int(elem_id))] = {
+                    'baseline_value': float(baseline_value),
+                    'mean_value': float(mean_value),
+                    'stddev_value': float(stddev_value),
+                    'cov_value': float(cov_value),
+                    'unit': 'kN/m'
+                }
+
+        return definitions
 
     def _get_applicable_element_ids_by_limit_state(self) -> Dict[str, list[int]]:
         """Daftar elemen yang relevan untuk tiap limit state."""
@@ -1118,6 +1520,7 @@ class PortalReliabilityAnalysis:
             'analysis_mode_label': self.get_analysis_mode_label(),
             'input_data': self.data,
             'random_variables': self.random_variables,
+            'deterministic_sensitivity_results': self.deterministic_sensitivity_results,
             'portal_system_reliability': self.get_portal_system_reliability_results(),
             'element_reliability': (
                 self.mc_results.get('element_reliability', {})
@@ -1432,7 +1835,7 @@ class PortalReliabilityAnalysis:
             random_samples,
             self.data['dead_load'].get('by_element', {}),
             prefix='qDL',
-            fallback_key='mean'
+            fallback_key='mean' if self.is_probabilistic else 'deterministic'
         )
         dead_load_dict = {'values': dead_load_values}
 
@@ -1440,7 +1843,7 @@ class PortalReliabilityAnalysis:
             random_samples,
             self.data['live_load'].get('by_element', {}),
             prefix='qLL',
-            fallback_key='mean'
+            fallback_key='mean' if self.is_probabilistic else 'deterministic'
         )
         live_load_dict = {'values': live_load_values}
         
@@ -1465,7 +1868,7 @@ class PortalReliabilityAnalysis:
 
     def run_deterministic_analysis(self):
         """Jalankan satu kali analisis dengan input deterministik Excel."""
-        print("\n[3/5] Running deterministic structural analysis...")
+        print("\n[3/6] Running deterministic structural analysis...")
 
         reference_sample = self._build_reference_sample()
         dead_load_dict = self._build_mean_load_dict(
@@ -1491,6 +1894,7 @@ class PortalReliabilityAnalysis:
 
         self.random_variables = {}
         self.sensitivity_results = {}
+        self.deterministic_sensitivity_results = {}
         self.latest_random_sample = reference_sample
         self.latest_simulation_result = deterministic_result
         self.latest_simulation_index = 0
@@ -1546,7 +1950,209 @@ class PortalReliabilityAnalysis:
         print(f"  [OK] Status: {'SAFE' if is_safe else 'UNSAFE'}")
 
         return deterministic_result
-    
+
+    def deterministic_sensitivity_analysis(self,
+                                           cov_scale: float = 1.0) -> Dict[str, Any]:
+        """Analisis sensitivitas lokal deterministik dengan perturbasi one-at-a-time berbasis COV."""
+        if self.is_probabilistic:
+            self.deterministic_sensitivity_results = {}
+            return {}
+
+        print("\n[4/6] Running deterministic sensitivity analysis...")
+
+        baseline_sample = dict(self.latest_random_sample or self._build_reference_sample())
+        baseline_result = self.latest_simulation_result
+        if baseline_result is None:
+            baseline_result = self.analysis_function(
+                baseline_sample,
+                include_section_samples=True
+            )
+
+        governing_state = self._get_governing_deterministic_limit_state(baseline_result)
+        if baseline_result is None or not governing_state:
+            self.deterministic_sensitivity_results = {}
+            print("  [OK] Deterministic sensitivity skipped because baseline result is unavailable")
+            return {}
+
+        target_key = governing_state['performance_key']
+        target_label = governing_state['limit_state_label']
+        target_unit = governing_state['unit']
+        baseline_entry = self._get_min_limit_state_response_entry(
+            baseline_result,
+            target_key
+        )
+        baseline_g_value = governing_state['g_value']
+        baseline_sf_value = baseline_entry.get('sf_value')
+
+        variable_definitions = self._get_deterministic_sensitivity_variable_definitions()
+        analysis_failures = 0
+        results = {}
+
+        for variable_name, metadata in variable_definitions.items():
+            baseline_value = float(metadata.get('baseline_value', 0.0))
+            cov_value = float(metadata.get('cov_value', 0.0) or 0.0)
+            sigma_value = float(metadata.get('stddev_value', 0.0) or 0.0) * float(cov_scale)
+            if not np.isfinite(baseline_value) or abs(baseline_value) <= 1e-12:
+                continue
+            if not np.isfinite(cov_value) or cov_value <= 0.0:
+                continue
+            if not np.isfinite(sigma_value) or sigma_value <= 0.0:
+                continue
+
+            perturbation_ratio = float(sigma_value / abs(baseline_value))
+            if not np.isfinite(perturbation_ratio) or perturbation_ratio <= 0.0:
+                continue
+
+            plus_value = baseline_value + sigma_value
+            minus_value = baseline_value - sigma_value
+
+            if baseline_value > 0.0 and minus_value <= 0.0:
+                minus_value = max(baseline_value * 0.1, 1e-9)
+
+            plus_sample = dict(baseline_sample)
+            minus_sample = dict(baseline_sample)
+            plus_sample[variable_name] = float(plus_value)
+            minus_sample[variable_name] = float(minus_value)
+
+            plus_result = self.analysis_function(
+                plus_sample,
+                include_section_samples=True
+            )
+            minus_result = self.analysis_function(
+                minus_sample,
+                include_section_samples=True
+            )
+            if plus_result is None:
+                analysis_failures += 1
+            if minus_result is None:
+                analysis_failures += 1
+
+            g_plus = self._get_min_performance_value(
+                plus_result,
+                performance_key=target_key
+            )
+            g_minus = self._get_min_performance_value(
+                minus_result,
+                performance_key=target_key
+            )
+            plus_entry = self._get_min_limit_state_response_entry(
+                plus_result,
+                target_key
+            )
+            minus_entry = self._get_min_limit_state_response_entry(
+                minus_result,
+                target_key
+            )
+
+            delta_plus = (
+                float(g_plus - baseline_g_value)
+                if g_plus is not None else
+                None
+            )
+            delta_minus = (
+                float(g_minus - baseline_g_value)
+                if g_minus is not None else
+                None
+            )
+
+            effect_candidates = []
+            if delta_plus is not None and np.isfinite(delta_plus):
+                effect_candidates.append(('plus', abs(delta_plus), delta_plus))
+            if delta_minus is not None and np.isfinite(delta_minus):
+                effect_candidates.append(('minus', abs(delta_minus), delta_minus))
+            if not effect_candidates:
+                continue
+
+            worst_case = max(
+                effect_candidates,
+                key=lambda item: (item[1], 0 if item[0] == 'plus' else 1)
+            )
+
+            results[variable_name] = {
+                'baseline_value': baseline_value,
+                'mean_value': metadata.get('mean_value'),
+                'stddev_value': metadata.get('stddev_value'),
+                'cov_value': cov_value,
+                'sigma_value': float(sigma_value),
+                'perturbation_ratio': float(perturbation_ratio),
+                'unit': metadata.get('unit', '-'),
+                'g_baseline': float(baseline_g_value),
+                'g_plus': None if g_plus is None else float(g_plus),
+                'g_minus': None if g_minus is None else float(g_minus),
+                'sf_baseline': baseline_sf_value,
+                'sf_plus': plus_entry.get('sf_value'),
+                'sf_minus': minus_entry.get('sf_value'),
+                'delta_g_plus': delta_plus,
+                'delta_g_minus': delta_minus,
+                'sensitivity_index': float(worst_case[1]),
+                'signed_effect': float(worst_case[2]),
+                'worst_case': (
+                    'Hampir tidak mengubah margin keamanan'
+                    if np.isclose(float(worst_case[2]), 0.0, atol=1e-12, rtol=1e-9) else
+                    (
+                        'Meningkatkan margin keamanan'
+                        if float(worst_case[2]) > 0.0 else
+                        'Mengurangi margin keamanan'
+                    )
+                )
+            }
+
+        self._apply_structural_modulus_sample(baseline_sample)
+        self.deterministic_sensitivity_results = {
+            'cov_scale': float(cov_scale),
+            'baseline': {
+                'limit_state_key': target_key,
+                'limit_state_label': target_label,
+                'unit': target_unit,
+                'g_value': float(baseline_g_value)
+            },
+            'analysis_failures': int(analysis_failures),
+            'results': dict(sorted(
+                results.items(),
+                key=lambda item: (
+                    -float(item[1].get('sensitivity_index', 0.0)),
+                    str(item[0])
+                )
+            ))
+        }
+
+        print(
+            "  [OK] Governing limit state baseline: "
+            f"{target_label} | g={baseline_g_value:.4f} {target_unit}"
+        )
+        print(
+            "  [OK] Deterministic sensitivity variables evaluated: "
+            f"{len(self.deterministic_sensitivity_results['results'])}"
+        )
+        if analysis_failures:
+            print(
+                "  [OK] Perturbed analyses failed: "
+                f"{analysis_failures}"
+            )
+
+        top_preview = list(self.deterministic_sensitivity_results['results'].items())[:5]
+        for idx, (var_name, sens_data) in enumerate(top_preview, 1):
+            print(
+                f"    {idx}. {var_name}: "
+                f"|Delta g|max={sens_data['sensitivity_index']:.4f} "
+                f"(COV={float(sens_data.get('cov_value', 0.0)):.4f})"
+            )
+
+        return self.deterministic_sensitivity_results
+
+        for idx, (var_name, sens_data) in enumerate(
+            self.deterministic_sensitivity_results['results'].items(),
+            1
+        ):
+            if idx > 5:
+                break
+            print(
+                f"    {idx}. {var_name}: "
+                f"|Δg|max={sens_data['sensitivity_index']:.4f}"
+            )
+
+        return self.deterministic_sensitivity_results
+
     def run_monte_carlo(self,
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
                         progress_interval: Optional[int] = None):
@@ -1749,6 +2355,7 @@ class PortalReliabilityAnalysis:
         if not self.is_probabilistic:
             self.reliability_assessment = None
             self.sensitivity_results = {}
+            self.deterministic_sensitivity_results = {}
             return None, {}
 
         print("\n[5/6] Analyzing reliability...")
@@ -1774,7 +2381,7 @@ class PortalReliabilityAnalysis:
 
     def generate_report(self):
         """Generate laporan lengkap."""
-        step_label = "[6/6]" if self.is_probabilistic else "[4/5]"
+        step_label = "[6/6]" if self.is_probabilistic else "[5/6]"
         print(f"\n{step_label} Generating report...")
 
         if self.is_probabilistic:
@@ -1926,6 +2533,36 @@ Interpretasi Rekayasa:
 {'='*60}
 """
 
+            deterministic_sensitivity = self.deterministic_sensitivity_results or {}
+            sensitivity_results = deterministic_sensitivity.get('results', {}) or {}
+            if sensitivity_results:
+                baseline_info = deterministic_sensitivity.get('baseline', {}) or {}
+                cov_scale = float(deterministic_sensitivity.get('cov_scale', 1.0) or 1.0)
+                baseline_label = str(baseline_info.get('limit_state_label', '-'))
+                baseline_unit = str(baseline_info.get('unit', '-'))
+                baseline_g = baseline_info.get('g_value')
+                baseline_g_text = (
+                    f"{float(baseline_g):.4f}"
+                    if baseline_g is not None else
+                    "-"
+                )
+
+                report += "\nRingkasan Sensitivitas Deterministik Lokal:\n"
+                report += (
+                    f"  - Basis evaluasi: limit state kontrol baseline {baseline_label}, "
+                    f"g={baseline_g_text} {baseline_unit}\n"
+                )
+                report += (
+                    f"  - Pendekatan: one-at-a-time dengan perturbasi +/-{cov_scale:.1f} sigma "
+                    "(sigma diturunkan dari COV x Mean) untuk tiap variabel\n"
+                )
+                for variable_name, values in list(sensitivity_results.items())[:5]:
+                    report += (
+                        f"  - {variable_name}: |Delta g|max={float(values.get('sensitivity_index', 0.0)):.4f}, "
+                        f"COV={float(values.get('cov_value', 0.0)):.4f}, "
+                        f"kasus terparah={values.get('worst_case', '-')}\n"
+                    )
+
         self.output_data['report'] = report
 
         print("  [OK] Report generated")
@@ -1969,6 +2606,7 @@ Interpretasi Rekayasa:
             'is_safe': is_safe,
             'random_variables': self.random_variables,
             'sensitivity_results': self.sensitivity_results,
+            'deterministic_sensitivity_results': self.deterministic_sensitivity_results,
             'element_reliability': self.mc_results.get('element_reliability', {}),
             'portal_system_reliability': self.get_portal_system_reliability_results(),
             'input_data': {
@@ -2049,6 +2687,7 @@ Interpretasi Rekayasa:
                 self.reliability_analysis()
             else:
                 self.run_deterministic_analysis()
+                self.deterministic_sensitivity_analysis()
             self.generate_report()
             self.save_results()
             
