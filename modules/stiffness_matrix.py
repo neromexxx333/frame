@@ -3,7 +3,7 @@ Modul untuk implementasi metode matriks kekakuan langsung (Direct Stiffness Meth
 untuk portal 2D.
 """
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from scipy.linalg import lu_factor, lu_solve
 
 MPA_TO_KN_PER_MM2 = 1.0 / 1000.0
@@ -112,6 +112,11 @@ class Element2D:
 
     def get_transformation_matrix(self) -> np.ndarray:
         return self.T
+
+    def update_elastic_modulus(self, E: float):
+        """Perbarui modulus elastisitas elemen (MPa) lalu hitung ulang kekakuan."""
+        self.E = float(E) * MPA_TO_KN_PER_MM2
+        self._compute_stiffness()
 
 
 class Portal2D:
@@ -226,6 +231,21 @@ class Portal2D:
         """Simpan matriks tereduksi dan faktorisasi solver sekali saja."""
         self._K_free = self.K_global[np.ix_(self.free_dofs, self.free_dofs)]
         self._K_free_factorized = lu_factor(self._K_free)
+
+    def update_element_moduli(self,
+                              element_moduli: Dict[int, float],
+                              default_E: Optional[float] = None):
+        """Perbarui modulus tiap elemen tanpa membangun ulang geometri portal."""
+        if default_E is not None:
+            self.E = float(default_E)
+
+        self.K_global.fill(0.0)
+        for element in self.elements:
+            modulus = float(element_moduli.get(element.elem_id, self.E))
+            element.update_elastic_modulus(modulus)
+
+        self._assemble_stiffness_matrix()
+        self._build_solver_cache()
 
     def get_reduced_stiffness_matrix(self) -> np.ndarray:
         """Dapatkan matriks kekakuan tereduksi (hanya free DOFs)."""

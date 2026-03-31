@@ -2,7 +2,7 @@
 Modul untuk simulasi Monte Carlo dan analisis keandalan probabilistik.
 """
 import numpy as np
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from scipy import stats
 
 
@@ -202,7 +202,9 @@ class MonteCarloAnalysis:
 
     def run_simulation(self, analysis_func: Callable,
                        random_vars: Dict,
-                       performance_func: Callable = None) -> Dict:
+                       performance_func: Callable = None,
+                       progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                       progress_interval: Optional[int] = None) -> Dict:
         """
         Jalankan simulasi Monte Carlo.
 
@@ -210,6 +212,8 @@ class MonteCarloAnalysis:
         - analysis_func: fungsi analisis struktural
         - random_vars: definisi variabel random
         - performance_func: fungsi evaluasi failure; boleh return bool atau dict detail
+        - progress_callback: callback untuk progress simulasi berjalan
+        - progress_interval: interval pelaporan progress
         """
         failures = 0
         analysis_failures = 0
@@ -224,6 +228,18 @@ class MonteCarloAnalysis:
 
         sample_arrays = self._generate_sample_arrays(random_vars)
         variable_names = list(sample_arrays.keys())
+        report_interval = int(progress_interval or max(1, self.num_simulations // 100))
+
+        if progress_callback is not None:
+            progress_callback({
+                'completed_simulations': 0,
+                'total_simulations': self.num_simulations,
+                'remaining_simulations': self.num_simulations,
+                'completed_fraction': 0.0,
+                'remaining_fraction': 1.0,
+                'failures': failures,
+                'analysis_failures': analysis_failures
+            })
 
         for index in range(self.num_simulations):
             samples = {
@@ -269,6 +285,24 @@ class MonteCarloAnalysis:
             if not performance_details['is_safe']:
                 failures += 1
                 failure_indices.append(index)
+
+            completed_simulations = index + 1
+            if (
+                progress_callback is not None and (
+                    completed_simulations == self.num_simulations
+                    or completed_simulations % report_interval == 0
+                )
+            ):
+                completed_fraction = completed_simulations / self.num_simulations
+                progress_callback({
+                    'completed_simulations': completed_simulations,
+                    'total_simulations': self.num_simulations,
+                    'remaining_simulations': self.num_simulations - completed_simulations,
+                    'completed_fraction': completed_fraction,
+                    'remaining_fraction': 1.0 - completed_fraction,
+                    'failures': failures,
+                    'analysis_failures': analysis_failures
+                })
 
             if (index + 1) % 1000 == 0:
                 print(f"  ... {index + 1} simulasi selesai")

@@ -163,6 +163,18 @@ class ExcelReader:
             or columns_lower.get('e_deterministic')
             or self.find_column(geom, ['deterministic'])
         )
+        fb_mean_col = (
+            columns_lower.get('fb_mean')
+            or columns_lower.get('fb mean')
+            or self.find_column(geom, ['fb_mean', 'bias'])
+        )
+        fb_stddev_col = (
+            columns_lower.get('fb_stdev')
+            or columns_lower.get('fb_stddev')
+            or columns_lower.get('fb stddev')
+            or self.find_column(geom, ['fb_stdev', 'fb_stddev'])
+        )
+        has_bias_factor_data = fb_mean_col is not None or fb_stddev_col is not None
 
         missing_columns = []
         if elem_id_col is None:
@@ -193,6 +205,7 @@ class ExcelReader:
 
         base_rows = []
         element_properties = {}
+        bias_factors_by_element = {}
 
         for row_index, row in geom.iterrows():
             excel_row = int(row_index) + 2
@@ -205,6 +218,16 @@ class ExcelReader:
             inertia = self._to_float(row.get(inertia_col), 0.0)
             e_mean = self._to_float(row.get(e_mean_col), 0.0)
             e_deterministic = self._to_float(row.get(e_deterministic_col), 0.0)
+            fb_mean = (
+                self._to_float(row.get(fb_mean_col), 0.0)
+                if fb_mean_col else
+                1.0
+            )
+            fb_stddev = (
+                self._to_float(row.get(fb_stddev_col), 0.0)
+                if fb_stddev_col else
+                0.0
+            )
 
             missing_fields = []
             if elem_id <= 0:
@@ -225,6 +248,10 @@ class ExcelReader:
                 missing_fields.append('E_mean')
             if e_deterministic <= 0.0:
                 missing_fields.append('Deterministic')
+            if has_bias_factor_data and fb_mean <= 0.0:
+                missing_fields.append('fb_mean')
+            if has_bias_factor_data and fb_stddev < 0.0:
+                missing_fields.append('fb_stdev')
 
             if missing_fields:
                 elem_label = f"elemen {elem_id}" if elem_id > 0 else f"baris {excel_row}"
@@ -240,7 +267,7 @@ class ExcelReader:
                 if raw_code is not None and not pd.isna(raw_code):
                     code_value = str(raw_code).strip()
 
-            base_rows.append({
+            row_data = {
                 'Element_ID': elem_id,
                 'Kode': code_value,
                 'Node_Start': node_start,
@@ -251,9 +278,13 @@ class ExcelReader:
                 'Inertia (mm4)': inertia,
                 'E_mean (MPa)': e_mean,
                 'E_deterministic (MPa)': e_deterministic
-            })
+            }
+            if has_bias_factor_data:
+                row_data['fb_mean'] = fb_mean
+                row_data['fb_stdev'] = fb_stddev
+            base_rows.append(row_data)
 
-            element_properties[elem_id] = {
+            property_data = {
                 'elem_id': elem_id,
                 'code': code_value,
                 'node_start': node_start,
@@ -265,6 +296,15 @@ class ExcelReader:
                 'E_mean': e_mean,
                 'E_deterministic': e_deterministic
             }
+            if has_bias_factor_data:
+                property_data['fb_mean'] = fb_mean
+                property_data['fb_stdev'] = fb_stddev
+                bias_factors_by_element[elem_id] = {
+                    'mean': fb_mean,
+                    'stddev': fb_stddev,
+                    'distribution': 'lognormal'
+                }
+            element_properties[elem_id] = property_data
 
         geometry_df = pd.DataFrame(base_rows).sort_values('Element_ID').reset_index(drop=True)
         base_elements = geometry_df[
@@ -279,7 +319,7 @@ class ExcelReader:
             geometry_df['E_deterministic (MPa)'].to_numpy(dtype=float)
         ])
 
-        return {
+        geometry_data = {
             'nodes': nodes,
             'elements': elements_mean,
             'elements_mean': elements_mean,
@@ -289,6 +329,9 @@ class ExcelReader:
             'element_ids': geometry_df['Element_ID'].astype(int).tolist(),
             'properties_by_element': element_properties
         }
+        if has_bias_factor_data:
+            geometry_data['fb_by_element'] = bias_factors_by_element
+        return geometry_data
 
     def get_concrete_properties(self, element_ids: Optional[List[int]] = None) -> Dict:
         """

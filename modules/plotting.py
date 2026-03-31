@@ -7,6 +7,8 @@ from matplotlib.patches import Rectangle, FancyBboxPatch, Polygon, Circle
 from typing import Dict, List, Optional, Tuple
 import warnings
 
+from modules.display_conventions import get_displayed_joint_moment
+
 warnings.filterwarnings('ignore')
 
 
@@ -1252,6 +1254,7 @@ class PortalPlotter:
             is_column_like = abs(tangent[1]) > abs(tangent[0])
             force_data = force_lookup[element.elem_id]
             is_beam_element = int(element.elem_id) in beam_element_ids
+            element_code = 'B' if is_beam_element else 'K'
             x_profile_m, force_profile = PortalPlotter.get_force_profile(
                 force_data,
                 force_type=config['profile_key'],
@@ -1289,11 +1292,26 @@ class PortalPlotter:
             ])
             start_force = float(force_profile[0])
             end_force = float(force_profile[-1])
-            start_joint_force = float(force_data[config['start_key']])
-            end_joint_force = float(force_data[config['end_joint_key']])
-            if force_type == 'moment' and is_beam_element:
-                start_joint_force = -start_joint_force
-                end_joint_force = -end_joint_force
+            raw_start_joint_force = float(force_data[config['start_key']])
+            raw_end_joint_force = float(force_data[config['end_joint_key']])
+            start_joint_force = raw_start_joint_force
+            end_joint_force = raw_end_joint_force
+            table_start_joint_force = raw_start_joint_force
+            table_end_joint_force = raw_end_joint_force
+            if force_type == 'moment':
+                table_start_joint_force = get_displayed_joint_moment(
+                    raw_start_joint_force,
+                    element_code,
+                    int(element.node_start)
+                )
+                table_end_joint_force = get_displayed_joint_moment(
+                    raw_end_joint_force,
+                    element_code,
+                    int(element.node_end)
+                )
+                if is_beam_element:
+                    start_joint_force = -start_joint_force
+                    end_joint_force = -end_joint_force
             if (
                 force_type == 'moment'
                 and not is_beam_element
@@ -1349,21 +1367,14 @@ class PortalPlotter:
             # sehingga kolom kanan E4-E6 yang bernilai negatif tetap merah.
             if force_type == 'shear':
                 color_reference_profile = force_profile
-            # Warna momen kolom pada diagram utama mengikuti tanda momen joint
-            # di kedua ujung elemen, karena itulah konvensi yang dibaca pengguna
-            # saat membandingkan dengan output beam end forces.
-            elif force_type == 'moment' and not is_beam_element and relative_to_chord is False:
-                color_reference_profile = np.linspace(
-                    start_joint_force,
-                    end_joint_force,
-                    len(display_signed_ordinates)
-                )
-            # Pada mode campuran, kolom tetap diberi warna berdasarkan pembacaan joint.
-            elif force_type == 'moment' and relative_to_chord == 'mixed' and int(element.elem_id) not in beam_element_ids:
-                color_reference_profile = np.linspace(
-                    start_joint_force,
-                    end_joint_force,
-                    len(display_signed_ordinates)
+            # Warna momen mengikuti profil yang benar-benar digambar pada plot.
+            # Dengan begitu, kolom yang momen internal start/end-nya berbeda
+            # tanda akan otomatis terarsir dengan dua warna berbeda.
+            elif force_type == 'moment':
+                color_reference_profile = (
+                    -display_signed_ordinates
+                    if not is_beam_element else
+                    display_signed_ordinates
                 )
             else:
                 color_reference_profile = display_signed_ordinates
@@ -1508,14 +1519,30 @@ class PortalPlotter:
 
             label_start_force = start_joint_force
             label_end_force = end_joint_force
+            if force_type == 'moment' and is_beam_element:
+                # Diagram momen balok menggambar momen internal sepanjang batang.
+                # Ujung kanan internal bertanda berlawanan terhadap aksi joint,
+                # sehingga label balok harus mengikuti profil internal agar warna
+                # dan angkanya konsisten dengan kurva yang terlihat.
+                label_start_force = start_force
+                label_end_force = end_force
+            elif force_type == 'moment' and not is_beam_element:
+                # Angka label kolom dibuat konsisten dengan nilai momen ujung
+                # pada tabel gaya dalam, sedangkan posisi kurva tetap mengikuti
+                # orientasi plot kolom yang sudah ada.
+                label_start_force = table_start_joint_force
+                label_end_force = table_end_joint_force
             if force_type == 'shear':
                 label_start_force = start_force
                 label_end_force = end_force
-            if relative_to_chord == 'mixed' and force_type == 'moment':
+            if relative_to_chord == 'mixed' and force_type == 'moment' and is_beam_element:
                 label_start_force = start_force
                 label_end_force = end_force
             label_start_color = get_signed_color(float(label_start_force))
             label_end_color = get_signed_color(float(label_end_force))
+            if force_type == 'moment' and not is_beam_element:
+                label_start_color = get_signed_color(float(color_reference_profile[0]))
+                label_end_color = get_signed_color(float(color_reference_profile[-1]))
 
             if show_result_labels:
                 if use_relative_profile:
