@@ -181,7 +181,8 @@ def multiply_finite_values(left_value, right_value) -> Optional[float]:
     return left_numeric * right_numeric
 
 
-def style_input_dataframe(df: pd.DataFrame):
+def style_input_dataframe(df: pd.DataFrame,
+                          table_min_width_px: Optional[int] = None):
     """Bangun styler tabel dengan header dan border yang lebih jelas."""
     subset_cols = list(df.columns)
     styler = df.style
@@ -196,14 +197,18 @@ def style_input_dataframe(df: pd.DataFrame):
             }
         )
 
+    table_props = [
+        ('border-collapse', 'collapse'),
+        ('width', '100%'),
+        ('font-size', '0.92rem')
+    ]
+    if table_min_width_px is not None:
+        table_props.append(('min-width', f'{int(table_min_width_px)}px'))
+
     table_styles = [
         {
             'selector': 'table',
-            'props': [
-                ('border-collapse', 'collapse'),
-                ('width', '100%'),
-                ('font-size', '0.92rem')
-            ]
+            'props': table_props
         },
         {
             'selector': 'th',
@@ -237,7 +242,7 @@ def render_input_table(df: pd.DataFrame, styler: Optional[object] = None) -> Non
     active_styler = styler if styler is not None else style_input_dataframe(df)
     table_html = active_styler.hide(axis='index').to_html()
     st.markdown(
-        f'<div style="overflow-x:auto;">{table_html}</div>',
+        f'<div style="overflow-x:auto; width:100%;">{table_html}</div>',
         unsafe_allow_html=True
     )
 
@@ -2133,11 +2138,11 @@ def build_sensitivity_rows(sensitivity_results: Dict,
             'Rata-rata pada Sampel Gagal': item['mean_in_failure'],
             'Rata-rata Keseluruhan': item['mean_overall'],
             'Δ = μ_gagal - μ_total': delta_mean,
+            'Simpangan Baku Keseluruhan': item['std_overall'],
             'Interpretasi Teknis': build_sensitivity_interpretation(
                 item['variable'],
                 delta_mean
-            ),
-            'Simpangan Baku Keseluruhan': item['std_overall']
+            )
         })
 
     return rows
@@ -2213,6 +2218,7 @@ def get_sensitivity_variable_label(variable_name: str) -> str:
     prefix, elem_id = match.groups()
     mapping = {
         'fb': f"faktor bias modulus elastisitas beton elemen {elem_id}",
+        'E': f"modulus elastisitas beton elemen {elem_id}",
         'fc': f"kuat tekan beton elemen {elem_id}",
         'fy_tarik': f"tegangan leleh baja tarik elemen {elem_id}",
         'fy_tekan': f"tegangan leleh baja tekan elemen {elem_id}",
@@ -2419,6 +2425,519 @@ def render_sensitivity_output_section(results_bundle: Dict,
     render_input_table(sensitivity_df)
 
 
+def _legacy_build_deterministic_sensitivity_interpretation(variable_name: str,
+                                                           delta_g_plus: Optional[float],
+                                                           perturbation_ratio: float,
+                                                           limit_state_label: str) -> str:
+    """Interpretasi teknis sensitivitas deterministik lokal berdasarkan skenario kenaikan."""
+    if delta_g_plus is None or not np.isfinite(float(delta_g_plus)):
+        return (
+            "Interpretasi teknis belum dapat ditentukan karena skenario perturbasi "
+            "tidak menghasilkan nilai g yang valid."
+        )
+
+    variable_text = get_sensitivity_variable_label(variable_name)
+    perturbation_percent = abs(float(perturbation_ratio) * 100.0)
+    delta_value = float(delta_g_plus)
+
+    if np.isclose(delta_value, 0.0, atol=1e-12, rtol=1e-9):
+        return (
+            f"Jika {variable_text} dinaikkan {perturbation_percent:.0f}%, nilai g pada "
+            f"limit state kontrol `{limit_state_label}` hampir tidak berubah."
+        )
+
+    if delta_value < 0.0:
+        return (
+            f"Jika {variable_text} dinaikkan {perturbation_percent:.0f}%, nilai g pada "
+            f"limit state kontrol `{limit_state_label}` turun {abs(delta_value):.4f}; "
+            "artinya perubahan ini cenderung mengurangi margin keamanan."
+        )
+
+    return (
+        f"Jika {variable_text} dinaikkan {perturbation_percent:.0f}%, nilai g pada "
+        f"limit state kontrol `{limit_state_label}` naik {abs(delta_value):.4f}; "
+        "artinya perubahan ini cenderung meningkatkan margin keamanan."
+    )
+
+
+def _legacy_build_deterministic_sensitivity_rows(
+    deterministic_sensitivity_results: Dict
+) -> List[Dict[str, Any]]:
+    """Bangun baris tabel sensitivitas deterministik lokal."""
+    if not deterministic_sensitivity_results:
+        return []
+
+    baseline_info = deterministic_sensitivity_results.get('baseline', {}) or {}
+    perturbation_ratio = float(
+        deterministic_sensitivity_results.get('perturbation_ratio', 0.10) or 0.10
+    )
+    limit_state_label = str(
+        baseline_info.get('limit_state_label', 'Kontrol')
+    )
+
+    ranked_items = list((deterministic_sensitivity_results.get('results') or {}).items())
+    rows = []
+    for rank, (variable_name, values) in enumerate(ranked_items, 1):
+        rows.append({
+            'Peringkat (-)': int(rank),
+            'Variabel Deterministik (-)': variable_name,
+            'Nilai Acuan': values.get('baseline_value'),
+            'Satuan': values.get('unit'),
+            'g jika +10%': values.get('g_plus'),
+            'Δg jika +10%': values.get('delta_g_plus'),
+            'g jika -10%': values.get('g_minus'),
+            'Δg jika -10%': values.get('delta_g_minus'),
+            'Efek Maksimum pada g Kontrol': values.get('sensitivity_index'),
+            'Pengaruh terhadap Fungsi Kinerja (g(x))': values.get('worst_case'),
+            'Interpretasi Teknis': build_deterministic_sensitivity_interpretation(
+                variable_name,
+                values.get('delta_g_plus'),
+                perturbation_ratio,
+                limit_state_label
+            )
+        })
+
+    return rows
+
+
+def _legacy_build_deterministic_sensitivity_df(
+    deterministic_sensitivity_results: Dict
+) -> pd.DataFrame:
+    """Bangun dataframe sensitivitas deterministik."""
+    rows = build_deterministic_sensitivity_rows(deterministic_sensitivity_results)
+    df = pd.DataFrame(rows)
+    rename_map = {}
+    for column in df.columns:
+        column_text = str(column)
+        if (
+            ('g jika +10%' in column_text)
+            and ('Delta' not in column_text)
+            and (column_text != 'g jika +10%')
+        ):
+            rename_map[column] = 'Delta g jika +10%'
+        elif (
+            ('g jika -10%' in column_text)
+            and ('Delta' not in column_text)
+            and (column_text != 'g jika -10%')
+        ):
+            rename_map[column] = 'Delta g jika -10%'
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def _legacy_build_deterministic_sensitivity_tornado_figure(
+    deterministic_sensitivity_results: Dict,
+    top_n: int = 15
+) -> Optional[Tuple[plt.Figure, plt.Axes]]:
+    """Bangun tornado chart sensitivitas deterministik +/ - perturbasi."""
+    rows = build_deterministic_sensitivity_rows(deterministic_sensitivity_results)
+    if not rows:
+        return None
+
+    display_rows = rows[:max(int(top_n), 1)]
+    labels = [row['Variabel Deterministik (-)'] for row in display_rows]
+    delta_plus = [
+        float(value) if value is not None and np.isfinite(float(value)) else 0.0
+        for value in (row.get('Δg jika +10%') for row in display_rows)
+    ]
+    delta_minus = [
+        float(value) if value is not None and np.isfinite(float(value)) else 0.0
+        for value in (row.get('Δg jika -10%') for row in display_rows)
+    ]
+
+    baseline_info = deterministic_sensitivity_results.get('baseline', {}) or {}
+    perturbation_ratio = float(
+        deterministic_sensitivity_results.get('perturbation_ratio', 0.10) or 0.10
+    )
+    perturbation_percent = abs(perturbation_ratio * 100.0)
+    target_unit = str(baseline_info.get('unit', '-'))
+    target_label = str(baseline_info.get('limit_state_label', 'Kontrol'))
+
+    fig_height = float(min(max(4.8, 0.62 * len(display_rows) + 1.8), 13.0))
+    fig, ax = plt.subplots(figsize=(11, fig_height))
+
+    y_positions = np.arange(len(display_rows))
+    bar_height = 0.34
+    ax.barh(
+        y_positions - (bar_height / 2.0),
+        delta_minus,
+        height=bar_height,
+        color='#2563eb',
+        edgecolor='#1f2937',
+        linewidth=0.8,
+        label=f"-{perturbation_percent:.0f}%"
+    )
+    ax.barh(
+        y_positions + (bar_height / 2.0),
+        delta_plus,
+        height=bar_height,
+        color='#dc2626',
+        edgecolor='#1f2937',
+        linewidth=0.8,
+        label=f"+{perturbation_percent:.0f}%"
+    )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color='#111827', linewidth=1.0, alpha=0.85)
+    ax.set_xlabel(f"Perubahan g pada limit state kontrol ({target_unit})")
+    ax.set_title(
+        f"Diagram Sensitivitas Deterministik One-at-a-Time terhadap g {target_label}"
+    )
+    ax.grid(True, axis='x', alpha=0.25, linestyle='--')
+    ax.legend(loc='lower right')
+
+    max_abs_value = max(
+        [abs(value) for value in delta_plus + delta_minus],
+        default=0.0
+    )
+    x_padding = max(0.05 * max_abs_value, 0.02)
+    axis_limit = max_abs_value + 4.0 * x_padding if max_abs_value > 0.0 else 1.0
+    ax.set_xlim(-axis_limit, axis_limit)
+
+    fig.tight_layout()
+    return fig, ax
+
+
+def _legacy_render_deterministic_sensitivity_output_section(results_bundle: Dict,
+                                                            heading_level: str = "####") -> None:
+    """Tampilkan sensitivitas deterministik lokal pada tab khusus."""
+    deterministic_results = (
+        results_bundle.get('deterministic_sensitivity_results', {})
+        if results_bundle else
+        {}
+    )
+    sensitivity_df = build_deterministic_sensitivity_df(deterministic_results)
+
+    if sensitivity_df.empty:
+        st.info(
+            "Data sensitivitas deterministik belum tersedia. Jalankan analisis "
+            "deterministik untuk membentuk hasil perturbasi one-at-a-time."
+        )
+        return
+
+    baseline_info = deterministic_results.get('baseline', {}) or {}
+    perturbation_ratio = float(
+        deterministic_results.get('perturbation_ratio', 0.10) or 0.10
+    )
+    perturbation_percent = abs(perturbation_ratio * 100.0)
+    target_label = str(baseline_info.get('limit_state_label', '-'))
+    target_unit = str(baseline_info.get('unit', '-'))
+    baseline_g = baseline_info.get('g_value')
+    analysis_failures = int(deterministic_results.get('analysis_failures', 0) or 0)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Limit State Kontrol", target_label)
+    metric_cols[1].metric("g Acuan", format_metric(baseline_g, 4))
+    metric_cols[2].metric("Perturbasi", f"+/-{perturbation_percent:.0f}%")
+    metric_cols[3].metric("Analisis Gagal", str(analysis_failures))
+
+    st.markdown(f"{heading_level} Diagram Sensitivitas Deterministik")
+    st.caption(
+        "Diagram tornado berikut dibentuk dari pendekatan `one-at-a-time`: setiap variabel "
+        f"deterministik digeser sendiri sebesar `+/-{perturbation_percent:.0f}%` terhadap nilai acuan, "
+        f"lalu perubahan `g` pada limit state kontrol baseline `{target_label}` dibandingkan. "
+        "Batang bernilai positif berarti margin keamanan meningkat, sedangkan batang negatif "
+        "berarti margin keamanan menurun."
+    )
+    tornado_plot = build_deterministic_sensitivity_tornado_figure(
+        deterministic_results,
+        top_n=15
+    )
+    if tornado_plot is not None:
+        tornado_fig, _ = tornado_plot
+        render_plot(
+            tornado_fig,
+            interactive=False,
+            alt_text="Diagram sensitivitas deterministik one-at-a-time"
+        )
+    else:
+        st.info("Diagram sensitivitas deterministik belum dapat dibentuk.")
+
+    st.markdown(f"{heading_level} Tabel Sensitivitas Deterministik")
+    st.caption(
+        f"Kolom `g jika +/-10%` menunjukkan nilai `g` pada limit state kontrol `{target_label}` ({target_unit}) "
+        "setelah satu variabel digeser dan variabel lain dipertahankan pada baseline."
+    )
+    st.caption(
+        "Kolom `Efek Maksimum pada g Kontrol` adalah magnitudo perubahan terbesar dari dua skenario "
+        "perturbasi. Pengaruh terhadap Fungsi Kinerja g(x) menunjukkan arah perubahan yang menghasilkan efek terbesar itu."
+    )
+    render_input_table(sensitivity_df)
+
+
+def build_deterministic_sensitivity_interpretation(variable_name: str,
+                                                   delta_g_plus: Optional[float],
+                                                   sigma_value: Optional[float],
+                                                   perturbation_ratio: Optional[float],
+                                                   limit_state_label: str) -> str:
+    """Interpretasi teknis sensitivitas deterministik lokal berbasis COV."""
+    if delta_g_plus is None or not np.isfinite(float(delta_g_plus)):
+        return (
+            "Interpretasi teknis belum dapat ditentukan karena skenario perturbasi "
+            "tidak menghasilkan nilai g yang valid."
+        )
+
+    variable_text = get_sensitivity_variable_label(variable_name)
+    sigma_numeric = float(sigma_value or 0.0)
+    perturbation_percent = abs(float(perturbation_ratio or 0.0) * 100.0)
+    delta_value = float(delta_g_plus)
+
+    if np.isclose(delta_value, 0.0, atol=1e-12, rtol=1e-9):
+        return (
+            f"Jika {variable_text} dinaikkan sebesar `+sigma` "
+            f"({sigma_numeric:.4f}; {perturbation_percent:.2f}%), nilai g pada limit state kontrol "
+            f"`{limit_state_label}` hampir tidak berubah."
+        )
+
+    if delta_value < 0.0:
+        return (
+            f"Jika {variable_text} dinaikkan sebesar `+sigma` "
+            f"({sigma_numeric:.4f}; {perturbation_percent:.2f}%), nilai g pada limit state kontrol "
+            f"`{limit_state_label}` turun {abs(delta_value):.4f}; artinya perubahan ini "
+            "cenderung mengurangi margin keamanan."
+        )
+
+    return (
+        f"Jika {variable_text} dinaikkan sebesar `+sigma` "
+        f"({sigma_numeric:.4f}; {perturbation_percent:.2f}%), nilai g pada limit state kontrol "
+        f"`{limit_state_label}` naik {abs(delta_value):.4f}; artinya perubahan ini "
+        "cenderung meningkatkan margin keamanan."
+    )
+
+
+def build_deterministic_sensitivity_rows(
+    deterministic_sensitivity_results: Dict
+) -> List[Dict[str, Any]]:
+    """Bangun baris tabel sensitivitas deterministik lokal berbasis COV."""
+    if not deterministic_sensitivity_results:
+        return []
+
+    baseline_info = deterministic_sensitivity_results.get('baseline', {}) or {}
+    cov_scale = float(
+        deterministic_sensitivity_results.get('cov_scale', 1.0) or 1.0
+    )
+    limit_state_label = str(baseline_info.get('limit_state_label', 'Kontrol'))
+
+    ranked_items = list((deterministic_sensitivity_results.get('results') or {}).items())
+    rows = []
+    for rank, (variable_name, values) in enumerate(ranked_items, 1):
+        rows.append({
+            'Peringkat (-)': int(rank),
+            'Variabel Deterministik (-)': variable_name,
+            'Nilai Acuan Deterministik': values.get('baseline_value'),
+            'Mean Acuan': values.get('mean_value'),
+            'StdDev Acuan': values.get('stddev_value'),
+            'COV (-)': values.get('cov_value'),
+            'Satuan': values.get('unit'),
+            'SF Awal (-)': values.get('sf_baseline'),
+            'SF jika +sigma (-)': values.get('sf_plus'),
+            'SF jika -sigma (-)': values.get('sf_minus'),
+            'g jika +sigma': values.get('g_plus'),
+            'Delta g jika +sigma': values.get('delta_g_plus'),
+            'g jika -sigma': values.get('g_minus'),
+            'Delta g jika -sigma': values.get('delta_g_minus'),
+            'Efek Maksimum pada g Kontrol': values.get('sensitivity_index'),
+            'Pengaruh terhadap Fungsi Kinerja (g(x))': values.get('worst_case'),
+            'Interpretasi Teknis': build_deterministic_sensitivity_interpretation(
+                variable_name,
+                values.get('delta_g_plus'),
+                values.get('sigma_value'),
+                values.get('perturbation_ratio'),
+                limit_state_label
+            )
+        })
+
+    return rows
+
+
+def build_deterministic_sensitivity_df(
+    deterministic_sensitivity_results: Dict
+) -> pd.DataFrame:
+    """Bangun dataframe sensitivitas deterministik berbasis COV."""
+    rows = build_deterministic_sensitivity_rows(deterministic_sensitivity_results)
+    return pd.DataFrame(rows)
+
+
+def build_deterministic_sensitivity_tornado_figure(
+    deterministic_sensitivity_results: Dict,
+    top_n: int = 15
+) -> Optional[Tuple[plt.Figure, plt.Axes]]:
+    """Bangun tornado chart sensitivitas deterministik untuk skenario +/- sigma."""
+    results = list((deterministic_sensitivity_results.get('results') or {}).items())
+    if not results:
+        return None
+
+    display_items = results[:max(int(top_n), 1)]
+    labels = [variable_name for variable_name, _ in display_items]
+    delta_plus = [
+        (
+            float(values.get('delta_g_plus'))
+            if values.get('delta_g_plus') is not None and np.isfinite(float(values.get('delta_g_plus')))
+            else 0.0
+        )
+        for _, values in display_items
+    ]
+    delta_minus = [
+        (
+            float(values.get('delta_g_minus'))
+            if values.get('delta_g_minus') is not None and np.isfinite(float(values.get('delta_g_minus')))
+            else 0.0
+        )
+        for _, values in display_items
+    ]
+
+    baseline_info = deterministic_sensitivity_results.get('baseline', {}) or {}
+    target_unit = str(baseline_info.get('unit', '-'))
+    target_label = str(baseline_info.get('limit_state_label', 'Kontrol'))
+    cov_scale = float(
+        deterministic_sensitivity_results.get('cov_scale', 1.0) or 1.0
+    )
+
+    fig_height = float(min(max(4.8, 0.62 * len(display_items) + 1.8), 13.0))
+    fig, ax = plt.subplots(figsize=(11, fig_height))
+
+    y_positions = np.arange(len(display_items))
+    bar_height = 0.34
+    minus_bars = ax.barh(
+        y_positions - (bar_height / 2.0),
+        delta_minus,
+        height=bar_height,
+        color='#2563eb',
+        edgecolor='#1f2937',
+        linewidth=0.8,
+        label=f"-{cov_scale:.1f} sigma"
+    )
+    plus_bars = ax.barh(
+        y_positions + (bar_height / 2.0),
+        delta_plus,
+        height=bar_height,
+        color='#dc2626',
+        edgecolor='#1f2937',
+        linewidth=0.8,
+        label=f"+{cov_scale:.1f} sigma"
+    )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color='#111827', linewidth=1.0, alpha=0.85)
+    ax.set_xlabel(f"Perubahan g pada limit state kontrol ({target_unit})")
+    ax.set_title(
+        f"Diagram Sensitivitas Deterministik terhadap g {target_label}"
+    )
+    ax.grid(True, axis='x', alpha=0.25, linestyle='--')
+    ax.legend(loc='lower right')
+
+    max_abs_value = max(
+        [abs(value) for value in delta_plus + delta_minus],
+        default=0.0
+    )
+    x_padding = max(0.05 * max_abs_value, 0.02)
+    axis_limit = max_abs_value + 5.5 * x_padding if max_abs_value > 0.0 else 1.0
+    ax.set_xlim(-axis_limit, axis_limit)
+
+    for bars, values in ((minus_bars, delta_minus), (plus_bars, delta_plus)):
+        for bar, value in zip(bars, values):
+            x_coord = float(bar.get_width())
+            y_coord = float(bar.get_y() + (bar.get_height() / 2.0))
+            text_offset = x_padding if value >= 0.0 else -x_padding
+            horizontal_alignment = 'left' if value >= 0.0 else 'right'
+            ax.text(
+                x_coord + text_offset,
+                y_coord,
+                f"{value:+.3f}",
+                va='center',
+                ha=horizontal_alignment,
+                fontsize=8.5,
+                color='#111827'
+            )
+
+    fig.tight_layout()
+    return fig, ax
+
+
+def render_deterministic_sensitivity_output_section(results_bundle: Dict,
+                                                    heading_level: str = "####") -> None:
+    """Tampilkan sensitivitas deterministik lokal berbasis COV pada tab khusus."""
+    deterministic_results = (
+        results_bundle.get('deterministic_sensitivity_results', {})
+        if results_bundle else
+        {}
+    )
+    sensitivity_df = build_deterministic_sensitivity_df(deterministic_results)
+
+    if sensitivity_df.empty:
+        st.info(
+            "Data sensitivitas deterministik berbasis COV belum tersedia. "
+            "Jalankan analisis deterministik untuk membentuk hasil perturbasi one-at-a-time."
+        )
+        return
+
+    baseline_info = deterministic_results.get('baseline', {}) or {}
+    cov_scale = float(
+        deterministic_results.get('cov_scale', 1.0) or 1.0
+    )
+    target_label = str(baseline_info.get('limit_state_label', '-'))
+    target_unit = str(baseline_info.get('unit', '-'))
+    baseline_g = baseline_info.get('g_value')
+    analysis_failures = int(deterministic_results.get('analysis_failures', 0) or 0)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Limit State Kontrol", target_label)
+    metric_cols[1].metric("g Acuan", format_metric(baseline_g, 4))
+    metric_cols[2].metric("Skala Perturbasi", f"+/-{cov_scale:.1f} sigma")
+    metric_cols[3].metric("Analisis Gagal", str(analysis_failures))
+
+    st.markdown(f"{heading_level} Diagram Sensitivitas Deterministik")
+    st.caption(
+        "Diagram tornado berikut dibentuk dari pendekatan `one-at-a-time` berbasis COV: "
+        "setiap variabel deterministik digeser sendiri sebesar `+/-sigma`, dengan "
+        "`sigma = COV x Mean`, "
+        f"lalu perubahan `g` pada limit state kontrol baseline `{target_label}` dibandingkan. "
+        "Batang bernilai positif berarti margin keamanan meningkat, sedangkan batang negatif "
+        "berarti margin keamanan menurun."
+    )
+    tornado_plot = build_deterministic_sensitivity_tornado_figure(
+        deterministic_results,
+        top_n=15
+    )
+    if tornado_plot is not None:
+        tornado_fig, _ = tornado_plot
+        render_plot(
+            tornado_fig,
+            interactive=False,
+            alt_text="Diagram sensitivitas deterministik dengan perturbasi sigma"
+        )
+    else:
+        st.info("Diagram sensitivitas deterministik berbasis COV belum dapat dibentuk.")
+
+    st.markdown(f"{heading_level} Tabel Sensitivitas Deterministik")
+    st.caption(
+        f"Kolom `g jika +/-sigma` menunjukkan nilai `g` pada limit state kontrol `{target_label}` ({target_unit}) "
+        "setelah satu variabel digeser sebesar `+/-sigma` dan variabel lain dipertahankan pada baseline."
+    )
+    st.caption(
+        "Kolom `COV (-)` menyatakan `StdDev / |Mean|` tiap variabel. "
+        "`Efek Maksimum pada g Kontrol` adalah magnitudo perubahan terbesar dari dua skenario "
+        "perturbasi berbasis COV, sedangkan `Pengaruh terhadap Fungsi Kinerja (g(x))` "
+        "merangkum apakah perubahan tersebut meningkatkan atau mengurangi margin keamanan."
+    )
+    st.caption(
+        "Kolom `SF` memakai definisi `SF = R / S`. Khusus cek aksial-lentur, "
+        "`SF` setara dengan `lambda` karena `S = 1.0`."
+    )
+    render_input_table(
+        sensitivity_df,
+        styler=style_input_dataframe(
+            sensitivity_df,
+            table_min_width_px=2600
+        )
+    )
+
+
 def run_analysis_dashboard(input_file: str,
                            analysis_mode: str,
                            num_simulations: int,
@@ -2451,6 +2970,7 @@ def run_analysis_dashboard(input_file: str,
             ("Membaca data input", analysis.read_input),
             ("Inisialisasi portal", analysis.initialize_portal),
             ("Menjalankan analisis deterministik", analysis.run_deterministic_analysis),
+            ("Analisis sensitivitas deterministik berbasis COV", analysis.deterministic_sensitivity_analysis),
             ("Menyusun laporan", analysis.generate_report),
             ("Menyimpan hasil", analysis.save_results),
         ]
@@ -4131,6 +4651,7 @@ dashboard_tabs = [
     "Output",
     "Output Reliability",
     "Output Sensitivitas",
+    "Output Sensitivitas Deterministik",
     "Plot Simulasi Terakhir",
     "Kurva Interaksi",
     "Laporan"
@@ -4489,6 +5010,25 @@ elif active_dashboard_tab == "Output Sensitivitas":
             heading_level="####"
         )
 
+elif active_dashboard_tab == "Output Sensitivitas Deterministik":
+    if not results_bundle:
+        st.info("Output sensitivitas deterministik akan tersedia setelah analisis dijalankan.")
+    elif is_probabilistic:
+        st.info(
+            "Tab ini khusus untuk mode deterministik. Pada mode probabilistik, gunakan "
+            "tab `Output Sensitivitas` untuk melihat sensitivitas berbasis Monte Carlo."
+        )
+    else:
+        st.markdown("#### Keluaran Sensitivitas Deterministik")
+        st.caption(
+            "Tab ini menyajikan analisis sensitivitas lokal `one-at-a-time` berbasis "
+            "`COV (Coefficient of Variation)` terhadap hasil deterministik baseline."
+        )
+        render_deterministic_sensitivity_output_section(
+            results_bundle,
+            heading_level="####"
+        )
+
 elif active_dashboard_tab == "Plot Simulasi Terakhir":
     if latest_result is None:
         st.info("Plot hasil analisis akan tersedia setelah analisis dijalankan.")
@@ -4725,8 +5265,14 @@ elif active_dashboard_tab == "Laporan":
         st.markdown("#### Ringkasan Laporan Analisis")
         st.text(results_bundle['report'])
 
-        render_sensitivity_output_section(
-            results_bundle,
-            is_probabilistic,
-            heading_level="####"
-        )
+        if is_probabilistic:
+            render_sensitivity_output_section(
+                results_bundle,
+                is_probabilistic,
+                heading_level="####"
+            )
+        else:
+            render_deterministic_sensitivity_output_section(
+                results_bundle,
+                heading_level="####"
+            )
