@@ -2071,17 +2071,352 @@ def style_limit_state_resume_df(df: pd.DataFrame):
     )
 
 
-def build_sensitivity_df(sensitivity_results: Dict) -> pd.DataFrame:
-    rows = []
-    for variable, values in sensitivity_results.items():
-        rows.append({
-            'Variable (-)': variable,
-            'Sensitivity Index (-)': values.get('sensitivity_index'),
-            'Mean in Failure (sesuai variabel)': values.get('mean_in_failure'),
-            'Mean Overall (sesuai variabel)': values.get('mean_overall'),
-            'Std Overall (sesuai variabel)': values.get('std_overall')
-        })
+def build_sensitivity_df(sensitivity_results: Dict,
+                         beta_system: Optional[float] = None) -> pd.DataFrame:
+    rows = build_sensitivity_rows(
+        sensitivity_results,
+        beta_system=beta_system
+    )
     return pd.DataFrame(rows)
+
+
+def build_sensitivity_rows(sensitivity_results: Dict,
+                           beta_system: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Bangun baris tabel sensitivitas dan kontribusi terhadap beta sistem."""
+    ranked_items = []
+    for variable, values in (sensitivity_results or {}).items():
+        try:
+            sensitivity_index = float(values.get('sensitivity_index', 0.0))
+        except (TypeError, ValueError):
+            sensitivity_index = 0.0
+        if not np.isfinite(sensitivity_index):
+            sensitivity_index = 0.0
+
+        ranked_items.append({
+            'variable': str(variable),
+            'sensitivity_index': sensitivity_index,
+            'mean_in_failure': values.get('mean_in_failure'),
+            'mean_overall': values.get('mean_overall'),
+            'std_overall': values.get('std_overall')
+        })
+
+    ranked_items.sort(
+        key=lambda item: (abs(float(item['sensitivity_index'])), item['variable']),
+        reverse=True
+    )
+
+    total_sensitivity = float(sum(abs(float(item['sensitivity_index'])) for item in ranked_items))
+    rows = []
+    for rank, item in enumerate(ranked_items, 1):
+        absolute_sensitivity = abs(float(item['sensitivity_index']))
+        importance_factor = (
+            (absolute_sensitivity / total_sensitivity) * 100.0
+            if total_sensitivity > 0.0 else
+            0.0
+        )
+        delta_mean = compute_sensitivity_delta(
+            item['mean_in_failure'],
+            item['mean_overall']
+        )
+        beta_contribution = compute_beta_contribution(
+            beta_system,
+            importance_factor,
+            item['variable'],
+            delta_mean
+        )
+        rows.append({
+            'Peringkat (-)': int(rank),
+            'Variabel Acak (-)': item['variable'],
+            'Indeks Sensitivitas (-)': item['sensitivity_index'],
+            'Faktor Kepentingan (%)': importance_factor,
+            'Kontribusi terhadap Beta, beta_i (-)': beta_contribution,
+            'Rata-rata pada Sampel Gagal': item['mean_in_failure'],
+            'Rata-rata Keseluruhan': item['mean_overall'],
+            'Δ = μ_gagal - μ_total': delta_mean,
+            'Interpretasi Teknis': build_sensitivity_interpretation(
+                item['variable'],
+                delta_mean
+            ),
+            'Simpangan Baku Keseluruhan': item['std_overall']
+        })
+
+    return rows
+
+
+def compute_sensitivity_delta(mean_in_failure, mean_overall) -> Optional[float]:
+    """Hitung selisih rata-rata sampel gagal terhadap rata-rata keseluruhan."""
+    try:
+        failure_value = float(mean_in_failure)
+        overall_value = float(mean_overall)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(failure_value) or not np.isfinite(overall_value):
+        return None
+    return float(failure_value - overall_value)
+
+
+def get_beta_direction_sign(variable_name: str) -> Optional[float]:
+    """Arah pengaruh kenaikan variabel terhadap beta."""
+    prefix = str(variable_name or '').split('_E', 1)[0]
+    if prefix in {'fb', 'fc', 'fy_tarik', 'fy_tekan', 'fy_geser'}:
+        return 1.0
+    if prefix in {'qDL', 'qLL'}:
+        return -1.0
+    return None
+
+
+def compute_beta_contribution(beta_system: Optional[float],
+                              importance_factor: Optional[float],
+                              variable_name: str,
+                              delta_mean: Optional[float]) -> Optional[float]:
+    """
+    Hitung kontribusi kuantitatif tiap variabel terhadap beta sistem.
+
+    Nilai dihitung dengan mengalokasikan beta sistem secara proporsional terhadap
+    faktor kepentingan sensitivitas absolut, lalu diberi tanda sesuai arah
+    pengaruh kenaikan variabel terhadap beta.
+    """
+    try:
+        beta_value = abs(float(beta_system))
+        importance_value = float(importance_factor)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(beta_value) or not np.isfinite(importance_value):
+        return None
+
+    beta_magnitude = beta_value * max(importance_value, 0.0) / 100.0
+    direction_sign = get_beta_direction_sign(variable_name)
+
+    if direction_sign is None:
+        if delta_mean is None:
+            return beta_magnitude
+        try:
+            delta_value = float(delta_mean)
+        except (TypeError, ValueError):
+            return beta_magnitude
+        if not np.isfinite(delta_value) or np.isclose(delta_value, 0.0):
+            return beta_magnitude
+        direction_sign = -1.0 if delta_value > 0.0 else 1.0
+
+    return float(direction_sign * beta_magnitude)
+
+
+def get_sensitivity_variable_label(variable_name: str) -> str:
+    """Ubah nama variabel sensitivitas menjadi label yang lebih deskriptif."""
+    variable_text = str(variable_name or '').strip()
+    match = re.fullmatch(r'([A-Za-z_]+)_E(\d+)', variable_text)
+    if not match:
+        return variable_text or "variabel ini"
+
+    prefix, elem_id = match.groups()
+    mapping = {
+        'fb': f"faktor bias modulus elastisitas beton elemen {elem_id}",
+        'fc': f"kuat tekan beton elemen {elem_id}",
+        'fy_tarik': f"tegangan leleh baja tarik elemen {elem_id}",
+        'fy_tekan': f"tegangan leleh baja tekan elemen {elem_id}",
+        'fy_geser': f"tegangan leleh baja geser elemen {elem_id}",
+        'qDL': f"beban mati terdistribusi elemen {elem_id}",
+        'qLL': f"beban hidup terdistribusi elemen {elem_id}"
+    }
+    return mapping.get(prefix, variable_text)
+
+
+def build_sensitivity_interpretation(variable_name: str,
+                                     delta_mean: Optional[float]) -> str:
+    """Bangun interpretasi teknis berdasarkan arah delta pada sampel gagal."""
+    if delta_mean is None or not np.isfinite(float(delta_mean)):
+        return "Interpretasi teknis belum dapat ditentukan karena data rata-rata tidak lengkap."
+
+    variable_text = get_sensitivity_variable_label(variable_name)
+    prefix = str(variable_name or '').split('_E', 1)[0]
+
+    if np.isclose(float(delta_mean), 0.0, atol=1e-12, rtol=1e-9):
+        return (
+            f"Pada sampel gagal, {variable_text} tidak menunjukkan pergeseran rata-rata "
+            "yang berarti terhadap populasi keseluruhan."
+        )
+
+    if prefix in {'fb', 'fc', 'fy_tarik', 'fy_tekan', 'fy_geser'}:
+        if float(delta_mean) < 0.0:
+            return (
+                f"Pada sampel gagal, {variable_text} cenderung lebih rendah dari rata-rata "
+                "keseluruhan; hal ini mengindikasikan penurunan kapasitas atau kekakuan "
+                "berkorelasi dengan kejadian gagal."
+            )
+        return (
+            f"Pada sampel gagal, {variable_text} cenderung lebih tinggi dari rata-rata "
+            "keseluruhan; hal ini menunjukkan kondisi gagal dipengaruhi interaksi sistem "
+            "yang perlu dibaca bersama variabel lain."
+        )
+
+    if prefix in {'qDL', 'qLL'}:
+        if float(delta_mean) > 0.0:
+            return (
+                f"Pada sampel gagal, {variable_text} cenderung lebih tinggi dari rata-rata "
+                "keseluruhan; hal ini mengindikasikan peningkatan demand berkontribusi "
+                "terhadap kejadian gagal."
+            )
+        return (
+            f"Pada sampel gagal, {variable_text} cenderung lebih rendah dari rata-rata "
+            "keseluruhan; kondisi ini menunjukkan pengaruhnya perlu dibaca bersama "
+            "kombinasi variabel acak lainnya."
+        )
+
+    if float(delta_mean) > 0.0:
+        return (
+            f"Pada sampel gagal, {variable_text} cenderung lebih tinggi dari rata-rata "
+            "keseluruhan."
+        )
+    return (
+        f"Pada sampel gagal, {variable_text} cenderung lebih rendah dari rata-rata "
+        "keseluruhan."
+    )
+
+
+def build_sensitivity_tornado_figure(sensitivity_results: Dict,
+                                     beta_system: Optional[float] = None,
+                                     top_n: int = 15) -> Optional[Tuple[plt.Figure, plt.Axes]]:
+    """Bangun diagram Analisis Sensitivitas kuantitatif kontribusi variabel terhadap beta."""
+    sensitivity_rows = build_sensitivity_rows(
+        sensitivity_results,
+        beta_system=beta_system
+    )
+    if not sensitivity_rows:
+        return None
+
+    display_rows = sensitivity_rows[:max(int(top_n), 1)]
+    labels = [row['Variabel Acak (-)'] for row in display_rows]
+    beta_contributions = [
+        row.get('Kontribusi terhadap Beta, beta_i (-)')
+        for row in display_rows
+    ]
+    if any(value is None for value in beta_contributions):
+        return None
+    beta_contributions = [float(value) for value in beta_contributions]
+    importance_values = [float(row['Faktor Kepentingan (%)']) for row in display_rows]
+
+    fig_height = float(min(max(4.8, 0.55 * len(display_rows) + 1.8), 12.5))
+    fig, ax = plt.subplots(figsize=(11, fig_height))
+
+    color_scale = [
+        '#2563eb' if value >= 0.0 else '#dc2626'
+        for value in beta_contributions
+    ]
+    y_positions = np.arange(len(display_rows))
+    bars = ax.barh(
+        y_positions,
+        beta_contributions,
+        color=color_scale,
+        edgecolor='#1f2937',
+        linewidth=0.8
+    )
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color='#111827', linewidth=1.0, alpha=0.85)
+    ax.set_xlabel('Kontribusi terhadap Indeks Keandalan, beta_i (-)')
+    ax.set_title('Diagram Analisis Sensitivitas Kuantitatif Kontribusi terhadap Beta')
+    ax.grid(True, axis='x', alpha=0.25, linestyle='--')
+
+    max_abs_value = max(abs(value) for value in beta_contributions) if beta_contributions else 0.0
+    x_padding = max(0.05 * max_abs_value, 0.02)
+    axis_limit = max_abs_value + 4.5 * x_padding if max_abs_value > 0.0 else 1.0
+    ax.set_xlim(-axis_limit, axis_limit)
+
+    for bar, importance_value, beta_value in zip(bars, importance_values, beta_contributions):
+        x_coord = float(bar.get_width())
+        y_coord = float(bar.get_y() + (bar.get_height() / 2.0))
+        text_offset = x_padding if beta_value >= 0.0 else -x_padding
+        horizontal_alignment = 'left' if beta_value >= 0.0 else 'right'
+        ax.text(
+            x_coord + text_offset,
+            y_coord,
+            f"{beta_value:+.3f} | {importance_value:.1f}%",
+            va='center',
+            ha=horizontal_alignment,
+            fontsize=9,
+            color='#111827'
+        )
+
+    fig.tight_layout()
+    return fig, ax
+
+
+def render_sensitivity_output_section(results_bundle: Dict,
+                                      is_probabilistic: bool,
+                                      heading_level: str = "####") -> None:
+    """Tampilkan tornado diagram dan tabel sensitivitas di dashboard."""
+    sensitivity_results = results_bundle.get('sensitivity_results', {}) if results_bundle else {}
+    beta_system = (
+        (results_bundle or {}).get('summary', {}).get('Beta')
+        if results_bundle else
+        None
+    )
+    sensitivity_df = build_sensitivity_df(
+        sensitivity_results,
+        beta_system=beta_system
+    )
+
+    if not is_probabilistic:
+        st.info(
+            "Pada mode deterministik tidak tersedia hasil analisis sensitivitas, "
+            "karena tidak dilakukan pengambilan sampel variabel acak."
+        )
+        return
+
+    if sensitivity_df.empty:
+        st.info(
+            "Data sensitivitas belum tersedia atau tidak terdapat sampel gagal "
+            "yang memadai untuk dilakukan pemeringkatan."
+        )
+        return
+
+    st.markdown(f"{heading_level} Diagram Analisis Sensitivitas Kuantitatif")
+    st.caption(
+        "Diagram Analisis Sensitivitas menampilkan hingga 15 variabel acak paling dominan berdasarkan "
+        "besar kontribusinya terhadap indeks keandalan sistem. Batang berarah positif "
+        "menunjukkan variabel yang kenaikannya cenderung menaikkan beta, sedangkan "
+        "batang berarah negatif menunjukkan variabel yang kenaikannya cenderung "
+        "menurunkan beta."
+    )
+    tornado_plot = build_sensitivity_tornado_figure(
+        sensitivity_results,
+        beta_system=beta_system,
+        top_n=15
+    )
+    if tornado_plot is not None:
+        tornado_fig, _ = tornado_plot
+        render_plot(
+            tornado_fig,
+            interactive=False,
+            alt_text="Diagram Analisis Sensitivitas kuantitatif kontribusi terhadap beta"
+        )
+    else:
+        st.info(
+            "Diagram Analisis Sensitivitas kuantitatif belum dapat dibentuk karena `Beta` sistem "
+            "tidak tersedia dalam nilai terhingga."
+        )
+
+    st.markdown(f"{heading_level} Tabel Sensitivitas Variabel Acak")
+    st.caption(
+        "`Kontribusi terhadap Beta, beta_i (-)` dihitung dengan mengalokasikan "
+        "`Beta` sistem secara proporsional terhadap `Faktor Kepentingan (%)` tiap "
+        "variabel. Dengan demikian, jumlah magnitudo kontribusi seluruh variabel "
+        "setara dengan beta sistem hasil simulasi."
+    )
+    st.caption(
+        "Tanda positif pada `beta_i` menunjukkan bahwa kenaikan variabel tersebut "
+        "secara teknis cenderung meningkatkan keandalan, sedangkan tanda negatif "
+        "menunjukkan kecenderungan menurunkan keandalan."
+    )
+    st.caption(
+        "Kolom `Δ = μ_gagal - μ_total` menyatakan selisih rata-rata nilai variabel "
+        "pada sampel gagal terhadap rata-rata keseluruhan, sedangkan `Interpretasi Teknis` "
+        "menjelaskan arah kecenderungan pengaruhnya terhadap kegagalan."
+    )
+    render_input_table(sensitivity_df)
 
 
 def run_analysis_dashboard(input_file: str,
@@ -3705,49 +4040,49 @@ if results_bundle:
             "Dashboard menampilkan simulasi valid terakhir yang tersedia."
         )
 
-    st.subheader("Ringkasan")
+    st.subheader("Ringkasan Hasil Analisis")
     if is_probabilistic:
         metric_cols = st.columns(5)
-        metric_cols[0].metric("Pf", format_metric(summary.get('Pf'), 6))
-        metric_cols[1].metric("Beta", format_metric(summary.get('Beta'), 4))
-        metric_cols[2].metric("Failures", str(summary.get('failures', 0)))
-        metric_cols[3].metric("Kelas Keamanan", summary.get('safety_class') or "-")
+        metric_cols[0].metric("Prob. Kegagalan, Pf", format_metric(summary.get('Pf'), 6))
+        metric_cols[1].metric("Indeks Keandalan, Beta", format_metric(summary.get('Beta'), 4))
+        metric_cols[2].metric("Jumlah Kegagalan", str(summary.get('failures', 0)))
+        metric_cols[3].metric("Kelas Keandalan", summary.get('safety_class') or "-")
         metric_cols[4].metric(
-            "Status",
-            "-" if summary.get('is_safe') is None else ("SAFE" if summary.get('is_safe') else "UNSAFE")
+            "Status Keamanan",
+            "-" if summary.get('is_safe') is None else ("AMAN" if summary.get('is_safe') else "TIDAK AMAN")
         )
         limit_cols = st.columns(4)
-        limit_cols[0].metric("g Min Momen (kN.m)", format_metric(summary.get('min_g_moment'), 4))
-        limit_cols[1].metric("g Min Geser (kN)", format_metric(summary.get('min_g_shear'), 4))
-        limit_cols[2].metric("g Min Aksial (kN)", format_metric(summary.get('min_g_axial'), 4))
-        limit_cols[3].metric("g Min Aksial+Momen (-)", format_metric(summary.get('min_g_axial_moment'), 4))
+        limit_cols[0].metric("g Minimum Lentur (kN.m)", format_metric(summary.get('min_g_moment'), 4))
+        limit_cols[1].metric("g Minimum Geser (kN)", format_metric(summary.get('min_g_shear'), 4))
+        limit_cols[2].metric("g Minimum Aksial (kN)", format_metric(summary.get('min_g_axial'), 4))
+        limit_cols[3].metric("g Minimum Aksial-Lentur (-)", format_metric(summary.get('min_g_axial_moment'), 4))
         st.caption(
-            f"Sumber input: `{analysis_source or DEFAULT_INPUT_FILE}` | "
-            f"Mode: {summary.get('analysis_mode_label', '-')} | "
-            f"Simulasi yang ditampilkan: #{(latest_simulation.get('display_index') or 0) + 1}"
+            f"Sumber berkas input: `{analysis_source or DEFAULT_INPUT_FILE}` | "
+            f"Mode analisis: {summary.get('analysis_mode_label', '-')} | "
+            f"Simulasi yang ditampilkan: ke-{(latest_simulation.get('display_index') or 0) + 1}"
         )
         if summary.get('analysis_failures', 0):
             st.warning(
-                f"{summary.get('analysis_failures', 0)} simulasi gagal dieksekusi. "
-                "Failure tersebut tetap dihitung konservatif sebagai kegagalan."
+                f"{summary.get('analysis_failures', 0)} simulasi tidak berhasil dieksekusi. "
+                "Kegagalan eksekusi tersebut tetap diperhitungkan secara konservatif sebagai kejadian gagal."
             )
     else:
         metric_cols = st.columns(8)
-        metric_cols[0].metric("Mode", summary.get('analysis_mode_label') or "-")
-        metric_cols[1].metric("Pf", "-")
-        metric_cols[2].metric("Beta", "-")
-        metric_cols[3].metric("g Min Momen (kN.m)", format_metric(summary.get('min_g_moment'), 4))
-        metric_cols[4].metric("g Min Geser (kN)", format_metric(summary.get('min_g_shear'), 4))
-        metric_cols[5].metric("g Min Aksial (kN)", format_metric(summary.get('min_g_axial'), 4))
-        metric_cols[6].metric("g Min Aksial+Momen (-)", format_metric(summary.get('min_g_axial_moment'), 4))
+        metric_cols[0].metric("Mode Analisis", summary.get('analysis_mode_label') or "-")
+        metric_cols[1].metric("Prob. Kegagalan, Pf", "-")
+        metric_cols[2].metric("Indeks Keandalan, Beta", "-")
+        metric_cols[3].metric("g Minimum Lentur (kN.m)", format_metric(summary.get('min_g_moment'), 4))
+        metric_cols[4].metric("g Minimum Geser (kN)", format_metric(summary.get('min_g_shear'), 4))
+        metric_cols[5].metric("g Minimum Aksial (kN)", format_metric(summary.get('min_g_axial'), 4))
+        metric_cols[6].metric("g Minimum Aksial-Lentur (-)", format_metric(summary.get('min_g_axial_moment'), 4))
         metric_cols[7].metric(
-            "Status",
-            "-" if summary.get('is_safe') is None else ("SAFE" if summary.get('is_safe') else "UNSAFE")
+            "Status Keamanan",
+            "-" if summary.get('is_safe') is None else ("AMAN" if summary.get('is_safe') else "TIDAK AMAN")
         )
         st.caption(
-            f"Sumber input: `{analysis_source or DEFAULT_INPUT_FILE}` | "
-            f"Mode: {summary.get('analysis_mode_label', '-')} | "
-            "Hasil ditampilkan dari satu analisis berbasis nilai deterministic input per elemen."
+            f"Sumber berkas input: `{analysis_source or DEFAULT_INPUT_FILE}` | "
+            f"Mode analisis: {summary.get('analysis_mode_label', '-')} | "
+            "Hasil yang ditampilkan berasal dari satu kali analisis dengan parameter deterministik pada setiap elemen."
         )
 else:
     latest_simulation = {}
@@ -3794,6 +4129,8 @@ analysis_input_data = (
 dashboard_tabs = [
     "Input",
     "Output",
+    "Output Reliability",
+    "Output Sensitivitas",
     "Plot Simulasi Terakhir",
     "Kurva Interaksi",
     "Laporan"
@@ -4025,25 +4362,29 @@ elif active_dashboard_tab == "Output":
             )
             render_input_table(build_internal_force_sign_guide_df())
 
-        st.markdown("#### Cek Keseimbangan Momen per Node")
-        st.caption(
-            "Tabel ini menjumlahkan momen joint dari tabel gaya dalam elemen pada node yang sama. "
-            "Kontribusi momen joint dihitung otomatis mengikuti konvensi tanda tampilan aktif pada tiap node."
-        )
-        st.caption(
-            "Residual dihitung dengan rumus "
-            "`Sigma_M_Elemen_Cek + Mz_Beban_Nodal - Mz_Reaksi`, "
-            f"dan dinyatakan `OK` bila |residual| <= {MOMENT_EQUILIBRIUM_TOLERANCE_KNM:.1e} kN.m."
-        )
-        joint_moment_equilibrium_df = build_joint_moment_equilibrium_df(
-            latest_result,
-            input_data=analysis_input_data
-        )
-        render_input_table(
-            joint_moment_equilibrium_df,
-            styler=style_joint_moment_equilibrium_df(joint_moment_equilibrium_df)
-        )
+        with st.expander("Cek Keseimbangan Momen per Node", expanded=False):
+            st.caption(
+                "Tabel ini menjumlahkan momen joint dari tabel gaya dalam elemen pada node yang sama. "
+                "Kontribusi momen joint dihitung otomatis mengikuti konvensi tanda tampilan aktif pada tiap node."
+            )
+            st.caption(
+                "Residual dihitung dengan rumus "
+                "`Sigma_M_Elemen_Cek + Mz_Beban_Nodal - Mz_Reaksi`, "
+                f"dan dinyatakan `OK` bila |residual| <= {MOMENT_EQUILIBRIUM_TOLERANCE_KNM:.1e} kN.m."
+            )
+            joint_moment_equilibrium_df = build_joint_moment_equilibrium_df(
+                latest_result,
+                input_data=analysis_input_data
+            )
+            render_input_table(
+                joint_moment_equilibrium_df,
+                styler=style_joint_moment_equilibrium_df(joint_moment_equilibrium_df)
+            )
 
+elif active_dashboard_tab == "Output Reliability":
+    if latest_result is None:
+        st.info("Tabel output akan tersedia setelah analisis dijalankan.")
+    else:
         st.markdown("#### Reliabilitas Sistem Portal Gabungan")
         st.caption(
             "Portal dianggap tersusun seri antara subsistem Balok dan subsistem Kolom, "
@@ -4132,6 +4473,21 @@ elif active_dashboard_tab == "Output":
                 table_df,
                 styler=style_limit_state_performance_df(table_df)
             )
+
+elif active_dashboard_tab == "Output Sensitivitas":
+    if not results_bundle:
+        st.info("Output sensitivitas akan tersedia setelah analisis dijalankan.")
+    else:
+        st.markdown("#### Keluaran Analisis Sensitivitas")
+        st.caption(
+            "Tab ini menyajikan kontribusi relatif variabel acak terhadap kejadian gagal "
+            "berdasarkan hasil simulasi Monte Carlo."
+        )
+        render_sensitivity_output_section(
+            results_bundle,
+            is_probabilistic,
+            heading_level="####"
+        )
 
 elif active_dashboard_tab == "Plot Simulasi Terakhir":
     if latest_result is None:
@@ -4364,16 +4720,13 @@ elif active_dashboard_tab == "Kurva Interaksi":
 
 elif active_dashboard_tab == "Laporan":
     if not results_bundle:
-        st.info("Laporan baru tersedia setelah analisis dijalankan.")
+        st.info("Laporan hasil analisis akan tersedia setelah analisis dijalankan.")
     else:
-        st.markdown("#### Ringkasan Laporan")
+        st.markdown("#### Ringkasan Laporan Analisis")
         st.text(results_bundle['report'])
 
-        st.markdown("#### Sensitivitas Variabel")
-        sensitivity_df = build_sensitivity_df(results_bundle['sensitivity_results'])
-        if not is_probabilistic:
-            st.info("Analisis deterministik tidak memiliki hasil sensitivitas variabel acak.")
-        elif sensitivity_df.empty:
-            st.info("Data sensitivitas belum tersedia atau tidak ada failure sample yang dapat diranking.")
-        else:
-            st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
+        render_sensitivity_output_section(
+            results_bundle,
+            is_probabilistic,
+            heading_level="####"
+        )
