@@ -11,6 +11,7 @@ import numpy as np
 from typing import Any, Callable, Dict, Optional
 import os
 import json
+import re
 from datetime import datetime
 
 # Import modules
@@ -116,6 +117,31 @@ class PortalReliabilityAnalysis:
     def _element_var_name(prefix: str, elem_id: int) -> str:
         """Nama variabel random flat per elemen."""
         return f"{prefix}_E{int(elem_id)}"
+
+    @staticmethod
+    def _parse_element_var_name(var_name: str) -> tuple[str, Optional[int]]:
+        """Pisahkan prefix dan nomor elemen dari nama variabel seperti fc_E7."""
+        match = re.fullmatch(r'([A-Za-z_]+)_E(\d+)', str(var_name or '').strip())
+        if not match:
+            return str(var_name or '').strip(), None
+        prefix, elem_id = match.groups()
+        return prefix, int(elem_id)
+
+    @staticmethod
+    def _get_random_variable_unit(var_name: str) -> str:
+        """Satuan default variabel random untuk tampilan UI."""
+        prefix, _ = PortalReliabilityAnalysis._parse_element_var_name(var_name)
+        unit_mapping = {
+            'fb': '(-)',
+            'E': 'MPa',
+            'fc': 'MPa',
+            'fy_tarik': 'MPa',
+            'fy_tekan': 'MPa',
+            'fy_geser': 'MPa',
+            'qDL': 'kN/m',
+            'qLL': 'kN/m'
+        }
+        return unit_mapping.get(prefix, '-')
 
     @staticmethod
     def _summarize_values(values_by_element: Dict[int, float], unit: str) -> str:
@@ -1593,10 +1619,70 @@ class PortalReliabilityAnalysis:
                     performance_key='performance_axial_moment'
                 )
             },
+            'probabilistic_histogram_data': self._build_probabilistic_histogram_data(),
             'sensitivity_results': self.sensitivity_results,
             'latest_simulation': latest_simulation,
             'report': self.output_data.get('report', '')
         }
+
+    def _build_probabilistic_histogram_data(self,
+                                            max_bins: int = 28) -> Dict[str, Dict[str, Any]]:
+        """Ringkas histogram sampel Monte Carlo per variabel random untuk UI."""
+        if not self.is_probabilistic or not self.mc_results or not self.random_variables:
+            return {}
+
+        sample_history = self.mc_results.get('random_samples_history', []) or []
+        if not sample_history:
+            return {}
+
+        histogram_data: Dict[str, Dict[str, Any]] = {}
+        for var_name, var_info in self.random_variables.items():
+            values = np.asarray([
+                float(sample[var_name])
+                for sample in sample_history
+                if var_name in sample
+            ], dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+
+            data_min = float(np.min(values))
+            data_max = float(np.max(values))
+            if np.isclose(data_min, data_max, atol=1e-12, rtol=1e-9):
+                span = max(abs(data_min) * 0.05, 1e-6)
+                hist_density, hist_edges = np.histogram(
+                    values,
+                    bins=1,
+                    range=(data_min - span, data_max + span),
+                    density=True
+                )
+            else:
+                num_bins = int(np.clip(np.sqrt(values.size), 12, max_bins))
+                hist_density, hist_edges = np.histogram(
+                    values,
+                    bins=num_bins,
+                    density=True
+                )
+
+            prefix, elem_id = self._parse_element_var_name(var_name)
+            histogram_data[var_name] = {
+                'variable_name': str(var_name),
+                'variable_type': prefix,
+                'element_id': elem_id,
+                'distribution': str(var_info.get('distribution', 'normal')).strip().lower(),
+                'mean': float(var_info.get('mean', np.mean(values))),
+                'stddev': float(var_info.get('stddev', np.std(values))),
+                'unit': self._get_random_variable_unit(var_name),
+                'sample_count': int(values.size),
+                'sample_mean': float(np.mean(values)),
+                'sample_std': float(np.std(values)),
+                'sample_min': data_min,
+                'sample_max': data_max,
+                'hist_density': hist_density.astype(float).tolist(),
+                'hist_bin_edges': hist_edges.astype(float).tolist()
+            }
+
+        return histogram_data
 
     def _get_element_reliability_results(self,
                                          limit_state: str = 'overall') -> Dict[int, Dict[str, float]]:
