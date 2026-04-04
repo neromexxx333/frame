@@ -245,6 +245,25 @@ class PerformanceFunction:
         return float(phi), 'transition'
 
     @staticmethod
+    def _get_applied_strength_reduction_factor(code_phi: float,
+                                               use_code_phi: bool = False) -> float:
+        """Pilih phi yang benar-benar dipakai pada mode analisis aktif."""
+        return float(code_phi if use_code_phi else RELIABILITY_PHI_FACTOR)
+
+    @staticmethod
+    def _get_axial_strength_reduction_factor(is_tension: bool,
+                                             use_code_phi: bool = False) -> float:
+        """Phi untuk titik ujung kapasitas aksial sesuai mode analisis."""
+        if not use_code_phi:
+            return float(RELIABILITY_PHI_FACTOR)
+        return 0.90 if bool(is_tension) else 0.65
+
+    @staticmethod
+    def _get_shear_strength_reduction_factor(use_code_phi: bool = False) -> float:
+        """Phi geser sesuai mode analisis."""
+        return 0.75 if use_code_phi else float(RELIABILITY_PHI_FACTOR)
+
+    @staticmethod
     def _get_rebar_stress(strain: float, fy_tension: float,
                           fy_compression: float,
                           steel_modulus: float = 200000.0) -> float:
@@ -310,7 +329,8 @@ class PerformanceFunction:
     def _get_beam_flexural_response(fc: float, fy: float,
                                     section_geometry: Dict,
                                     steel_area: Dict,
-                                    fy_tekan: float = None) -> Dict[str, float]:
+                                    fy_tekan: float = None,
+                                    use_code_phi: bool = False) -> Dict[str, float]:
         """
         Hitung respons kapasitas lentur balok berbasis kompatibilitas regangan.
 
@@ -396,10 +416,14 @@ class PerformanceFunction:
             fy_tension,
             steel_modulus=steel_modulus
         )
-        phi, classification = PerformanceFunction._get_flexural_phi_nonspiral(
+        code_phi, classification = PerformanceFunction._get_flexural_phi_nonspiral(
             epsilon_t_net,
             fy_tension,
             steel_modulus=steel_modulus
+        )
+        applied_phi = PerformanceFunction._get_applied_strength_reduction_factor(
+            code_phi,
+            use_code_phi=use_code_phi
         )
 
         moment_internal = (
@@ -408,7 +432,7 @@ class PerformanceFunction:
             + steel_force_tension * d
         )
         nominal_moment = max(-moment_internal / 1000.0, 0.0)
-        design_moment = RELIABILITY_PHI_FACTOR * nominal_moment
+        design_moment = applied_phi * nominal_moment
 
         tension_steel_yielded = (
             tension_strain < 0.0 and
@@ -425,7 +449,8 @@ class PerformanceFunction:
             'compression_block_depth': float(a),
             'epsilon_t_net': float(epsilon_t_net),
             'epsilon_ty': float(epsilon_ty),
-            'phi': float(phi),
+            'phi': float(applied_phi),
+            'phi_code': float(code_phi),
             'classification': classification,
             'Mn': float(nominal_moment),
             'phi_Mn': float(design_moment),
@@ -441,14 +466,16 @@ class PerformanceFunction:
     def _get_moment_capacity(fc: float, fy: float,
                              section_geometry: Dict,
                              steel_area: Dict,
-                             fy_tekan: float = None) -> float:
+                             fy_tekan: float = None,
+                             use_code_phi: bool = False) -> float:
         """Hitung kapasitas momen rencana lentur balok (phiMn) dalam kN.m."""
         response = PerformanceFunction._get_beam_flexural_response(
             fc,
             fy,
             section_geometry,
             steel_area,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
         return float(response['phi_Mn'])
 
@@ -491,7 +518,8 @@ class PerformanceFunction:
                                           section_geometry: Dict,
                                           steel_area: Dict,
                                           c: float,
-                                          fy_tekan: float = None) -> Dict[str, float]:
+                                          fy_tekan: float = None,
+                                          use_code_phi: bool = False) -> Dict[str, float]:
         """
         Respons penampang kolom pada kedalaman garis netral tertentu.
 
@@ -552,10 +580,14 @@ class PerformanceFunction:
             fy_tension,
             steel_modulus=steel_modulus
         )
-        phi, classification = PerformanceFunction._get_flexural_phi_nonspiral(
+        code_phi, classification = PerformanceFunction._get_flexural_phi_nonspiral(
             epsilon_t_net,
             fy_tension,
             steel_modulus=steel_modulus
+        )
+        applied_phi = PerformanceFunction._get_applied_strength_reduction_factor(
+            code_phi,
+            use_code_phi=use_code_phi
         )
 
         return {
@@ -564,12 +596,13 @@ class PerformanceFunction:
             'compression_block_depth': float(a),
             'epsilon_t_net': float(epsilon_t_net),
             'epsilon_ty': float(epsilon_ty),
-            'phi': float(phi),
+            'phi': float(applied_phi),
+            'phi_code': float(code_phi),
             'classification': classification,
             'Pn': float(nominal_axial),
             'Mn': float(nominal_moment),
-            'phi_Pn': float(RELIABILITY_PHI_FACTOR * nominal_axial),
-            'phi_Mn': float(RELIABILITY_PHI_FACTOR * nominal_moment),
+            'phi_Pn': float(applied_phi * nominal_axial),
+            'phi_Mn': float(applied_phi * nominal_moment),
             'tension_steel_strain': float(tension_strain),
             'tension_steel_stress': float(tension_stress),
             'tension_steel_yielded': bool(
@@ -588,7 +621,8 @@ class PerformanceFunction:
                                             section_geometry: Dict,
                                             steel_area: Dict,
                                             c_values: np.ndarray,
-                                            fy_tekan: float = None) -> Dict[str, np.ndarray]:
+                                            fy_tekan: float = None,
+                                            use_code_phi: bool = False) -> Dict[str, np.ndarray]:
         """
         Versi vectorized dari respons penampang kolom untuk banyak nilai c.
         Dipakai untuk mempercepat pembentukan kurva interaksi.
@@ -649,7 +683,7 @@ class PerformanceFunction:
 
         epsilon_t_net = np.maximum(-tension_strain, 0.0)
         transition_denominator = max(epsilon_tc - epsilon_ty, 1e-9)
-        phi = np.where(
+        code_phi = np.where(
             epsilon_t_net <= epsilon_ty,
             0.65,
             np.where(
@@ -657,6 +691,11 @@ class PerformanceFunction:
                 0.90,
                 0.65 + 0.25 * ((epsilon_t_net - epsilon_ty) / transition_denominator)
             )
+        )
+        applied_phi = (
+            code_phi
+            if use_code_phi else
+            np.full_like(code_phi, RELIABILITY_PHI_FACTOR, dtype=float)
         )
         classification = np.where(
             epsilon_t_net <= epsilon_ty,
@@ -670,9 +709,10 @@ class PerformanceFunction:
 
         return {
             'neutral_axis_depth': c_values,
-            'phi_Pn': RELIABILITY_PHI_FACTOR * nominal_axial,
-            'phi_Mn': RELIABILITY_PHI_FACTOR * nominal_moment,
-            'phi': phi,
+            'phi_Pn': applied_phi * nominal_axial,
+            'phi_Mn': applied_phi * nominal_moment,
+            'phi': applied_phi,
+            'phi_code': code_phi,
             'epsilon_t_net': epsilon_t_net,
             'epsilon_ty': np.full_like(c_values, epsilon_ty, dtype=float),
             'classification': classification
@@ -684,6 +724,7 @@ class PerformanceFunction:
                                       section_geometry: Dict,
                                       steel_area: Dict,
                                       fy_tekan: float = None,
+                                      use_code_phi: bool = False,
                                       num_points: int = 240) -> List[Dict[str, float]]:
         """
         Bangun kurva interaksi desain phiPn-phiMn untuk kolom beton bertulang.
@@ -704,18 +745,27 @@ class PerformanceFunction:
             steel_area,
             fy_tekan=fy_tekan
         )
-        phi_pn_max = RELIABILITY_PHI_FACTOR * Po
+        compression_phi = PerformanceFunction._get_axial_strength_reduction_factor(
+            is_tension=False,
+            use_code_phi=use_code_phi
+        )
+        tension_phi = PerformanceFunction._get_axial_strength_reduction_factor(
+            is_tension=True,
+            use_code_phi=use_code_phi
+        )
+        phi_pn_max = compression_phi * Po
         As = max(float(steel_area.get('As', 0.0) or 0.0), 0.0)
         As_prime = max(float(steel_area.get('As_prime', 0.0) or 0.0), 0.0)
         Ast = As + As_prime
-        phi_pn_tension = RELIABILITY_PHI_FACTOR * abs(float(fy_tarik)) * Ast / 1000.0
+        phi_pn_tension = tension_phi * abs(float(fy_tarik)) * Ast / 1000.0
         epsilon_ty = PerformanceFunction._get_tension_control_limits(fy_tarik)[0]
 
         points: List[Dict[str, float]] = [
             {
                 'phi_Pn': float(phi_pn_max),
                 'phi_Mn': 0.0,
-                'phi': 0.65,
+                'phi': float(compression_phi),
+                'phi_code': 0.65,
                 'epsilon_t_net': 0.0,
                 'epsilon_ty': epsilon_ty,
                 'classification': 'compression-controlled',
@@ -724,7 +774,8 @@ class PerformanceFunction:
             {
                 'phi_Pn': float(-phi_pn_tension),
                 'phi_Mn': 0.0,
-                'phi': 0.90,
+                'phi': float(tension_phi),
+                'phi_code': 0.90,
                 'epsilon_t_net': max(0.005, epsilon_ty),
                 'epsilon_ty': epsilon_ty,
                 'classification': 'tension-controlled',
@@ -737,12 +788,14 @@ class PerformanceFunction:
             fy_tarik,
             section_geometry,
             steel_area,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
         points.append({
             'phi_Pn': 0.0,
             'phi_Mn': float(pure_bending['phi_Mn']),
             'phi': float(pure_bending['phi']),
+            'phi_code': float(pure_bending.get('phi_code', pure_bending['phi'])),
             'epsilon_t_net': float(pure_bending['epsilon_t_net']),
             'epsilon_ty': float(pure_bending['epsilon_ty']),
             'classification': str(pure_bending['classification']),
@@ -760,7 +813,8 @@ class PerformanceFunction:
             section_geometry,
             steel_area,
             c_values,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
         valid_mask = responses['phi_Pn'] <= (phi_pn_max + 1e-6)
         valid_indices = np.nonzero(valid_mask)[0]
@@ -770,6 +824,7 @@ class PerformanceFunction:
                 'phi_Pn': float(responses['phi_Pn'][idx]),
                 'phi_Mn': float(responses['phi_Mn'][idx]),
                 'phi': float(responses['phi'][idx]),
+                'phi_code': float(responses['phi_code'][idx]),
                 'epsilon_t_net': float(responses['epsilon_t_net'][idx]),
                 'epsilon_ty': float(responses['epsilon_ty'][idx]),
                 'classification': str(responses['classification'][idx]),
@@ -945,6 +1000,7 @@ class PerformanceFunction:
                                          section_geometry: Dict,
                                          steel_area: Dict,
                                          fy_tekan: float = None,
+                                         use_code_phi: bool = False,
                                          interaction_curve: Optional[List[Dict[str, float]]] = None
                                          ) -> Dict[str, float]:
         """
@@ -956,7 +1012,8 @@ class PerformanceFunction:
                 fy_tarik,
                 section_geometry,
                 steel_area,
-                fy_tekan=fy_tekan
+                fy_tekan=fy_tekan,
+                use_code_phi=use_code_phi
             )
         compression_boundary = max(
             interaction_curve,
@@ -1028,6 +1085,7 @@ class PerformanceFunction:
                                              section_geometry: Dict,
                                              steel_area: Dict,
                                              fy_tekan: float = None,
+                                             use_code_phi: bool = False,
                                              interaction_curve: Optional[List[Dict[str, float]]] = None
                                              ) -> Dict[str, float]:
         """
@@ -1054,6 +1112,7 @@ class PerformanceFunction:
                 section_geometry,
                 steel_area,
                 fy_tekan=fy_tekan,
+                use_code_phi=use_code_phi,
                 interaction_curve=interaction_curve
             )
 
@@ -1063,7 +1122,8 @@ class PerformanceFunction:
                 fy_tarik,
                 section_geometry,
                 steel_area,
-                fy_tekan=fy_tekan
+                fy_tekan=fy_tekan,
+                use_code_phi=use_code_phi
             )
 
         states: List[Dict[str, float]] = []
@@ -1129,7 +1189,8 @@ class PerformanceFunction:
     def _get_axial_capacities(fc: float, fy_tarik: float,
                               section_geometry: Dict,
                               steel_area: Dict,
-                              fy_tekan: float = None) -> Tuple[float, float]:
+                              fy_tekan: float = None,
+                              use_code_phi: bool = False) -> Tuple[float, float]:
         """
         Hitung kapasitas aksial (kN).
 
@@ -1146,17 +1207,28 @@ class PerformanceFunction:
             steel_area,
             fy_tekan=fy_tekan
         )
-        phi_pn_tekan = RELIABILITY_PHI_FACTOR * Po
-        phi_pn_tarik = RELIABILITY_PHI_FACTOR * fy_tarik * Ast / 1000.0
+        phi_pn_tekan = (
+            PerformanceFunction._get_axial_strength_reduction_factor(
+                is_tension=False,
+                use_code_phi=use_code_phi
+            ) * Po
+        )
+        phi_pn_tarik = (
+            PerformanceFunction._get_axial_strength_reduction_factor(
+                is_tension=True,
+                use_code_phi=use_code_phi
+            ) * fy_tarik * Ast / 1000.0
+        )
 
         return float(phi_pn_tekan), float(phi_pn_tarik)
 
     @staticmethod
     def moment_capacity_demand(max_moment_demand: float,
-                              fc: float, fy: float,
-                              section_geometry: Dict,
-                              steel_area: Dict,
-                              fy_tekan: float = None) -> float:
+                               fc: float, fy: float,
+                               section_geometry: Dict,
+                               steel_area: Dict,
+                               fy_tekan: float = None,
+                               use_code_phi: bool = False) -> float:
         """
         Performance function untuk momen:
         g = Capacity - Demand
@@ -1177,7 +1249,8 @@ class PerformanceFunction:
             fy,
             section_geometry,
             steel_area,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
         Md = abs(max_moment_demand)
         g = Mc - Md
@@ -1192,6 +1265,7 @@ class PerformanceFunction:
                               section_geometry: Dict,
                               steel_area: Dict,
                               fy_tekan: float = None,
+                              use_code_phi: bool = False,
                               interaction_curve: Optional[List[Dict[str, float]]] = None
                               ) -> float:
         """
@@ -1208,6 +1282,7 @@ class PerformanceFunction:
             section_geometry,
             steel_area,
             fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi,
             interaction_curve=interaction_curve
         )
         return float(result['g'])
@@ -1221,6 +1296,7 @@ class PerformanceFunction:
                                               section_geometry: Dict,
                                               steel_area: Dict,
                                               fy_tekan: float = None,
+                                              use_code_phi: bool = False,
                                               interaction_curve: Optional[List[Dict[str, float]]] = None
                                               ) -> float:
         """
@@ -1239,20 +1315,20 @@ class PerformanceFunction:
             section_geometry,
             steel_area,
             fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi,
             interaction_curve=interaction_curve
         )
         return float(result['g'])
 
     @staticmethod
-    def shear_capacity_demand(max_shear_demand: float,
-                            fc: float, fy_shear: float,
-                            section_geometry: Dict,
-                            shear_steel_area: float,
-                            shear_spacing: float = 200.0) -> float:
-        """
-        Performance function untuk geser:
-        g = Capacity - Demand
-        """
+    def _get_shear_capacity_check_result(max_shear_demand: float,
+                                         fc: float,
+                                         fy_shear: float,
+                                         section_geometry: Dict,
+                                         shear_steel_area: float,
+                                         shear_spacing: float = 200.0,
+                                         use_code_phi: bool = False) -> Dict[str, float]:
+        """Hasil cek kapasitas geser lengkap dengan metadata phi dan komponen kapasitas."""
         missing_fields: List[str] = []
         b = PerformanceFunction._read_positive_input(
             section_geometry.get('b'),
@@ -1292,17 +1368,48 @@ class PerformanceFunction:
                 section_geometry
             )
 
-        # Kapasitas geser beton
-        Vc = 0.17 * np.sqrt(max(fc_value, 15.0)) * b * d / 1000  # kN
+        Vc = 0.17 * np.sqrt(max(fc_value, 15.0)) * b * d / 1000.0
+        Vs = fy_shear_value * Av * d / s / 1000.0
+        nominal_shear = Vc + Vs
+        code_phi = 0.75
+        applied_phi = PerformanceFunction._get_shear_strength_reduction_factor(
+            use_code_phi=use_code_phi
+        )
+        design_shear = applied_phi * nominal_shear
+        demand_shear = abs(float(max_shear_demand))
 
-        # Kapasitas geser baja berdasarkan luas dan spasi sengkang aktual.
-        Vs = fy_shear_value * Av * d / s / 1000  # kN
+        return {
+            'phi': float(applied_phi),
+            'phi_code': float(code_phi),
+            'Vc': float(Vc),
+            'Vs': float(Vs),
+            'Vn': float(nominal_shear),
+            'phi_Vn': float(design_shear),
+            'demand_shear': float(demand_shear),
+            'g': float(design_shear - demand_shear)
+        }
 
-        Vc_total = RELIABILITY_PHI_FACTOR * (Vc + Vs)
-        Vd = abs(max_shear_demand)
-        g = Vc_total - Vd
-
-        return g
+    @staticmethod
+    def shear_capacity_demand(max_shear_demand: float,
+                            fc: float, fy_shear: float,
+                            section_geometry: Dict,
+                            shear_steel_area: float,
+                            shear_spacing: float = 200.0,
+                            use_code_phi: bool = False) -> float:
+        """
+        Performance function untuk geser:
+        g = Capacity - Demand
+        """
+        result = PerformanceFunction._get_shear_capacity_check_result(
+            max_shear_demand,
+            fc,
+            fy_shear,
+            section_geometry,
+            shear_steel_area,
+            shear_spacing=shear_spacing,
+            use_code_phi=use_code_phi
+        )
+        return float(result['g'])
 
     @staticmethod
     def combined_moment_shear(max_moment: float,
@@ -1311,7 +1418,8 @@ class PerformanceFunction:
                             section_geometry: Dict,
                             steel_area: Dict,
                             fy_tekan: float = None,
-                            fy_shear: float = None) -> Tuple[float, float, float]:
+                            fy_shear: float = None,
+                            use_code_phi: bool = False) -> Tuple[float, float, float]:
         """
         Performance function kombinasi untuk momen dan geser
 
@@ -1324,7 +1432,8 @@ class PerformanceFunction:
             fy,
             section_geometry,
             steel_area,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
 
         g_s = PerformanceFunction.shear_capacity_demand(
@@ -1333,7 +1442,8 @@ class PerformanceFunction:
             fy if fy_shear is None else fy_shear,
             section_geometry,
             steel_area.get('As_shear', 0.0),
-            shear_spacing=steel_area.get('shear_spacing', 0.0)
+            shear_spacing=steel_area.get('shear_spacing', 0.0),
+            use_code_phi=use_code_phi
         )
 
         # Tetap dipertahankan untuk kompatibilitas pemanggilan lama.
