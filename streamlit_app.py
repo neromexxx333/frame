@@ -34,6 +34,8 @@ from modules.stiffness_matrix import Portal2D
 
 
 DEFAULT_INPUT_FILE = "input_template.xlsx"
+DETERMINISTIC_MODE_LABEL = "Deterministik (SNI 2847:2019)"
+PROBABILISTIC_MODE_LABEL = "Probabilistik"
 BASE_ESTIMATE_ELEMENTS = 9.0
 BASE_ESTIMATE_RANDOM_VARIABLES = 42.0
 CALIBRATION_REFERENCE_NUM_SIMULATIONS = 100000.0
@@ -1361,7 +1363,8 @@ def style_performance_df(df: pd.DataFrame):
                 'g_Shear (kN)',
                 'Status_Shear',
                 'Pf_Shear (-)',
-                'Beta_Shear (-)'
+                'Beta_Shear (-)',
+                'Phi_Shear (-)'
             ],
             'axial': [
                 'g_Axial (kN)',
@@ -1474,6 +1477,7 @@ def build_performance_df(latest_result: Dict,
     axial_values = latest_result.get('performance_axial', {})
     axial_moment_values = latest_result.get('performance_axial_moment', {})
     moment_meta_values = latest_result.get('performance_metadata', {})
+    shear_meta_values = latest_result.get('performance_shear_metadata', {})
     axial_meta_values = latest_result.get('performance_axial_metadata', {})
     axial_moment_meta_values = latest_result.get('performance_axial_moment_metadata', {})
     geometry_lookup = {}
@@ -1637,6 +1641,7 @@ def build_performance_df(latest_result: Dict,
         | set(axial_values.keys())
         | set(axial_moment_values.keys())
         | set(moment_meta_values.keys())
+        | set(shear_meta_values.keys())
         | set(axial_meta_values.keys())
         | set(axial_moment_meta_values.keys())
     )
@@ -1654,6 +1659,7 @@ def build_performance_df(latest_result: Dict,
         g_axial = get_by_element(axial_values, elem_id)
         g_axial_moment = get_by_element(axial_moment_values, elem_id)
         moment_meta = get_by_element(moment_meta_values, elem_id, {})
+        shear_meta = get_by_element(shear_meta_values, elem_id, {})
         axial_meta = get_by_element(axial_meta_values, elem_id, {})
         axial_moment_meta = get_by_element(axial_moment_meta_values, elem_id, {})
         overall_reliability = get_reliability('overall', elem_id)
@@ -1720,6 +1726,7 @@ def build_performance_df(latest_result: Dict,
             'Status_Shear': status_shear,
             'Pf_Shear (-)': shear_reliability.get('Pf'),
             'Beta_Shear (-)': shear_reliability.get('Beta'),
+            'Phi_Shear (-)': shear_meta.get('phi'),
             'g_Axial (kN)': g_axial,
             'Status_Axial': status_axial,
             'Pf_Axial (-)': axial_reliability.get('Pf'),
@@ -1767,6 +1774,7 @@ def build_limit_state_performance_tables(latest_result: Dict,
     axial_values = latest_result.get('performance_axial', {})
     axial_moment_values = latest_result.get('performance_axial_moment', {})
     moment_meta_values = latest_result.get('performance_metadata', {})
+    shear_meta_values = latest_result.get('performance_shear_metadata', {})
     axial_meta_values = latest_result.get('performance_axial_metadata', {})
     axial_moment_meta_values = latest_result.get('performance_axial_moment_metadata', {})
     geometry_lookup = {}
@@ -1860,7 +1868,8 @@ def build_limit_state_performance_tables(latest_result: Dict,
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN.m)': capacity,
-            'S dari Analisis Struktur (kN.m)': demand
+            'S dari Analisis Struktur (kN.m)': demand,
+            'phi (-)': normalize_numeric(meta.get('phi'))
         }
         if is_probabilistic:
             row_data['Jumlah Gagal (-)'] = reliability.get('failures')
@@ -1877,23 +1886,24 @@ def build_limit_state_performance_tables(latest_result: Dict,
     for elem_id in collect_element_ids(
         max_forces_values,
         shear_values,
+        shear_meta_values,
         element_reliability.get('shear', {})
     ):
         max_forces_entry = get_by_element(max_forces_values, elem_id, {}) or {}
         demand = normalize_numeric(max_forces_entry.get('max_shear'))
         demand = abs(demand) if demand is not None else None
         g_value = normalize_numeric(get_by_element(shear_values, elem_id))
-        capacity = (
-            None
-            if demand is None or g_value is None else
-            g_value + demand
-        )
+        meta = get_by_element(shear_meta_values, elem_id, {}) or {}
+        capacity = normalize_numeric(meta.get('phi_Vn'))
+        if capacity is None and demand is not None and g_value is not None:
+            capacity = g_value + demand
         reliability = get_reliability('shear', elem_id)
         row_data = {
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN)': capacity,
-            'S dari Analisis Struktur (kN)': demand
+            'S dari Analisis Struktur (kN)': demand,
+            'phi (-)': normalize_numeric(meta.get('phi'))
         }
         if is_probabilistic:
             row_data['Jumlah Gagal (-)'] = reliability.get('failures')
@@ -1947,7 +1957,8 @@ def build_limit_state_performance_tables(latest_result: Dict,
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (kN)': capacity,
-            'S dari Analisis Struktur (kN)': demand
+            'S dari Analisis Struktur (kN)': demand,
+            'phi (-)': normalize_numeric(meta.get('phi'))
         }
         if is_probabilistic:
             row_data['Jumlah Gagal (-)'] = reliability.get('failures')
@@ -1976,7 +1987,8 @@ def build_limit_state_performance_tables(latest_result: Dict,
             'Elemen (-)': int(elem_id),
             'Kode': get_element_code(elem_id),
             'Kapasitas R (-)': capacity,
-            'S dari Analisis Struktur (-)': demand
+            'S dari Analisis Struktur (-)': demand,
+            'phi (-)': normalize_numeric(meta.get('phi'))
         }
         if is_probabilistic:
             row_data['Jumlah Gagal (-)'] = reliability.get('failures')
@@ -2016,6 +2028,7 @@ def style_limit_state_performance_df(df: pd.DataFrame,
                 for column in df.columns
                 if column.startswith('Kapasitas R')
                 or column.startswith('S dari Analisis Struktur')
+                or column == 'phi (-)'
                 or column == 'SF = R/S (-)'
                 or column.startswith('g(x)')
             ],
@@ -2071,6 +2084,7 @@ def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame],
                     (col for col in table_df.columns if col.startswith('S dari Analisis Struktur')),
                     None
                 )),
+                'phi (-)': row.get('phi (-)'),
                 'SF = R/S (-)': row.get('SF = R/S (-)'),
                 'g(x)': row.get(next(
                     (col for col in table_df.columns if col.startswith('g(x)')),
@@ -2124,7 +2138,8 @@ def build_limit_state_resume_df(limit_state_tables: Dict[str, pd.DataFrame],
             'Limit State Kontrol': governing.get('Limit State Kontrol'),
             'Satuan': governing.get('Satuan'),
             'Kapasitas R': governing.get('Kapasitas R'),
-            'S dari Analisis Struktur': governing.get('S dari Analisis Struktur')
+            'S dari Analisis Struktur': governing.get('S dari Analisis Struktur'),
+            'phi (-)': governing.get('phi (-)')
         }
         if is_probabilistic:
             row_data['Jumlah Gagal (-)'] = governing.get('Jumlah Gagal (-)')
@@ -2144,7 +2159,7 @@ def style_limit_state_resume_df(df: pd.DataFrame,
                                 is_probabilistic: bool = True):
     """Styling tabel resume limit state pengontrol."""
     styler = style_input_dataframe(df)
-    performance_columns = ['Kapasitas R', 'S dari Analisis Struktur']
+    performance_columns = ['Kapasitas R', 'S dari Analisis Struktur', 'phi (-)']
     if 'SF = R/S (-)' in df.columns:
         performance_columns.append('SF = R/S (-)')
     performance_columns.append('g(x)')
@@ -3854,6 +3869,7 @@ def find_exact_interaction_boundary_state(fc: float,
                                           steel_area: Dict,
                                           demand_axial: float,
                                           demand_moment: float,
+                                          use_code_phi: bool = False,
                                           num_scan_points: int = 360,
                                           tolerance: float = 1e-9) -> Optional[Dict[str, Any]]:
     """Cari c_boundary exact dari persamaan kontinu Md*Pn(c) - Pd*Mn(c) = 0."""
@@ -3878,7 +3894,8 @@ def find_exact_interaction_boundary_state(fc: float,
             section_geometry,
             steel_area,
             c_value,
-            fy_tekan=fy_tekan
+            fy_tekan=fy_tekan,
+            use_code_phi=use_code_phi
         )
         residual = float(
             demand_moment * float(response['phi_Pn'])
@@ -3982,7 +3999,8 @@ def build_interaction_diagram_figure(input_data: Dict,
         material_snapshot['fy_tarik'],
         section_inputs['section_geometry'],
         section_inputs['steel_area'],
-        fy_tekan=material_snapshot['fy_tekan']
+        fy_tekan=material_snapshot['fy_tekan'],
+        use_code_phi=not is_probabilistic
     )
 
     axial_moment_meta = (
@@ -4192,7 +4210,8 @@ def build_interaction_diagram_figure(input_data: Dict,
         material_snapshot['fy_tarik'],
         section_inputs['section_geometry'],
         section_inputs['steel_area'],
-        fy_tekan=material_snapshot['fy_tekan']
+        fy_tekan=material_snapshot['fy_tekan'],
+        use_code_phi=not is_probabilistic
     )
 
     axial_moment_meta = (
@@ -4226,7 +4245,8 @@ def build_interaction_diagram_figure(input_data: Dict,
         section_inputs['section_geometry'],
         section_inputs['steel_area'],
         demand_axial,
-        max_moment
+        max_moment,
+        use_code_phi=not is_probabilistic
     )
 
     moment_values = [float(point['phi_Mn']) for point in interaction_curve]
@@ -4517,10 +4537,11 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Atau upload file Excel", type=["xlsx", "xlsm"])
     analysis_mode_label = st.radio(
         "Mode Analisis",
-        options=["Deterministik", "Probabilistik"],
+        options=[DETERMINISTIC_MODE_LABEL, PROBABILISTIC_MODE_LABEL],
         index=1
     )
-    if analysis_mode_label == "Probabilistik":
+    is_sidebar_probabilistic = analysis_mode_label == PROBABILISTIC_MODE_LABEL
+    if is_sidebar_probabilistic:
         num_simulations = st.number_input(
             "Jumlah simulasi Monte Carlo",
             min_value=100,
@@ -4537,13 +4558,13 @@ with st.sidebar:
         if preview_input_data is not None:
             estimated_seconds = estimate_analysis_runtime_seconds(
                 preview_input_data,
-                analysis_mode_label == "Probabilistik",
+                is_sidebar_probabilistic,
                 int(num_simulations)
             )
             estimated_elements = len(
                 get_geometry_elements_for_mode(
                     preview_input_data,
-                    analysis_mode_label == "Probabilistik"
+                    is_sidebar_probabilistic
                 )
             )
             estimated_random_variables = count_probabilistic_random_variables(preview_input_data)
@@ -4551,7 +4572,7 @@ with st.sidebar:
                 "Perkiraan waktu analisis: "
                 f"`{format_duration_text(estimated_seconds)}`"
             )
-            if analysis_mode_label == "Probabilistik":
+            if is_sidebar_probabilistic:
                 st.caption(
                     f"Basis estimasi lokal: {estimated_elements} elemen, "
                     f"{estimated_random_variables} variabel random, "
@@ -4590,7 +4611,7 @@ if run_analysis:
             with st.spinner("Analisis sedang dijalankan..."):
                 analysis = run_analysis_dashboard(
                     resolved_file,
-                    analysis_mode_label,
+                    'probabilistic' if is_sidebar_probabilistic else 'deterministic',
                     int(num_simulations),
                     progress_container=progress_container
                 )
@@ -4615,7 +4636,7 @@ if preview_input_data is not None:
     try:
         preview_portal_nodes, preview_portal_elements = build_preview_portal(
             preview_input_data,
-            analysis_mode_label == "Probabilistik"
+            is_sidebar_probabilistic
         )
     except Exception as exc:
         preview_error = exc
@@ -4626,7 +4647,7 @@ portal_elements = st.session_state.get('portal_elements')
 portal_nodes = st.session_state.get('portal_nodes')
 analysis_source = st.session_state.get('analysis_source')
 selected_analysis_mode = (
-    'probabilistic' if analysis_mode_label == "Probabilistik" else 'deterministic'
+    'probabilistic' if is_sidebar_probabilistic else 'deterministic'
 )
 
 selected_input_data = preview_input_data
@@ -5045,12 +5066,13 @@ elif active_dashboard_tab == "Output Reliability":
         )
         st.caption(
             "Tabel dipisah per limit state: lentur, geser, aksial, dan aksial-lentur. "
-            "Kolom `R`, `S`, dan `g(x)` ditampilkan terpisah agar perhitungan tiap cek "
+            "Kolom `R`, `S`, `phi`, dan `g(x)` ditampilkan terpisah agar perhitungan tiap cek "
             "lebih mudah dibaca."
         )
         st.caption(
-            "Perhitungan `R` pada tabel ini memakai faktor reduksi kekuatan `phi = 1`, "
-            "agar kapasitas yang ditampilkan konsisten dengan evaluasi reliabilitas."
+            "Perhitungan `R` pada tabel ini mengikuti mode analisis aktif: "
+            "`phi = 1` pada mode probabilistik, sedangkan pada mode deterministik "
+            "`phi` dihitung sesuai SNI 2847:2019 untuk masing-masing limit state."
         )
         if is_probabilistic:
             st.caption(
@@ -5061,7 +5083,8 @@ elif active_dashboard_tab == "Output Reliability":
             st.caption(
                 "Pada mode deterministik, tabel hanya menampilkan field yang relevan "
                 "dengan satu kali analisis, termasuk `SF = R/S`, dan status ditentukan "
-                "dari tanda `g(x)`."
+                "dari tanda `g(x)`. Nilai `R` sudah memakai faktor reduksi kekuatan "
+                "sesuai SNI 2847:2019 untuk lentur, geser, aksial, dan aksial-lentur."
             )
         st.caption(
             "Untuk cek aksial-lentur, `R` merepresentasikan `lambda_boundary`, "
@@ -5318,6 +5341,8 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
                 "Panel kiri menampilkan kurva penuh, panel kanan fokus pada titik kontrol. "
                 "Titik `Demand`, `Boundary exact (c)`, dan `Garis lambda` "
                 "diberi label langsung pada gambar. "
+                "Pada mode probabilistik kurva memakai `phi = 1`, sedangkan pada mode "
+                "deterministik kurva memakai `phi` sesuai SNI 2847:2019. "
                 "Gunakan scroll mouse atau pinch untuk memperbesar gambar."
             )
 
