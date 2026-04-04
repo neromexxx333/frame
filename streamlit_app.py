@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from matplotlib.patches import Patch
 
 from main import PortalReliabilityAnalysis
 from modules.display_conventions import (
@@ -49,6 +50,52 @@ BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
 )
 ZOOMABLE_PLOT_VIEWER_HEIGHT = 540
 MOMENT_EQUILIBRIUM_TOLERANCE_KNM = 1e-6
+DETERMINISTIC_RISK_WEIGHT_SEVERITY = 0.60
+DETERMINISTIC_RISK_WEIGHT_SENSITIVITY = 0.40
+
+RISK_LEVEL_COLORS = {
+    'Rendah': '#0000ff',
+    'Sedang': '#00b050',
+    'Tinggi': '#ffc000',
+    'Kritis': '#ff0000',
+    'Tidak Ada Data': '#94a3b8'
+}
+
+RISK_LEVEL_ORDER = {
+    'Tidak Ada Data': -1,
+    'Rendah': 0,
+    'Sedang': 1,
+    'Tinggi': 2,
+    'Kritis': 3
+}
+
+RISK_LEVEL_STYLES = {
+    'Rendah': (
+        'background-color: #dcfce7; '
+        'font-weight: 700; '
+        'color: #166534;'
+    ),
+    'Sedang': (
+        'background-color: #fef3c7; '
+        'font-weight: 700; '
+        'color: #92400e;'
+    ),
+    'Tinggi': (
+        'background-color: #ffedd5; '
+        'font-weight: 700; '
+        'color: #9a3412;'
+    ),
+    'Kritis': (
+        'background-color: #fee2e2; '
+        'font-weight: 700; '
+        'color: #991b1b;'
+    ),
+    'Tidak Ada Data': (
+        'background-color: #e5e7eb; '
+        'font-weight: 700; '
+        'color: #475569;'
+    )
+}
 
 HEADER_GROUP_PALETTES = {
     'default': {
@@ -96,6 +143,14 @@ HEADER_GROUP_PALETTES = {
         'border': '#f59e0b'
     },
     'axial_moment': {
+        'background': '#ede9fe',
+        'border': '#8b5cf6'
+    },
+    'risk': {
+        'background': '#fee2e2',
+        'border': '#ef4444'
+    },
+    'sensitivity': {
         'background': '#ede9fe',
         'border': '#8b5cf6'
     }
@@ -2180,6 +2235,800 @@ def style_limit_state_resume_df(df: pd.DataFrame,
     )
 
 
+def coerce_finite_float(value: Any) -> Optional[float]:
+    """Konversi ke float finite, atau None bila invalid."""
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(numeric_value):
+        return None
+    return float(numeric_value)
+
+
+def extract_element_id_from_variable_name(variable_name: str) -> Optional[int]:
+    """Ambil nomor elemen dari nama variabel sensitivitas seperti fc_E7."""
+    match = re.fullmatch(r'[A-Za-z_]+_E(\d+)', str(variable_name or '').strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def normalize_nonnegative_mapping(raw_values: Dict[int, float]) -> Dict[int, float]:
+    """Normalisasi mapping non-negatif ke rentang 0-1."""
+    cleaned_values = {
+        int(key): max(float(value), 0.0)
+        for key, value in (raw_values or {}).items()
+        if value is not None and np.isfinite(float(value))
+    }
+    if not cleaned_values:
+        return {}
+
+    max_value = max(cleaned_values.values())
+    if max_value <= 0.0:
+        return {int(key): 0.0 for key in cleaned_values}
+
+    return {
+        int(key): float(value / max_value)
+        for key, value in cleaned_values.items()
+    }
+
+
+def get_risk_level_rank(level: str) -> int:
+    """Urutan level risiko untuk sorting."""
+    return int(RISK_LEVEL_ORDER.get(str(level or '').strip(), -1))
+
+
+def describe_deterministic_priority_level(risk_score: Optional[float],
+                                          sf_value: Optional[float]) -> str:
+    """Tentukan level prioritas risiko deterministik per elemen."""
+    score = max(coerce_finite_float(risk_score) or 0.0, 0.0)
+    sf_numeric = coerce_finite_float(sf_value)
+
+    if score >= 0.75:
+        level = 'Kritis'
+    elif score >= 0.55:
+        level = 'Tinggi'
+    elif score >= 0.30:
+        level = 'Sedang'
+    else:
+        level = 'Rendah'
+
+    if sf_numeric is None:
+        return level
+    if sf_numeric <= 0.75:
+        return 'Kritis'
+    if sf_numeric < 1.0:
+        if level == 'Rendah':
+            return 'Sedang'
+        if level == 'Sedang':
+            return 'Tinggi'
+        return 'Kritis'
+    return level
+
+
+def describe_probabilistic_risk_level(pf_value: Optional[float],
+                                      beta_value: Optional[float]) -> str:
+    """Tentukan level risiko probabilistik dari kombinasi Pf dan Beta."""
+    pf_numeric = coerce_finite_float(pf_value)
+    beta_numeric = coerce_finite_float(beta_value)
+
+    level = 'Tidak Ada Data'
+    if pf_numeric is not None:
+        if pf_numeric >= 1e-1:
+            level = 'Kritis'
+        elif pf_numeric >= 1e-2:
+            level = 'Tinggi'
+        elif pf_numeric >= 1e-3:
+            level = 'Sedang'
+        else:
+            level = 'Rendah'
+
+    if beta_numeric is not None:
+        if beta_numeric < 1.5:
+            level = 'Kritis'
+        elif beta_numeric < 2.5:
+            level = (
+                'Tinggi'
+                if get_risk_level_rank(level) < get_risk_level_rank('Tinggi') else
+                level
+            )
+        elif beta_numeric < 3.0:
+            level = (
+                'Sedang'
+                if get_risk_level_rank(level) < get_risk_level_rank('Sedang') else
+                level
+            )
+        elif level == 'Tidak Ada Data':
+            level = 'Rendah'
+
+    return level
+
+
+def build_element_risk_map_figure(nodes: np.ndarray,
+                                  elements: List,
+                                  boundary_conditions: Optional[Dict[int, Dict[str, Any]]],
+                                  element_levels: Dict[int, str],
+                                  title: str,
+                                  subtitle: Optional[str] = None) -> plt.Figure:
+    """Bangun peta warna elemen berdasarkan level risiko/prioritas."""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8), dpi=180)
+    boundary_conditions = boundary_conditions or {}
+    nodes_array = np.asarray(nodes, dtype=float)
+    structure_span = PortalPlotter.get_structure_span(nodes_array, elements)
+    symbol_size = 0.025 * structure_span
+    node_label_offset = 0.018 * structure_span
+    x_values = np.asarray(nodes_array[:, 1], dtype=float)
+    y_values = np.asarray(nodes_array[:, 2], dtype=float)
+    support_bounds = (
+        float(np.min(x_values)),
+        float(np.max(x_values)),
+        float(np.min(y_values)),
+        float(np.max(y_values))
+    )
+
+    line_widths = {
+        'Rendah': 3.8,
+        'Sedang': 4.8,
+        'Tinggi': 5.8,
+        'Kritis': 6.8,
+        'Tidak Ada Data': 3.4
+    }
+
+    present_levels = []
+    for element in elements:
+        elem_id = int(element.elem_id)
+        level = str(element_levels.get(elem_id, 'Tidak Ada Data'))
+        color = RISK_LEVEL_COLORS.get(level, RISK_LEVEL_COLORS['Tidak Ada Data'])
+        line_width = line_widths.get(level, line_widths['Tidak Ada Data'])
+        start = np.asarray(element.coord_start, dtype=float)
+        end = np.asarray(element.coord_end, dtype=float)
+        present_levels.append(level)
+
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color='#0f172a',
+            linewidth=line_width + 1.6,
+            alpha=0.16,
+            solid_capstyle='round',
+            zorder=1
+        )
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color=color,
+            linewidth=line_width,
+            solid_capstyle='round',
+            zorder=2
+        )
+
+        mid_point = (start + end) / 2.0
+        ax.text(
+            mid_point[0],
+            mid_point[1],
+            f"E{elem_id}",
+            fontsize=9,
+            ha='center',
+            va='center',
+            zorder=4,
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='white',
+                alpha=0.92,
+                edgecolor=color,
+                linewidth=1.0
+            )
+        )
+
+    for node in nodes_array:
+        node_id = int(node[0])
+        coord = np.asarray(node[1:3], dtype=float)
+        restraints = boundary_conditions.get(node_id, {})
+        PortalPlotter._draw_support_symbol(
+            ax,
+            coord,
+            restraints,
+            symbol_size,
+            support_bounds
+        )
+        ax.plot(
+            coord[0],
+            coord[1],
+            marker='o',
+            markersize=6,
+            markerfacecolor='white',
+            markeredgecolor='#1f2937',
+            markeredgewidth=1.4,
+            zorder=5
+        )
+
+        label_bbox = dict(boxstyle='round,pad=0.15', facecolor='white', alpha=0.85)
+        if any(int(restraints.get(axis, 0)) == 1 for axis in ('X', 'Y', 'R')):
+            support_min_y = PortalPlotter._get_support_symbol_min_y(
+                coord,
+                restraints,
+                symbol_size,
+                support_bounds
+            )
+            ax.annotate(
+                f"N{node_id}",
+                xy=(float(coord[0]), float(support_min_y)),
+                xycoords='data',
+                xytext=(0, -6),
+                textcoords='offset points',
+                fontsize=8.5,
+                ha='center',
+                va='top',
+                zorder=6,
+                bbox=label_bbox
+            )
+        else:
+            ax.text(
+                coord[0],
+                coord[1] - node_label_offset,
+                f"N{node_id}",
+                fontsize=8.5,
+                ha='center',
+                va='top',
+                zorder=6,
+                bbox=label_bbox
+            )
+
+    legend_levels = [
+        level for level in ('Kritis', 'Tinggi', 'Sedang', 'Rendah', 'Tidak Ada Data')
+        if level in set(present_levels)
+    ]
+    legend_handles = [
+        Patch(
+            facecolor=RISK_LEVEL_COLORS[level],
+            edgecolor='#1e3a8a',
+            linewidth=1.4,
+            label=level
+        )
+        for level in legend_levels
+    ]
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles,
+            title='Level',
+            loc='center left',
+            bbox_to_anchor=(1.01, 0.5),
+            borderaxespad=0.0,
+            framealpha=0.96
+        )
+
+    ax.set_xlabel('X (mm)')
+    ax.set_ylabel('Y (mm)')
+    ax.set_title(title)
+    ax.grid(True, alpha=0.28)
+    ax.axis('equal')
+    ax.margins(0.08)
+    PortalPlotter.expand_axes_for_data_text(ax)
+    fig.subplots_adjust(
+        right=0.84 if legend_handles else 0.97,
+        bottom=0.17 if subtitle else 0.11
+    )
+    if subtitle:
+        fig.text(
+            0.08,
+            0.035,
+            str(subtitle),
+            fontsize=8.6,
+            color='#374151',
+            ha='left',
+            va='bottom',
+            wrap=True,
+            bbox=dict(
+                boxstyle='round,pad=0.24',
+                facecolor='white',
+                alpha=0.9,
+                edgecolor='#cbd5e1'
+            )
+        )
+    return fig
+
+
+def build_deterministic_risk_priority_df(latest_result: Dict,
+                                         input_data: Optional[Dict],
+                                         deterministic_sensitivity_results: Optional[Dict]) -> pd.DataFrame:
+    """Bangun tabel prioritas risiko deterministik per elemen."""
+    if latest_result is None or not input_data:
+        return pd.DataFrame()
+
+    limit_state_tables = build_limit_state_performance_tables(
+        latest_result,
+        input_data=input_data,
+        element_reliability={},
+        is_probabilistic=False
+    )
+    resume_df = build_limit_state_resume_df(limit_state_tables, is_probabilistic=False)
+    resume_lookup = {
+        int(row['Elemen (-)']): row
+        for _, row in resume_df.iterrows()
+    } if not resume_df.empty else {}
+
+    geometry_lookup = input_data.get('geometry', {}).get('properties_by_element', {}) or {}
+    all_element_ids = sorted({
+        int(elem_id) for elem_id in geometry_lookup.keys()
+    } or {
+        int(row[0]) for row in np.asarray(
+            input_data.get('geometry', {}).get('elements', []),
+            dtype=float
+        )
+    })
+
+    sensitivity_lookup: Dict[int, Dict[str, Any]] = {}
+    for variable_name, values in ((deterministic_sensitivity_results or {}).get('results') or {}).items():
+        elem_id = extract_element_id_from_variable_name(variable_name)
+        if elem_id is None:
+            continue
+
+        sensitivity_index = coerce_finite_float(values.get('sensitivity_index')) or 0.0
+        if sensitivity_index < 0.0:
+            sensitivity_index = 0.0
+
+        entry = sensitivity_lookup.setdefault(int(elem_id), {
+            'aggregate': 0.0,
+            'count': 0,
+            'top_variable': '-',
+            'top_sensitivity': -1.0,
+            'top_effect': '-'
+        })
+        entry['aggregate'] += float(sensitivity_index)
+        entry['count'] += 1
+        if (
+            float(sensitivity_index) > float(entry['top_sensitivity'])
+            or (
+                np.isclose(float(sensitivity_index), float(entry['top_sensitivity']))
+                and str(variable_name) < str(entry['top_variable'])
+            )
+        ):
+            entry['top_variable'] = str(variable_name)
+            entry['top_sensitivity'] = float(sensitivity_index)
+            entry['top_effect'] = describe_deterministic_g_effect(values.get('delta_g_plus'))
+
+    severity_raw: Dict[int, float] = {}
+    sensitivity_raw: Dict[int, float] = {}
+    for elem_id in all_element_ids:
+        resume_row = resume_lookup.get(int(elem_id), {})
+        sf_value_raw = resume_row.get('SF = R/S (-)')
+        try:
+            sf_value = float(sf_value_raw)
+        except (TypeError, ValueError):
+            sf_value = None
+
+        if sf_value is None:
+            severity_raw[int(elem_id)] = 0.0
+        elif np.isposinf(sf_value):
+            severity_raw[int(elem_id)] = 0.0
+        elif (not np.isfinite(sf_value)) or sf_value <= 0.0:
+            severity_raw[int(elem_id)] = 10.0
+        else:
+            severity_raw[int(elem_id)] = float(min(1.0 / max(sf_value, 1e-6), 10.0))
+
+        sensitivity_raw[int(elem_id)] = float(
+            (sensitivity_lookup.get(int(elem_id), {}) or {}).get('aggregate', 0.0)
+        )
+
+    severity_index = normalize_nonnegative_mapping(severity_raw)
+    sensitivity_index = normalize_nonnegative_mapping(sensitivity_raw)
+
+    rows = []
+    for elem_id in all_element_ids:
+        resume_row = resume_lookup.get(int(elem_id), {})
+        sf_value = resume_row.get('SF = R/S (-)')
+        priority_score = (
+            DETERMINISTIC_RISK_WEIGHT_SEVERITY * severity_index.get(int(elem_id), 0.0)
+            + DETERMINISTIC_RISK_WEIGHT_SENSITIVITY * sensitivity_index.get(int(elem_id), 0.0)
+        )
+        level = describe_deterministic_priority_level(priority_score, sf_value)
+        sensitivity_entry = sensitivity_lookup.get(int(elem_id), {}) or {}
+
+        rows.append({
+            'Elemen (-)': int(elem_id),
+            'Kode': get_element_code_from_input(input_data, int(elem_id)),
+            'Limit State Kontrol': resume_row.get('Limit State Kontrol', '-'),
+            'Satuan': resume_row.get('Satuan', '-'),
+            'g Kontrol': resume_row.get('g(x)'),
+            'SF Kontrol (-)': resume_row.get('SF = R/S (-)'),
+            'Severity Index (-)': severity_index.get(int(elem_id), 0.0),
+            'Agregat |Delta g|max': sensitivity_raw.get(int(elem_id), 0.0),
+            'Sensitivity Index (-)': sensitivity_index.get(int(elem_id), 0.0),
+            'Risk Priority Score (-)': float(priority_score),
+            'Level Prioritas': level,
+            'Variabel Dominan': sensitivity_entry.get('top_variable', '-'),
+            'Efek Variabel Dominan': sensitivity_entry.get('top_effect', '-'),
+            'Jumlah Variabel Sensitif (-)': int(sensitivity_entry.get('count', 0) or 0)
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df['_level_rank'] = df['Level Prioritas'].map(get_risk_level_rank).fillna(-1)
+    df = df.sort_values(
+        by=['_level_rank', 'Risk Priority Score (-)', 'Severity Index (-)', 'Elemen (-)'],
+        ascending=[False, False, False, True]
+    ).drop(columns=['_level_rank']).reset_index(drop=True)
+    return df
+
+
+def build_probabilistic_risk_map_df(latest_result: Dict,
+                                    input_data: Optional[Dict],
+                                    element_reliability: Optional[Dict]) -> pd.DataFrame:
+    """Bangun tabel risk map probabilistik berbasis Pf/Beta elemen."""
+    if latest_result is None or not input_data:
+        return pd.DataFrame()
+
+    element_reliability = element_reliability or {}
+    overall_lookup = element_reliability.get('overall', {}) or {}
+
+    limit_state_tables = build_limit_state_performance_tables(
+        latest_result,
+        input_data=input_data,
+        element_reliability=element_reliability,
+        is_probabilistic=True
+    )
+    resume_df = build_limit_state_resume_df(limit_state_tables, is_probabilistic=True)
+    resume_lookup = {
+        int(row['Elemen (-)']): row
+        for _, row in resume_df.iterrows()
+    } if not resume_df.empty else {}
+
+    geometry_lookup = input_data.get('geometry', {}).get('properties_by_element', {}) or {}
+    all_element_ids = sorted({
+        int(elem_id) for elem_id in (
+            set(geometry_lookup.keys()) | set(overall_lookup.keys()) | set(resume_lookup.keys())
+        )
+    })
+
+    rows = []
+    for elem_id in all_element_ids:
+        overall_info = (
+            get_by_element_value(overall_lookup, int(elem_id), {}) or {}
+        )
+        resume_row = resume_lookup.get(int(elem_id), {})
+        pf_value = overall_info.get('Pf')
+        beta_value = overall_info.get('Beta')
+        level = describe_probabilistic_risk_level(pf_value, beta_value)
+
+        rows.append({
+            'Elemen (-)': int(elem_id),
+            'Kode': get_element_code_from_input(input_data, int(elem_id)),
+            'Limit State Kontrol': resume_row.get('Limit State Kontrol', '-'),
+            'Pf Elemen (-)': pf_value,
+            'Beta Elemen (-)': beta_value,
+            'Jumlah Gagal Elemen (-)': overall_info.get('failures'),
+            'Pf Kontrol (-)': resume_row.get('Pf (-)'),
+            'Beta Kontrol (-)': resume_row.get('Beta (-)'),
+            'Level Risiko': level
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df['_level_rank'] = df['Level Risiko'].map(get_risk_level_rank).fillna(-1)
+    df['_pf_sort'] = pd.to_numeric(df['Pf Elemen (-)'], errors='coerce').fillna(-1.0)
+    df['_beta_sort'] = pd.to_numeric(df['Beta Elemen (-)'], errors='coerce').fillna(np.inf)
+    df = df.sort_values(
+        by=['_level_rank', '_pf_sort', '_beta_sort', 'Elemen (-)'],
+        ascending=[False, False, True, True]
+    ).drop(columns=['_level_rank', '_pf_sort', '_beta_sort']).reset_index(drop=True)
+    return df
+
+
+def style_risk_level_dataframe(df: pd.DataFrame,
+                               level_column: str,
+                               grouped_columns: Dict[str, List[str]]):
+    """Styling generik untuk tabel risk map berbasis level risiko."""
+    styler = style_input_dataframe(df, table_min_width_px=1700)
+    styler = apply_grouped_header_styles(styler, df, grouped_columns)
+    if df.empty or level_column not in df.columns:
+        return styler
+
+    def highlight_level(dataframe: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame('', index=dataframe.index, columns=dataframe.columns)
+        mapped_styles = dataframe[level_column].astype(str).map(
+            lambda value: RISK_LEVEL_STYLES.get(value, '')
+        )
+        styles.loc[:, level_column] = mapped_styles
+        return styles
+
+    return styler.apply(highlight_level, axis=None)
+
+
+def style_deterministic_risk_priority_df(df: pd.DataFrame):
+    """Styling tabel risk priority map deterministik."""
+    return style_risk_level_dataframe(
+        df,
+        level_column='Level Prioritas',
+        grouped_columns={
+            'identity': ['Elemen (-)', 'Kode'],
+            'summary': ['Limit State Kontrol', 'Satuan', 'g Kontrol', 'SF Kontrol (-)'],
+            'sensitivity': [
+                'Agregat |Delta g|max',
+                'Sensitivity Index (-)',
+                'Variabel Dominan',
+                'Efek Variabel Dominan',
+                'Jumlah Variabel Sensitif (-)'
+            ],
+            'risk': [
+                'Severity Index (-)',
+                'Risk Priority Score (-)',
+                'Level Prioritas'
+            ]
+        }
+    )
+
+
+def style_probabilistic_risk_map_df(df: pd.DataFrame):
+    """Styling tabel risk map probabilistik."""
+    return style_risk_level_dataframe(
+        df,
+        level_column='Level Risiko',
+        grouped_columns={
+            'identity': ['Elemen (-)', 'Kode'],
+            'summary': ['Limit State Kontrol'],
+            'overall': [
+                'Pf Elemen (-)',
+                'Beta Elemen (-)',
+                'Jumlah Gagal Elemen (-)'
+            ],
+            'risk': [
+                'Pf Kontrol (-)',
+                'Beta Kontrol (-)',
+                'Level Risiko'
+            ]
+        }
+    )
+
+
+def build_deterministic_risk_level_threshold_df() -> pd.DataFrame:
+    """Panduan batas level untuk risk priority map deterministik."""
+    return pd.DataFrame([
+        {
+            'Level': 'Kritis',
+            'Batas Skor Dasar': 'Risk Priority Score >= 0.75',
+            'Aturan Tambahan': 'Atau langsung Kritis bila SF <= 0.75'
+        },
+        {
+            'Level': 'Tinggi',
+            'Batas Skor Dasar': '0.55 <= Risk Priority Score < 0.75',
+            'Aturan Tambahan': 'Bisa naik tingkat bila 0.75 < SF < 1.00'
+        },
+        {
+            'Level': 'Sedang',
+            'Batas Skor Dasar': '0.30 <= Risk Priority Score < 0.55',
+            'Aturan Tambahan': 'Bisa naik tingkat bila 0.75 < SF < 1.00'
+        },
+        {
+            'Level': 'Rendah',
+            'Batas Skor Dasar': 'Risk Priority Score < 0.30',
+            'Aturan Tambahan': 'Tetap rendah bila SF >= 1.00'
+        }
+    ])
+
+
+def build_probabilistic_risk_level_threshold_df() -> pd.DataFrame:
+    """Panduan batas level untuk risk map probabilistik."""
+    return pd.DataFrame([
+        {
+            'Level': 'Kritis',
+            'Batas Pf': 'Pf >= 1e-1',
+            'Batas Beta': 'Beta < 1.5'
+        },
+        {
+            'Level': 'Tinggi',
+            'Batas Pf': '1e-2 <= Pf < 1e-1',
+            'Batas Beta': '1.5 <= Beta < 2.5'
+        },
+        {
+            'Level': 'Sedang',
+            'Batas Pf': '1e-3 <= Pf < 1e-2',
+            'Batas Beta': '2.5 <= Beta < 3.0'
+        },
+        {
+            'Level': 'Rendah',
+            'Batas Pf': 'Pf < 1e-3',
+            'Batas Beta': 'Beta >= 3.0'
+        }
+    ])
+
+
+def style_risk_threshold_df(df: pd.DataFrame):
+    """Styling sederhana untuk tabel batas level risk map."""
+    return style_risk_level_dataframe(
+        df,
+        level_column='Level',
+        grouped_columns={
+            'risk': list(df.columns)
+        }
+    )
+
+
+def render_risk_map_output_section(results_bundle: Dict,
+                                   latest_result: Dict,
+                                   input_data: Dict,
+                                   nodes: np.ndarray,
+                                   elements: List,
+                                   is_probabilistic: bool,
+                                   heading_level: str = "####") -> None:
+    """Render risk map adaptif untuk mode deterministik atau probabilistik."""
+    if latest_result is None or not input_data:
+        st.info("Risk map akan tersedia setelah analisis dijalankan.")
+        return
+
+    if nodes is None or elements is None:
+        nodes, elements = build_preview_portal(input_data, is_probabilistic)
+
+    if is_probabilistic:
+        risk_df = build_probabilistic_risk_map_df(
+            latest_result,
+            input_data=input_data,
+            element_reliability=(results_bundle or {}).get('element_reliability', {})
+        )
+        if risk_df.empty:
+            st.info("Data risk map probabilistik belum tersedia.")
+            return
+
+        top_row = risk_df.iloc[0]
+        critical_count = int((risk_df['Level Risiko'] == 'Kritis').sum())
+        element_level_map = {
+            int(row['Elemen (-)']): str(row['Level Risiko'])
+            for _, row in risk_df.iterrows()
+        }
+
+        st.markdown(f"{heading_level} Risk Map Probabilistik")
+        st.caption(
+            "Peta ini mewarnai setiap elemen berdasarkan `Pf/Beta` elemen secara keseluruhan. "
+            "Warna menunjukkan level risiko, sedangkan tabel di bawah merangkum limit state "
+            "kontrol yang paling dominan pada setiap elemen."
+        )
+        st.caption(
+            "Klasifikasi yang dipakai: `Kritis` bila `Pf >= 1e-1` atau `Beta < 1.5`, "
+            "`Tinggi` bila `Pf >= 1e-2` atau `Beta < 2.5`, `Sedang` bila "
+            "`Pf >= 1e-3` atau `Beta < 3.0`, dan `Rendah` untuk kondisi di bawahnya."
+        )
+        with st.expander("Batas Level Risk Map", expanded=False):
+            st.caption(
+                "Level akhir mengikuti kondisi yang lebih kritis antara ambang `Pf` "
+                "dan ambang `Beta`."
+            )
+            render_input_table(
+                build_probabilistic_risk_level_threshold_df(),
+                styler=style_risk_threshold_df(
+                    build_probabilistic_risk_level_threshold_df()
+                )
+            )
+
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Elemen Paling Kritis", f"E{int(top_row['Elemen (-)'])}")
+        metric_cols[1].metric("Pf Maksimum", format_metric(top_row.get('Pf Elemen (-)'), 6))
+        metric_cols[2].metric("Beta Minimum", format_metric(top_row.get('Beta Elemen (-)'), 4))
+        metric_cols[3].metric("Elemen Kritis", str(critical_count))
+
+        risk_fig = build_element_risk_map_figure(
+            nodes,
+            elements,
+            boundary_conditions=input_data.get('boundary', {}),
+            element_levels=element_level_map,
+            title="Risk Map Probabilistik Elemen Portal",
+            subtitle="Basis warna: level risiko elemen dari Pf/Beta keseluruhan."
+        )
+        render_plot(
+            risk_fig,
+            interactive=True,
+            viewer_key="probabilistic-risk-map",
+            alt_text="Risk map probabilistik elemen portal",
+            viewer_height=620
+        )
+
+        st.markdown(f"{heading_level} Tabel Risk Map Probabilistik")
+        render_input_table(
+            risk_df,
+            styler=style_probabilistic_risk_map_df(risk_df)
+        )
+        return
+
+    deterministic_results = (results_bundle or {}).get('deterministic_sensitivity_results', {}) or {}
+    risk_df = build_deterministic_risk_priority_df(
+        latest_result,
+        input_data=input_data,
+        deterministic_sensitivity_results=deterministic_results
+    )
+    if risk_df.empty:
+        st.info("Data risk priority map deterministik belum tersedia.")
+        return
+
+    baseline_info = deterministic_results.get('baseline', {}) or {}
+    baseline_label = str(baseline_info.get('limit_state_label', '-'))
+    top_row = risk_df.iloc[0]
+    critical_count = int((risk_df['Level Prioritas'] == 'Kritis').sum())
+    top_sensitive_row = risk_df.sort_values(
+        by=['Sensitivity Index (-)', 'Elemen (-)'],
+        ascending=[False, True]
+    ).iloc[0]
+    element_level_map = {
+        int(row['Elemen (-)']): str(row['Level Prioritas'])
+        for _, row in risk_df.iterrows()
+    }
+
+    st.markdown(f"{heading_level} Risk Priority Map Deterministik")
+    st.caption(
+        "Peta ini menyusun prioritas risiko elemen dari dua sisi: "
+        "`Severity Index` dari kebalikan `SF` elemen pengontrol, dan "
+        "`Sensitivity Index` dari akumulasi `|Delta g|max` variabel-variabel yang "
+        "terkait dengan elemen yang sama."
+    )
+    st.caption(
+        f"Skor prioritas dihitung dengan rumus "
+        f"`{DETERMINISTIC_RISK_WEIGHT_SEVERITY:.2f} x Severity + "
+        f"{DETERMINISTIC_RISK_WEIGHT_SENSITIVITY:.2f} x Sensitivity`, "
+        f"dengan sensitivitas mengacu pada limit state kontrol baseline `{baseline_label}`. "
+        "Jenis limit state yang dibandingkan tetap sama pada semua perturbasi, "
+        "namun elemen pengontrol dapat berubah."
+    )
+    with st.expander("Batas Level Risk Priority Map", expanded=False):
+        st.caption(
+            "`Risk Priority Score` dipakai sebagai batas dasar level, lalu `SF` "
+            "dipakai sebagai pengaman tambahan agar elemen dengan margin sangat rendah "
+            "tetap naik ke level prioritas yang lebih kritis."
+        )
+        st.caption(
+            "`Severity Index` dan `Sensitivity Index` dinormalisasi pada model aktif, "
+            "jadi level ini bersifat prioritas relatif dalam model yang sedang dianalisis."
+        )
+        render_input_table(
+            build_deterministic_risk_level_threshold_df(),
+            styler=style_risk_threshold_df(
+                build_deterministic_risk_level_threshold_df()
+            )
+        )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Limit State Baseline", baseline_label)
+    metric_cols[1].metric("Elemen Prioritas Tertinggi", f"E{int(top_row['Elemen (-)'])}")
+    metric_cols[2].metric(
+        "Skor Prioritas Maksimum",
+        format_metric(top_row.get('Risk Priority Score (-)'), 4)
+    )
+    metric_cols[3].metric("Elemen Kritis", str(critical_count))
+
+    st.caption(
+        f"Elemen paling sensitif terhadap perubahan variabel adalah "
+        f"`E{int(top_sensitive_row['Elemen (-)'])}` dengan "
+        f"`Sensitivity Index = {format_metric(top_sensitive_row.get('Sensitivity Index (-)'), 4)}`."
+    )
+
+    risk_fig = build_element_risk_map_figure(
+        nodes,
+        elements,
+        boundary_conditions=input_data.get('boundary', {}),
+        element_levels=element_level_map,
+        title="Risk Priority Map Deterministik Elemen Portal",
+        subtitle=(
+            "Basis warna: prioritas risiko elemen dari severity kontrol dan "
+            "sensitivitas terhadap limit state baseline."
+        )
+    )
+    render_plot(
+        risk_fig,
+        interactive=True,
+        viewer_key="deterministic-risk-map",
+        alt_text="Risk priority map deterministik elemen portal",
+        viewer_height=620
+    )
+
+    st.markdown(f"{heading_level} Tabel Risk Priority Map Deterministik")
+    render_input_table(
+        risk_df,
+        styler=style_deterministic_risk_priority_df(risk_df)
+    )
+
+
 def build_sensitivity_df(sensitivity_results: Dict,
                          beta_system: Optional[float] = None) -> pd.DataFrame:
     rows = build_sensitivity_rows(
@@ -2529,6 +3378,27 @@ def render_sensitivity_output_section(results_bundle: Dict,
     render_input_table(sensitivity_df)
 
 
+def describe_deterministic_g_effect(delta_g_value: Optional[float]) -> str:
+    """Ringkas arah pengaruh kenaikan +sigma terhadap margin keamanan."""
+    if delta_g_value is None:
+        return "-"
+
+    try:
+        numeric_value = float(delta_g_value)
+    except (TypeError, ValueError):
+        return "-"
+
+    if not np.isfinite(numeric_value):
+        return "-"
+    if np.isclose(numeric_value, 0.0, atol=1e-12, rtol=1e-9):
+        return "Hampir tidak mengubah margin keamanan"
+    return (
+        "Meningkatkan margin keamanan"
+        if numeric_value > 0.0 else
+        "Mengurangi margin keamanan"
+    )
+
+
 def _legacy_build_deterministic_sensitivity_interpretation(variable_name: str,
                                                            delta_g_plus: Optional[float],
                                                            perturbation_ratio: float,
@@ -2592,7 +3462,9 @@ def _legacy_build_deterministic_sensitivity_rows(
             'g jika -10%': values.get('g_minus'),
             'Δg jika -10%': values.get('delta_g_minus'),
             'Efek Maksimum pada g Kontrol': values.get('sensitivity_index'),
-            'Pengaruh terhadap Fungsi Kinerja (g(x))': values.get('worst_case'),
+            'Pengaruh terhadap Fungsi Kinerja (g(x))': describe_deterministic_g_effect(
+                values.get('delta_g_plus')
+            ),
             'Interpretasi Teknis': build_deterministic_sensitivity_interpretation(
                 variable_name,
                 values.get('delta_g_plus'),
@@ -2686,9 +3558,9 @@ def _legacy_build_deterministic_sensitivity_tornado_figure(
     ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.axvline(0.0, color='#111827', linewidth=1.0, alpha=0.85)
-    ax.set_xlabel(f"Perubahan g pada limit state kontrol ({target_unit})")
+    ax.set_xlabel(f"Perubahan g minimum pada limit state kontrol ({target_unit})")
     ax.set_title(
-        f"Diagram Sensitivitas Deterministik One-at-a-Time terhadap g {target_label}"
+        f"Diagram Sensitivitas Deterministik terhadap g minimum limit state kontrol: {target_label}"
     )
     ax.grid(True, axis='x', alpha=0.25, linestyle='--')
     ax.legend(loc='lower right')
@@ -2742,9 +3614,13 @@ def _legacy_render_deterministic_sensitivity_output_section(results_bundle: Dict
     st.caption(
         "Diagram tornado berikut dibentuk dari pendekatan `one-at-a-time`: setiap variabel "
         f"deterministik digeser sendiri sebesar `+/-{perturbation_percent:.0f}%` terhadap nilai acuan, "
-        f"lalu perubahan `g` pada limit state kontrol baseline `{target_label}` dibandingkan. "
+        f"lalu perubahan `g minimum` pada jenis limit state kontrol baseline `{target_label}` dibandingkan. "
         "Batang bernilai positif berarti margin keamanan meningkat, sedangkan batang negatif "
         "berarti margin keamanan menurun."
+    )
+    st.caption(
+        "Jenis limit state yang dibandingkan tetap sama pada semua skenario perturbasi. "
+        "Yang dapat berubah adalah elemen pengontrol yang menghasilkan nilai `g minimum` tersebut."
     )
     tornado_plot = build_deterministic_sensitivity_tornado_figure(
         deterministic_results,
@@ -2762,8 +3638,9 @@ def _legacy_render_deterministic_sensitivity_output_section(results_bundle: Dict
 
     st.markdown(f"{heading_level} Tabel Sensitivitas Deterministik")
     st.caption(
-        f"Kolom `g jika +/-10%` menunjukkan nilai `g` pada limit state kontrol `{target_label}` ({target_unit}) "
-        "setelah satu variabel digeser dan variabel lain dipertahankan pada baseline."
+        f"Kolom `g jika +/-10%` menunjukkan nilai `g minimum` pada limit state kontrol "
+        f"`{target_label}` ({target_unit}) setelah satu variabel digeser dan variabel lain "
+        "dipertahankan pada baseline."
     )
     st.caption(
         "Kolom `Efek Maksimum pada g Kontrol` adalah magnitudo perubahan terbesar dari dua skenario "
@@ -2844,7 +3721,9 @@ def build_deterministic_sensitivity_rows(
             'g jika -sigma': values.get('g_minus'),
             'Delta g jika -sigma': values.get('delta_g_minus'),
             'Efek Maksimum pada g Kontrol': values.get('sensitivity_index'),
-            'Pengaruh terhadap Fungsi Kinerja (g(x))': values.get('worst_case'),
+            'Pengaruh terhadap Fungsi Kinerja (g(x))': describe_deterministic_g_effect(
+                values.get('delta_g_plus')
+            ),
             'Interpretasi Teknis': build_deterministic_sensitivity_interpretation(
                 variable_name,
                 values.get('delta_g_plus'),
@@ -2928,9 +3807,9 @@ def build_deterministic_sensitivity_tornado_figure(
     ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.axvline(0.0, color='#111827', linewidth=1.0, alpha=0.85)
-    ax.set_xlabel(f"Perubahan g pada limit state kontrol ({target_unit})")
+    ax.set_xlabel(f"Perubahan g minimum pada limit state kontrol ({target_unit})")
     ax.set_title(
-        f"Diagram Sensitivitas Deterministik terhadap g {target_label}"
+        f"Diagram Sensitivitas Deterministik terhadap g minimum limit state kontrol: {target_label}"
     )
     ax.grid(True, axis='x', alpha=0.25, linestyle='--')
     ax.legend(loc='lower right')
@@ -3000,9 +3879,13 @@ def render_deterministic_sensitivity_output_section(results_bundle: Dict,
         "Diagram tornado berikut dibentuk dari pendekatan `one-at-a-time` berbasis COV: "
         "setiap variabel deterministik digeser sendiri sebesar `+/-sigma`, dengan "
         "`sigma = COV x Mean`, "
-        f"lalu perubahan `g` pada limit state kontrol baseline `{target_label}` dibandingkan. "
+        f"lalu perubahan `g minimum` pada jenis limit state kontrol baseline `{target_label}` dibandingkan. "
         "Batang bernilai positif berarti margin keamanan meningkat, sedangkan batang negatif "
         "berarti margin keamanan menurun."
+    )
+    st.caption(
+        "Jenis limit state yang dibandingkan tetap sama pada semua skenario perturbasi. "
+        "Yang dapat berubah adalah elemen pengontrol yang menghasilkan nilai `g minimum` tersebut."
     )
     tornado_plot = build_deterministic_sensitivity_tornado_figure(
         deterministic_results,
@@ -3020,14 +3903,21 @@ def render_deterministic_sensitivity_output_section(results_bundle: Dict,
 
     st.markdown(f"{heading_level} Tabel Sensitivitas Deterministik")
     st.caption(
-        f"Kolom `g jika +/-sigma` menunjukkan nilai `g` pada limit state kontrol `{target_label}` ({target_unit}) "
-        "setelah satu variabel digeser sebesar `+/-sigma` dan variabel lain dipertahankan pada baseline."
+        f"Kolom `g jika +/-sigma` menunjukkan nilai `g minimum` pada limit state kontrol "
+        f"`{target_label}` ({target_unit}) setelah satu variabel digeser sebesar `+/-sigma` "
+        "dan variabel lain dipertahankan pada baseline."
     )
     st.caption(
         "Kolom `COV (-)` menyatakan `StdDev / |Mean|` tiap variabel. "
         "`Efek Maksimum pada g Kontrol` adalah magnitudo perubahan terbesar dari dua skenario "
         "perturbasi berbasis COV, sedangkan `Pengaruh terhadap Fungsi Kinerja (g(x))` "
         "merangkum apakah perubahan tersebut meningkatkan atau mengurangi margin keamanan."
+    )
+    st.caption(
+        "Kolom `Pengaruh terhadap Fungsi Kinerja (g(x))` dan `Interpretasi Teknis` "
+        "mengikuti skenario kenaikan `+sigma`, agar konsisten dengan kolom "
+        "`Delta g jika +sigma`. Peringkat dan `Efek Maksimum pada g Kontrol` tetap "
+        "ditentukan dari magnitudo terbesar antara skenario `+sigma` dan `-sigma`."
     )
     st.caption(
         "Kolom `SF` memakai definisi `SF = R / S`. Khusus cek aksial-lentur, "
@@ -4762,6 +5652,7 @@ dashboard_tabs = [
     "Output Reliability",
     "Output Sensitivitas Probabilistik",
     "Output Sensitivitas Deterministik",
+    "Risk Map",
     "Plot Simulasi Terakhir",
     "Kurva Interasi P-M",
     "Laporan"
@@ -5176,6 +6067,28 @@ elif active_dashboard_tab == "Output Sensitivitas Deterministik":
             heading_level="####"
         )
 
+elif active_dashboard_tab == "Risk Map":
+    if latest_result is None:
+        st.info("Risk map akan tersedia setelah analisis dijalankan.")
+    else:
+        risk_plot_nodes = portal_nodes
+        risk_plot_elements = portal_elements
+        if risk_plot_nodes is None or risk_plot_elements is None:
+            risk_plot_nodes, risk_plot_elements = build_preview_portal(
+                analysis_input_data,
+                is_probabilistic
+            )
+
+        render_risk_map_output_section(
+            results_bundle=results_bundle or {},
+            latest_result=latest_result,
+            input_data=analysis_input_data,
+            nodes=risk_plot_nodes,
+            elements=risk_plot_elements,
+            is_probabilistic=is_probabilistic,
+            heading_level="####"
+        )
+
 elif active_dashboard_tab == "Plot Simulasi Terakhir":
     if latest_result is None:
         st.info("Plot hasil analisis akan tersedia setelah analisis dijalankan.")
@@ -5413,6 +6326,26 @@ elif active_dashboard_tab == "Laporan":
     else:
         st.markdown("#### Ringkasan Laporan Analisis")
         st.text(results_bundle['report'])
+
+        if latest_result is not None:
+            report_risk_nodes = portal_nodes
+            report_risk_elements = portal_elements
+            if report_risk_nodes is None or report_risk_elements is None:
+                report_risk_nodes, report_risk_elements = build_preview_portal(
+                    analysis_input_data,
+                    is_probabilistic
+                )
+
+            st.markdown("#### Risk Map")
+            render_risk_map_output_section(
+                results_bundle=results_bundle or {},
+                latest_result=latest_result,
+                input_data=analysis_input_data,
+                nodes=report_risk_nodes,
+                elements=report_risk_elements,
+                is_probabilistic=is_probabilistic,
+                heading_level="#####"
+            )
 
         if is_probabilistic:
             render_sensitivity_output_section(
