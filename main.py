@@ -70,7 +70,9 @@ class PortalReliabilityAnalysis:
             'probabilistik': 'probabilistic',
             'monte carlo': 'probabilistic',
             'deterministic': 'deterministic',
-            'deterministik': 'deterministic'
+            'deterministik': 'deterministic',
+            'deterministic (sni 2847:2019)': 'deterministic',
+            'deterministik (sni 2847:2019)': 'deterministic'
         }
 
         normalized = aliases.get(mode)
@@ -89,7 +91,11 @@ class PortalReliabilityAnalysis:
 
     def get_analysis_mode_label(self) -> str:
         """Label mode untuk UI/report."""
-        return 'Probabilistik' if self.is_probabilistic else 'Deterministik'
+        return (
+            'Probabilistik'
+            if self.is_probabilistic else
+            'Deterministik (SNI 2847:2019)'
+        )
 
     @staticmethod
     def _get_scalar_value(value: Any, reducer: str = 'first') -> float:
@@ -823,12 +829,14 @@ class PortalReliabilityAnalysis:
                 })
         elif performance_key == 'performance_shear':
             performance_values = analysis_result.get('performance_shear', {}) or {}
+            metadata_values = analysis_result.get('performance_shear_metadata', {}) or {}
             entries = []
             element_ids = sorted({
                 int(elem_id)
                 for elem_id in (
                     list(max_forces_values.keys())
-                    + list(performance_values.keys())
+                        + list(performance_values.keys())
+                        + list(metadata_values.keys())
                 )
             })
             for elem_id in element_ids:
@@ -836,11 +844,10 @@ class PortalReliabilityAnalysis:
                 demand = max_forces_entry.get('max_shear')
                 demand = abs(float(demand)) if demand is not None else None
                 g_value = performance_values.get(elem_id)
-                capacity = (
-                    None
-                    if demand is None or g_value is None else
-                    float(g_value) + float(demand)
-                )
+                meta = metadata_values.get(elem_id, {}) or {}
+                capacity = meta.get('phi_Vn')
+                if capacity is None and demand is not None and g_value is not None:
+                    capacity = float(g_value) + float(demand)
                 entries.append({
                     'elem_id': int(elem_id),
                     'g_value': None if g_value is None else float(g_value),
@@ -1172,8 +1179,10 @@ class PortalReliabilityAnalysis:
         axial_performance = {}
         axial_moment_performance = {}
         moment_metadata = {}
+        shear_metadata = {}
         axial_metadata = {}
         axial_moment_metadata = {}
+        use_code_phi = not self.is_probabilistic
 
         def _extract_section_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
             metadata = {
@@ -1190,8 +1199,14 @@ class PortalReliabilityAnalysis:
                 'phi_Pn_tarik',
                 'Pn',
                 'phi_Mn',
+                'phi_Vn',
+                'phi_code',
                 'Mn',
+                'Vn',
+                'Vc',
+                'Vs',
                 'lambda',
+                'demand_shear',
                 'demand_axial_abs',
                 'controlling_state',
                 'tension_steel_yielded',
@@ -1238,20 +1253,24 @@ class PortalReliabilityAnalysis:
                 fy_tarik,
                 section_inputs['section_geometry'],
                 section_inputs['steel_area'],
-                fy_tekan=fy_tekan
+                fy_tekan=fy_tekan,
+                use_code_phi=use_code_phi
             )
             g_moment = float(moment_result['phi_Mn'] - abs(max_moment))
-            g_shear = PerformanceFunction.shear_capacity_demand(
+            shear_result = PerformanceFunction._get_shear_capacity_check_result(
                 max_shear,
                 fc_value,
                 fy_geser,
                 section_inputs['section_geometry'],
                 section_inputs['steel_area'].get('As_shear', 0.0),
-                shear_spacing=section_inputs['steel_area'].get('shear_spacing', 0.0)
+                shear_spacing=section_inputs['steel_area'].get('shear_spacing', 0.0),
+                use_code_phi=use_code_phi
             )
+            g_shear = float(shear_result['g'])
             moment_performance[elem_id] = g_moment
             shear_performance[elem_id] = g_shear
             moment_metadata[elem_id] = _extract_section_metadata(moment_result)
+            shear_metadata[elem_id] = _extract_section_metadata(shear_result)
             axial_demands = self._get_axial_demand_components(force_data)
             interaction_curve = None
             if element_code in {'B', 'K'}:
@@ -1260,7 +1279,8 @@ class PortalReliabilityAnalysis:
                     fy_tarik,
                     section_inputs['section_geometry'],
                     section_inputs['steel_area'],
-                    fy_tekan=fy_tekan
+                    fy_tekan=fy_tekan,
+                    use_code_phi=use_code_phi
                 )
 
             if element_code in {'B', 'K'}:
@@ -1272,6 +1292,7 @@ class PortalReliabilityAnalysis:
                     section_inputs['section_geometry'],
                     section_inputs['steel_area'],
                     fy_tekan=fy_tekan,
+                    use_code_phi=use_code_phi,
                     interaction_curve=interaction_curve
                 )
                 if not self.is_probabilistic:
@@ -1280,7 +1301,8 @@ class PortalReliabilityAnalysis:
                         fy_tarik,
                         section_inputs['section_geometry'],
                         section_inputs['steel_area'],
-                        fy_tekan=fy_tekan
+                        fy_tekan=fy_tekan,
+                        use_code_phi=use_code_phi
                     )
                     compression_boundary = max(
                         interaction_curve,
@@ -1326,6 +1348,7 @@ class PortalReliabilityAnalysis:
                     section_inputs['section_geometry'],
                     section_inputs['steel_area'],
                     fy_tekan=fy_tekan,
+                    use_code_phi=use_code_phi,
                     interaction_curve=interaction_curve
                 )
                 axial_moment_performance[elem_id] = float(axial_moment_result['g'])
@@ -1339,6 +1362,7 @@ class PortalReliabilityAnalysis:
             'axial': axial_performance,
             'axial_moment': axial_moment_performance,
             'moment_metadata': moment_metadata,
+            'shear_metadata': shear_metadata,
             'axial_metadata': axial_metadata,
             'axial_moment_metadata': axial_moment_metadata
         }
@@ -1360,6 +1384,7 @@ class PortalReliabilityAnalysis:
         output['performance_axial'] = performance_values.get('axial', {})
         output['performance_axial_moment'] = performance_values.get('axial_moment', {})
         output['performance_metadata'] = performance_values.get('moment_metadata', {})
+        output['performance_shear_metadata'] = performance_values.get('shear_metadata', {})
         output['performance_axial_metadata'] = performance_values.get('axial_metadata', {})
         output['performance_axial_moment_metadata'] = performance_values.get(
             'axial_moment_metadata',
@@ -1538,7 +1563,7 @@ class PortalReliabilityAnalysis:
                 'safety_class': (
                     self.reliability_assessment.get_safety_class()
                     if self.reliability_assessment else
-                    ('Deterministik' if latest_result is not None else None)
+                    (self.get_analysis_mode_label() if latest_result is not None else None)
                 ),
                 'is_safe': (
                     self.reliability_assessment.is_safe('ultimate')
@@ -2500,11 +2525,11 @@ class PortalReliabilityAnalysis:
 
             report = f"""
 {'='*60}
-LAPORAN ANALISIS STRUKTUR DETERMINISTIK
+LAPORAN ANALISIS STRUKTUR DETERMINISTIK (SNI 2847:2019)
 {'='*60}
 
 Dasar Analisis:
-  - Mode analisis: Deterministik
+  - Mode analisis: Deterministik (SNI 2847:2019)
   - Respons struktur dihitung satu kali menggunakan parameter deterministik pada setiap elemen
   - Probabilitas kegagalan, Pf: Tidak berlaku
   - Indeks keandalan, Beta: Tidak berlaku
@@ -2589,7 +2614,7 @@ Interpretasi Rekayasa:
         safety_class = (
             self.reliability_assessment.get_safety_class()
             if self.reliability_assessment else
-            ('Deterministik' if latest_result is not None else None)
+            (self.get_analysis_mode_label() if latest_result is not None else None)
         )
 
         json_results = self._to_serializable({
