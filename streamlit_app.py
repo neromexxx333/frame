@@ -21,6 +21,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from matplotlib.patches import Patch
+from scipy import stats
 
 from main import PortalReliabilityAnalysis
 from modules.display_conventions import (
@@ -2574,10 +2575,15 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
             'count': 0,
             'top_variable': '-',
             'top_sensitivity': -1.0,
-            'top_effect': '-'
+            'top_effect': '-',
+            'variables': []
         })
         entry['aggregate'] += float(sensitivity_index)
         entry['count'] += 1
+        entry['variables'].append({
+            'name': str(variable_name),
+            'sensitivity': float(sensitivity_index)
+        })
         if (
             float(sensitivity_index) > float(entry['top_sensitivity'])
             or (
@@ -2625,6 +2631,17 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
         )
         level = describe_deterministic_priority_level(priority_score, sf_value)
         sensitivity_entry = sensitivity_lookup.get(int(elem_id), {}) or {}
+        ordered_variable_names = [
+            item.get('name', '-')
+            for item in sorted(
+                sensitivity_entry.get('variables', []),
+                key=lambda item: (
+                    -float(item.get('sensitivity', 0.0) or 0.0),
+                    str(item.get('name', ''))
+                )
+            )
+            if str(item.get('name', '')).strip()
+        ]
 
         rows.append({
             'Elemen (-)': int(elem_id),
@@ -2640,7 +2657,10 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
             'Level Prioritas': level,
             'Variabel Dominan': sensitivity_entry.get('top_variable', '-'),
             'Efek Variabel Dominan': sensitivity_entry.get('top_effect', '-'),
-            'Jumlah Variabel Sensitif (-)': int(sensitivity_entry.get('count', 0) or 0)
+            'Jumlah Variabel Sensitivitas Elemen (-)': len(ordered_variable_names),
+            'Daftar Variabel Sensitivitas Elemen (-)': (
+                ', '.join(ordered_variable_names) if ordered_variable_names else '-'
+            )
         })
 
     df = pd.DataFrame(rows)
@@ -2722,9 +2742,10 @@ def build_probabilistic_risk_map_df(latest_result: Dict,
 
 def style_risk_level_dataframe(df: pd.DataFrame,
                                level_column: str,
-                               grouped_columns: Dict[str, List[str]]):
+                               grouped_columns: Dict[str, List[str]],
+                               table_min_width_px: int = 1700):
     """Styling generik untuk tabel risk map berbasis level risiko."""
-    styler = style_input_dataframe(df, table_min_width_px=1700)
+    styler = style_input_dataframe(df, table_min_width_px=table_min_width_px)
     styler = apply_grouped_header_styles(styler, df, grouped_columns)
     if df.empty or level_column not in df.columns:
         return styler
@@ -2753,14 +2774,16 @@ def style_deterministic_risk_priority_df(df: pd.DataFrame):
                 'Sensitivity Index (-)',
                 'Variabel Dominan',
                 'Efek Variabel Dominan',
-                'Jumlah Variabel Sensitif (-)'
+                'Jumlah Variabel Sensitivitas Elemen (-)',
+                'Daftar Variabel Sensitivitas Elemen (-)'
             ],
             'risk': [
                 'Severity Index (-)',
                 'Risk Priority Score (-)',
                 'Level Prioritas'
             ]
-        }
+        },
+        table_min_width_px=2400
     )
 
 
@@ -3023,10 +3046,338 @@ def render_risk_map_output_section(results_bundle: Dict,
     )
 
     st.markdown(f"{heading_level} Tabel Risk Priority Map Deterministik")
+    st.caption(
+        "Kolom `Jumlah Variabel Sensitivitas Elemen (-)` menunjukkan berapa banyak "
+        "variabel perturbasi one-at-a-time yang dipetakan ke elemen tersebut dan ikut "
+        "membentuk `Sensitivity Index`."
+    )
+    st.caption(
+        "Kolom `Daftar Variabel Sensitivitas Elemen (-)` menuliskan nama variabel yang "
+        "terkait dengan elemen itu, diurutkan dari `|Delta g|max` terbesar ke terkecil."
+    )
     render_input_table(
         risk_df,
         styler=style_deterministic_risk_priority_df(risk_df)
     )
+
+
+def get_probabilistic_histogram_variable_specs() -> List[Dict[str, str]]:
+    """Spesifikasi variabel random yang ditampilkan pada tab histogram."""
+    return [
+        {
+            'type': 'fc',
+            'label': 'Mutu Beton fc',
+            'distribution_label': 'Lognormal',
+            'unit': 'MPa'
+        },
+        {
+            'type': 'fy_tarik',
+            'label': 'fy Tarik',
+            'distribution_label': 'Normal',
+            'unit': 'MPa'
+        },
+        {
+            'type': 'fy_tekan',
+            'label': 'fy Tekan',
+            'distribution_label': 'Normal',
+            'unit': 'MPa'
+        },
+        {
+            'type': 'fy_geser',
+            'label': 'fy Geser',
+            'distribution_label': 'Normal',
+            'unit': 'MPa'
+        },
+        {
+            'type': 'qDL',
+            'label': 'Beban Mati qDL',
+            'distribution_label': 'Normal',
+            'unit': 'kN/m'
+        },
+        {
+            'type': 'qLL',
+            'label': 'Beban Hidup qLL',
+            'distribution_label': 'Lognormal',
+            'unit': 'kN/m'
+        }
+    ]
+
+
+def build_histogram_variable_name(variable_type: str, elem_id: int) -> str:
+    """Nama flat variabel random per elemen untuk tab histogram."""
+    return f"{str(variable_type).strip()}_E{int(elem_id)}"
+
+
+def build_probabilistic_histogram_summary_df(histogram_data: Dict[str, Dict[str, Any]],
+                                             elem_id: int) -> pd.DataFrame:
+    """Ringkas statistik histogram Monte Carlo untuk satu elemen."""
+    rows = []
+    for spec in get_probabilistic_histogram_variable_specs():
+        variable_name = build_histogram_variable_name(spec['type'], int(elem_id))
+        record = histogram_data.get(variable_name)
+        if not record:
+            continue
+
+        rows.append({
+            'Variabel Acak (-)': variable_name,
+            'Distribusi Input': str(record.get('distribution', spec['distribution_label'])).title(),
+            'Mean Input': record.get('mean'),
+            'StdDev Input': record.get('stddev'),
+            'Mean Sampel MC': record.get('sample_mean'),
+            'StdDev Sampel MC': record.get('sample_std'),
+            'Minimum Sampel': record.get('sample_min'),
+            'Maksimum Sampel': record.get('sample_max'),
+            'Jumlah Sampel (-)': record.get('sample_count'),
+            'Satuan': record.get('unit', spec['unit'])
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_probability_density_curve(distribution: str,
+                                    mean_value: Optional[float],
+                                    stddev_value: Optional[float],
+                                    x_values: np.ndarray) -> Optional[np.ndarray]:
+    """Hitung PDF teoritis untuk overlay histogram."""
+    mean_numeric = coerce_finite_float(mean_value)
+    stddev_numeric = coerce_finite_float(stddev_value)
+    if mean_numeric is None or stddev_numeric is None or stddev_numeric <= 0.0:
+        return None
+
+    distribution_name = str(distribution or 'normal').strip().lower()
+    x_array = np.asarray(x_values, dtype=float)
+    if x_array.size == 0:
+        return None
+
+    if distribution_name == 'normal':
+        return stats.norm.pdf(x_array, loc=mean_numeric, scale=stddev_numeric)
+
+    if distribution_name == 'lognormal':
+        if mean_numeric <= 0.0:
+            return None
+        variance_ratio = (stddev_numeric / mean_numeric) ** 2
+        sigma = np.sqrt(np.log(1.0 + variance_ratio))
+        mu = np.log(mean_numeric) - 0.5 * sigma ** 2
+        clipped_x = np.clip(x_array, 1e-12, None)
+        pdf_values = stats.lognorm.pdf(clipped_x, s=sigma, scale=np.exp(mu))
+        pdf_values = np.where(x_array > 0.0, pdf_values, 0.0)
+        return np.asarray(pdf_values, dtype=float)
+
+    return None
+
+
+def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any]],
+                                         elem_id: int) -> Optional[plt.Figure]:
+    """Bangun figure histogram variabel random untuk satu elemen."""
+    variable_specs = get_probabilistic_histogram_variable_specs()
+    if not variable_specs:
+        return None
+
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.8), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    color_map = {
+        'fc': '#2563eb',
+        'fy_tarik': '#dc2626',
+        'fy_tekan': '#f59e0b',
+        'fy_geser': '#7c3aed',
+        'qDL': '#0f766e',
+        'qLL': '#be185d'
+    }
+    plotted_any = False
+
+    for axis, spec in zip(axes_list, variable_specs):
+        variable_name = build_histogram_variable_name(spec['type'], int(elem_id))
+        record = histogram_data.get(variable_name)
+        if not record:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                f"Data {spec['label']} untuk E{int(elem_id)}\ntidak tersedia.",
+                ha='center',
+                va='center',
+                fontsize=10,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#f8fafc',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            continue
+
+        hist_edges = np.asarray(record.get('hist_bin_edges', []), dtype=float)
+        hist_density = np.asarray(record.get('hist_density', []), dtype=float)
+        if hist_edges.size < 2 or hist_density.size == 0:
+            axis.axis('off')
+            continue
+
+        bin_widths = np.diff(hist_edges)
+        bin_centers = hist_edges[:-1] + (0.5 * bin_widths)
+        face_color = color_map.get(spec['type'], '#2563eb')
+        axis.bar(
+            bin_centers,
+            hist_density,
+            width=bin_widths * 0.92,
+            color=face_color,
+            alpha=0.38,
+            edgecolor='#1f2937',
+            linewidth=0.8,
+            label='Histogram MC'
+        )
+
+        pdf_x = np.linspace(hist_edges[0], hist_edges[-1], 320)
+        pdf_y = build_probability_density_curve(
+            str(record.get('distribution', spec['distribution_label'])),
+            record.get('mean'),
+            record.get('stddev'),
+            pdf_x
+        )
+        if pdf_y is not None and np.all(np.isfinite(pdf_y)):
+            axis.plot(
+                pdf_x,
+                pdf_y,
+                color='#111827',
+                linewidth=1.8,
+                label='PDF teoritis'
+            )
+
+        input_mean = coerce_finite_float(record.get('mean'))
+        sample_mean = coerce_finite_float(record.get('sample_mean'))
+        if input_mean is not None:
+            axis.axvline(
+                input_mean,
+                color='#dc2626',
+                linestyle='--',
+                linewidth=1.1,
+                label='Mean input'
+            )
+        if sample_mean is not None:
+            axis.axvline(
+                sample_mean,
+                color='#2563eb',
+                linestyle=':',
+                linewidth=1.2,
+                label='Mean sampel'
+            )
+
+        axis.set_title(
+            f"{spec['label']} | E{int(elem_id)}\nDistribusi: {spec['distribution_label']}",
+            fontsize=10.5,
+            pad=10
+        )
+        axis.set_xlabel(f"Nilai ({record.get('unit', spec['unit'])})")
+        axis.set_ylabel('Kerapatan')
+        axis.grid(True, alpha=0.22, linestyle='--')
+        axis.legend(fontsize=8, loc='best')
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Histogram Variabel Acak Probabilistik per Elemen | E{int(elem_id)}",
+        fontsize=13,
+        y=0.98
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    return fig
+
+
+def render_probabilistic_histogram_output_section(results_bundle: Dict,
+                                                  heading_level: str = "####") -> None:
+    """Tampilkan histogram variabel random untuk mode probabilistik."""
+    histogram_data = (results_bundle or {}).get('probabilistic_histogram_data', {}) or {}
+    summary = (results_bundle or {}).get('summary', {}) or {}
+    if not histogram_data:
+        st.info(
+            "Histogram variabel acak belum tersedia. Jalankan analisis probabilistik "
+            "agar sampel Monte Carlo dapat diringkas ke tab ini."
+        )
+        return
+
+    allowed_types = {
+        spec['type']
+        for spec in get_probabilistic_histogram_variable_specs()
+    }
+    available_element_ids = sorted({
+        int(record.get('element_id'))
+        for record in histogram_data.values()
+        if record.get('variable_type') in allowed_types
+        and record.get('element_id') is not None
+    })
+    if not available_element_ids:
+        st.info("Tidak ada elemen dengan data histogram variabel acak yang dapat ditampilkan.")
+        return
+
+    selected_element_id = st.selectbox(
+        "Pilih elemen untuk histogram variabel acak",
+        options=available_element_ids,
+        format_func=lambda elem_id: f"E{int(elem_id)}",
+        key="probabilistic_histogram_element_selector"
+    )
+
+    variable_specs = get_probabilistic_histogram_variable_specs()
+    available_variable_count = int(sum(
+        1
+        for spec in variable_specs
+        if build_histogram_variable_name(spec['type'], int(selected_element_id)) in histogram_data
+    ))
+
+    st.markdown(f"{heading_level} Histogram Variabel Acak")
+    st.caption(
+        "Tab ini menampilkan histogram hasil sampling Monte Carlo aktual untuk variabel acak "
+        "per elemen, lalu dibandingkan dengan `PDF` teoritis sesuai distribusi input."
+    )
+    st.caption(
+        "Distribusi yang dipakai pada tampilan ini adalah: `fc = lognormal`, "
+        "`fy tarik/tekan/geser = normal`, `beban mati = normal`, dan "
+        "`beban hidup = lognormal`."
+    )
+    st.caption(
+        "Elemen yang tersedia pada model aktif: "
+        + ", ".join(f"`E{int(elem_id)}`" for elem_id in available_element_ids)
+    )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Jumlah Simulasi", format_metric_comma(summary.get('num_simulations'), 0))
+    metric_cols[1].metric("Elemen Terpilih", f"E{int(selected_element_id)}")
+    metric_cols[2].metric("Variabel Tersedia", str(available_variable_count))
+    metric_cols[3].metric("Analisis Gagal", format_metric_comma(summary.get('analysis_failures'), 0))
+
+    histogram_fig = build_probabilistic_histogram_figure(
+        histogram_data,
+        elem_id=int(selected_element_id)
+    )
+    if histogram_fig is not None:
+        render_plot(
+            histogram_fig,
+            interactive=False,
+            alt_text=f"Histogram variabel acak probabilistik elemen {int(selected_element_id)}"
+        )
+    else:
+        st.info("Histogram untuk elemen yang dipilih belum dapat dibentuk.")
+
+    histogram_summary_df = build_probabilistic_histogram_summary_df(
+        histogram_data,
+        elem_id=int(selected_element_id)
+    )
+    st.markdown(f"{heading_level} Tabel Ringkasan Histogram")
+    st.caption(
+        "Tabel ini membandingkan parameter input (`mean/stddev`) dengan statistik sampel Monte Carlo "
+        "yang benar-benar terbentuk pada elemen terpilih."
+    )
+    if histogram_summary_df.empty:
+        st.info("Ringkasan histogram untuk elemen yang dipilih belum tersedia.")
+    else:
+        render_input_table(
+            histogram_summary_df,
+            styler=style_input_dataframe(
+                histogram_summary_df,
+                table_min_width_px=1700
+            )
+        )
 
 
 def build_sensitivity_df(sensitivity_results: Dict,
@@ -5651,6 +6002,7 @@ dashboard_tabs = [
     "Output Analisis Struktur",
     "Output Reliability",
     "Output Sensitivitas Probabilistik",
+    "Histogram",
     "Output Sensitivitas Deterministik",
     "Risk Map",
     "Plot Simulasi Terakhir",
@@ -6045,6 +6397,20 @@ elif active_dashboard_tab == "Output Sensitivitas Probabilistik":
         render_sensitivity_output_section(
             results_bundle,
             is_probabilistic,
+            heading_level="####"
+        )
+
+elif active_dashboard_tab == "Histogram":
+    if not results_bundle:
+        st.info("Histogram variabel acak akan tersedia setelah analisis dijalankan.")
+    elif not is_probabilistic:
+        st.info(
+            "Tab `Histogram` khusus untuk mode probabilistik. "
+            "Jalankan analisis probabilistik agar distribusi sampel Monte Carlo bisa ditampilkan."
+        )
+    else:
+        render_probabilistic_histogram_output_section(
+            results_bundle,
             heading_level="####"
         )
 
