@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2576,6 +2577,7 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
             'top_variable': '-',
             'top_sensitivity': -1.0,
             'top_effect': '-',
+            'top_delta_g': None,
             'variables': []
         })
         entry['aggregate'] += float(sensitivity_index)
@@ -2591,9 +2593,17 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
                 and str(variable_name) < str(entry['top_variable'])
             )
         ):
+            signed_effect = coerce_finite_float(values.get('signed_effect'))
+            if signed_effect is None:
+                signed_effect = coerce_finite_float(values.get('delta_g_plus'))
             entry['top_variable'] = str(variable_name)
             entry['top_sensitivity'] = float(sensitivity_index)
-            entry['top_effect'] = describe_deterministic_g_effect(values.get('delta_g_plus'))
+            entry['top_delta_g'] = signed_effect
+            entry['top_effect'] = (
+                str(values.get('worst_case')).strip()
+                if str(values.get('worst_case', '')).strip()
+                else describe_deterministic_g_effect(signed_effect)
+            )
 
     severity_raw: Dict[int, float] = {}
     sensitivity_raw: Dict[int, float] = {}
@@ -2648,14 +2658,15 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
             'Kode': get_element_code_from_input(input_data, int(elem_id)),
             'Limit State Kontrol': resume_row.get('Limit State Kontrol', '-'),
             'Satuan': resume_row.get('Satuan', '-'),
-            'g Kontrol': resume_row.get('g(x)'),
-            'SF Kontrol (-)': resume_row.get('SF = R/S (-)'),
+            'g(x) Awal': resume_row.get('g(x)'),
+            'SF Awal (-)': resume_row.get('SF = R/S (-)'),
             'Severity Index (-)': severity_index.get(int(elem_id), 0.0),
             'Agregat |Delta g|max': sensitivity_raw.get(int(elem_id), 0.0),
             'Sensitivity Index (-)': sensitivity_index.get(int(elem_id), 0.0),
             'Risk Priority Score (-)': float(priority_score),
             'Level Prioritas': level,
             'Variabel Dominan': sensitivity_entry.get('top_variable', '-'),
+            'Delta g Variabel Dominan': sensitivity_entry.get('top_delta_g'),
             'Efek Variabel Dominan': sensitivity_entry.get('top_effect', '-'),
             'Jumlah Variabel Sensitivitas Elemen (-)': len(ordered_variable_names),
             'Daftar Variabel Sensitivitas Elemen (-)': (
@@ -2672,6 +2683,7 @@ def build_deterministic_risk_priority_df(latest_result: Dict,
         by=['_level_rank', 'Risk Priority Score (-)', 'Severity Index (-)', 'Elemen (-)'],
         ascending=[False, False, False, True]
     ).drop(columns=['_level_rank']).reset_index(drop=True)
+    df = add_element_number_display_column(df)
     return df
 
 
@@ -2737,7 +2749,31 @@ def build_probabilistic_risk_map_df(latest_result: Dict,
         by=['_level_rank', '_pf_sort', '_beta_sort', 'Elemen (-)'],
         ascending=[False, False, True, True]
     ).drop(columns=['_level_rank', '_pf_sort', '_beta_sort']).reset_index(drop=True)
+    df = add_element_number_display_column(df)
     return df
+
+
+def add_element_number_display_column(df: pd.DataFrame,
+                                      element_column: str = 'Elemen (-)',
+                                      display_column: str = 'Nomor Elemen') -> pd.DataFrame:
+    """Tambahkan kolom tampilan nomor elemen dalam format E# tanpa mengubah kolom numerik asli."""
+    if df is None or df.empty or element_column not in df.columns:
+        return df
+
+    result = df.copy()
+    display_values = result[element_column].map(
+        lambda value: (
+            f"E{int(float(value))}"
+            if pd.notna(value) and str(value).strip() not in {'', '-', 'nan'}
+            else '-'
+        )
+    )
+    if display_column in result.columns:
+        result[display_column] = display_values
+        return result
+
+    result.insert(0, display_column, display_values)
+    return result
 
 
 def style_risk_level_dataframe(df: pd.DataFrame,
@@ -2767,12 +2803,13 @@ def style_deterministic_risk_priority_df(df: pd.DataFrame):
         df,
         level_column='Level Prioritas',
         grouped_columns={
-            'identity': ['Elemen (-)', 'Kode'],
-            'summary': ['Limit State Kontrol', 'Satuan', 'g Kontrol', 'SF Kontrol (-)'],
+            'identity': ['Nomor Elemen', 'Kode'],
+            'summary': ['Limit State Kontrol', 'Satuan', 'g(x) Awal', 'SF Awal (-)'],
             'sensitivity': [
                 'Agregat |Delta g|max',
                 'Sensitivity Index (-)',
                 'Variabel Dominan',
+                'Delta g Variabel Dominan',
                 'Efek Variabel Dominan',
                 'Jumlah Variabel Sensitivitas Elemen (-)',
                 'Daftar Variabel Sensitivitas Elemen (-)'
@@ -2793,7 +2830,7 @@ def style_probabilistic_risk_map_df(df: pd.DataFrame):
         df,
         level_column='Level Risiko',
         grouped_columns={
-            'identity': ['Elemen (-)', 'Kode'],
+            'identity': ['Nomor Elemen', 'Elemen (-)', 'Kode'],
             'summary': ['Limit State Kontrol'],
             'overall': [
                 'Pf Elemen (-)',
@@ -2870,6 +2907,571 @@ def style_risk_threshold_df(df: pd.DataFrame):
             'risk': list(df.columns)
         }
     )
+
+
+def get_risk_recommendation_catalog() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Daftar rekomendasi teknis umum berdasarkan jenis elemen dan level risiko."""
+    return {
+        'B': {
+            'Kritis': {
+                'indikasi': 'Kegagalan lentur/geser atau daktilitas rendah.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Tingkatkan kapasitas lentur.',
+                            'Tambah luas tulangan tarik.',
+                            'Optimasi tinggi efektif balok.',
+                            'Perkuatan geser.',
+                            'Rapatkan sengkang.',
+                            'Gunakan sengkang tertutup (seismic hooks).'
+                        ]
+                    },
+                    {
+                        'title': 'Cek rasio tulangan',
+                        'items': [
+                            'Rasio tulangan terpasang harus memenuhi rasio tulangan minimum dan maksimum.'
+                        ]
+                    },
+                    {
+                        'title': 'Pelaksanaan, retrofit, dan perawatan',
+                        'items': [
+                            'Shoring / temporary support (WAJIB) untuk mencegah collapse selama retrofit.',
+                            'Perbaikan retak (epoxy injection).',
+                            'Perkuatan lentur: CFRP (flexural strengthening) atau steel plate bonding.',
+                            'Perkuatan geser: wrap FRP U-jacket / full wrap.',
+                            'Jacketing beton.',
+                            'Tambah dimensi balok.',
+                            'Tambah tulangan baru.',
+                            'Coating anti-korosi.'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Tinggi': {
+                'indikasi': 'Aman tetapi margin keamanan kecil.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Tambah luas tulangan tarik.',
+                            'Perbaiki detailing sengkang di daerah kritis.',
+                            'Evaluasi redistribusi momen.',
+                            'Cek kontrol retak dan lendutan (serviceability).'
+                        ]
+                    },
+                    {
+                        'title': 'Perkuatan dan rehabilitasi',
+                        'items': [
+                            'Perkuatan lentur: CFRP (flexural strengthening) atau steel plate bonding.',
+                            'Perkuatan geser: wrap FRP U-jacket / full wrap.',
+                            'Perbaikan retak (epoxy injection).',
+                            'Coating anti-korosi.'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Sedang': {
+                'indikasi': 'Sesuai target keandalan.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Tidak perlu redesign besar.',
+                            'Optimasi minor: cek spasi tulangan geser.',
+                            'Optimasi minor: cek detailing tulangan angkur.',
+                            'Validasi terhadap kombinasi beban SNI 1727:2020.'
+                        ]
+                    },
+                    {
+                        'title': 'Perbaikan minor dan perawatan',
+                        'items': [
+                            'Grouting.',
+                            'Coating anti-korosi.',
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Rendah': {
+                'indikasi': 'Overdesign, kapasitas jauh lebih besar daripada beban.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Optimasi desain.',
+                            'Kurangi luas tulangan tarik.',
+                            'Kecilkan dimensi jika memungkinkan.'
+                        ]
+                    },
+                    {
+                        'title': 'Cek persyaratan desain',
+                        'items': [
+                            'Rasio tulangan terpasang harus memenuhi rasio tulangan minimum dan maksimum.',
+                            'Pastikan daktilitas tidak menurun.'
+                        ]
+                    },
+                    {
+                        'title': 'Perbaikan minor dan perawatan',
+                        'items': [
+                            'Grouting.',
+                            'Coating anti-korosi.',
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            }
+        },
+        'K': {
+            'Kritis': {
+                'indikasi': 'Risiko kegagalan aksial atau interaksi P-M.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Cek interaksi aksial-lentur.',
+                            'Tingkatkan confinement.',
+                            'Tambah rasio tulangan longitudinal (1% <= rho <= 8%).',
+                            'Perbesar dimensi kolom.',
+                            'Cek Strong Column Weak Beam (SCWB).'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Tinggi': {
+                'indikasi': 'Mendekati batas kapasitas.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Tambah confinement lokal pada zona sendi plastis.',
+                            'Tambah rasio tulangan longitudinal (1% <= rho <= 8%).',
+                            'Evaluasi efek P-Delta (second order).'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Sedang': {
+                'indikasi': 'Aman sesuai target.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Verifikasi detailing gempa.',
+                            'Cek panjang penyaluran dan penggunaan kait sengkang 135 derajat.'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            },
+            'Rendah': {
+                'indikasi': 'Overdesign, terlalu kuat dan kurang efisien.',
+                'sections': [
+                    {
+                        'title': 'Tindakan utama',
+                        'items': [
+                            'Optimasi desain.',
+                            'Kurangi luas tulangan tarik.',
+                            'Kecilkan dimensi jika memungkinkan.'
+                        ]
+                    },
+                    {
+                        'title': 'Cek persyaratan desain',
+                        'items': [
+                            'Rasio tulangan terpasang harus memenuhi rasio tulangan minimum dan maksimum.',
+                            'Memenuhi SCWB.',
+                            'Menjaga kekakuan struktur.'
+                        ]
+                    },
+                    {
+                        'title': 'Perawatan',
+                        'items': [
+                            'Monitoring dan perawatan berkala.'
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+
+def get_risk_recommendation_card_palette(level: str) -> Dict[str, str]:
+    """Palet warna kartu rekomendasi teknis per level risiko."""
+    palette_mapping = {
+        'Kritis': {
+            'accent': '#ff0000',
+            'background': '#fff1f2',
+            'surface': '#ffe4e6',
+            'text': '#7f1d1d'
+        },
+        'Tinggi': {
+            'accent': '#ca8a04',
+            'background': '#fefce8',
+            'surface': '#fef3c7',
+            'text': '#854d0e'
+        },
+        'Sedang': {
+            'accent': '#15803d',
+            'background': '#f0fdf4',
+            'surface': '#dcfce7',
+            'text': '#166534'
+        },
+        'Rendah': {
+            'accent': "#110BB0",      # biru utama
+            'background': '#EFF6FF',  # biru sangat muda (gantikan hijau)
+            'surface': '#DBEAFE',     # biru muda untuk box isi
+            'text': '#1E40AF'         # teks biru gelap
+        }
+    }
+    return palette_mapping.get(
+        str(level or '').strip().title(),
+        {
+            'accent': '#475569',
+            'background': '#f8fafc',
+            'surface': '#e2e8f0',
+            'text': '#1e293b'
+        }
+    )
+
+
+def build_risk_recommendation_level_counts(risk_df: pd.DataFrame,
+                                           level_column: str) -> Dict[str, Dict[str, int]]:
+    """Hitung jumlah elemen per level risiko untuk balok dan kolom."""
+    levels = ('Kritis', 'Tinggi', 'Sedang', 'Rendah')
+    counts = {
+        'B': {level: 0 for level in levels},
+        'K': {level: 0 for level in levels}
+    }
+    if risk_df is None or risk_df.empty or level_column not in risk_df.columns:
+        return counts
+
+    for _, row in risk_df.iterrows():
+        code = str(row.get('Kode', '') or '').strip().upper()
+        level = str(row.get(level_column, '') or '').strip().title()
+        if code in counts and level in counts[code]:
+            counts[code][level] += 1
+
+    return counts
+
+
+def build_risk_recommendation_element_lists(risk_df: pd.DataFrame,
+                                            level_column: str) -> Dict[str, Dict[str, List[int]]]:
+    """Kumpulkan nomor elemen per level risiko untuk balok dan kolom."""
+    levels = ('Kritis', 'Tinggi', 'Sedang', 'Rendah')
+    element_lists = {
+        'B': {level: [] for level in levels},
+        'K': {level: [] for level in levels}
+    }
+    if risk_df is None or risk_df.empty or level_column not in risk_df.columns:
+        return element_lists
+
+    for _, row in risk_df.iterrows():
+        code = str(row.get('Kode', '') or '').strip().upper()
+        level = str(row.get(level_column, '') or '').strip().title()
+        elem_id = row.get('Elemen (-)')
+        if code not in element_lists or level not in element_lists[code]:
+            continue
+        if pd.isna(elem_id) or str(elem_id).strip() in {'', '-', 'nan'}:
+            continue
+        try:
+            element_lists[code][level].append(int(float(elem_id)))
+        except (TypeError, ValueError):
+            continue
+
+    for code in element_lists:
+        for level in element_lists[code]:
+            element_lists[code][level] = sorted(set(element_lists[code][level]))
+    return element_lists
+
+
+def build_risk_recommendation_cards_html(element_code: str,
+                                         level_counts: Dict[str, int],
+                                         element_lists: Optional[Dict[str, List[int]]] = None,
+                                         zoom_scale: float = 1.0,
+                                         section_key: str = "risk-rec") -> str:
+    """Bangun HTML kartu rekomendasi teknis yang responsif dan mudah dibaca."""
+    recommendations = get_risk_recommendation_catalog().get(str(element_code).strip().upper(), {})
+    element_label = get_element_type_label(str(element_code).strip().upper())
+    levels = ('Kritis', 'Tinggi', 'Sedang', 'Rendah')
+    dom_key = sanitize_dom_id(f"{section_key}-{element_code}-{int(zoom_scale * 100)}")
+
+    cards_markup = []
+    for level in levels:
+        recommendation = recommendations.get(level)
+        if not recommendation:
+            continue
+
+        palette = get_risk_recommendation_card_palette(level)
+        active_count = int((level_counts or {}).get(level, 0) or 0)
+        active_elements = list((element_lists or {}).get(level, []) or [])
+        element_list_text = (
+            ", ".join(f"E{int(elem_id)}" for elem_id in active_elements)
+            if active_elements else
+            f"Belum muncul pada elemen {element_label.lower()} model aktif"
+        )
+        count_text = (
+            f"{active_count} elemen {element_label.lower()} pada model aktif"
+            if active_count > 0 else
+            f"Belum muncul pada elemen {element_label.lower()} model aktif"
+        )
+
+        section_blocks = []
+        for section in recommendation.get('sections', []):
+            section_title = str(section.get('title', '-') or '-')
+            items_markup = ''.join(
+                f"<li>{html.escape(str(item))}</li>"
+                for item in section.get('items', [])
+            )
+            section_blocks.append(
+                (
+                    f'<div class="{dom_key}-section-block">'
+                    f'<div class="{dom_key}-section-title">'
+                    f'{html.escape(section_title)}'
+                    f'</div>'
+                    f'<ul>{items_markup}</ul>'
+                    f'</div>'
+                )
+            )
+
+        cards_markup.append(
+            (
+                f'<article class="{dom_key}-card" '
+                f'style="'
+                f'--card-accent: {palette["accent"]}; '
+                f'--card-background: {palette["background"]}; '
+                f'--card-surface: {palette["surface"]}; '
+                f'--card-text: {palette["text"]};'
+                f'">'
+                f'<div class="{dom_key}-card-header">'
+                f'<div class="{dom_key}-level-badge">{html.escape(level.upper())}</div>'
+                f'<div class="{dom_key}-count-badge">{html.escape(count_text)}</div>'
+                f'</div>'
+                f'<div class="{dom_key}-indicator">'
+                f'<strong>Indikasi:</strong> {html.escape(str(recommendation.get("indikasi", "-")))}'
+                f'</div>'
+                f'<div class="{dom_key}-element-strip">'
+                f'<span class="{dom_key}-element-strip-label">Nomor elemen:</span> '
+                f'<span class="{dom_key}-element-strip-values">{html.escape(element_list_text)}</span>'
+                f'</div>'
+                f'{"".join(section_blocks)}'
+                f'</article>'
+            )
+        )
+
+    base_font_size = 0.96 * float(zoom_scale)
+    indicator_font_size = 0.98 * float(zoom_scale)
+    badge_font_size = 0.86 * float(zoom_scale)
+    section_title_size = 0.92 * float(zoom_scale)
+
+    style_markup = textwrap.dedent(
+        f"""
+        <style>
+          .{dom_key}-wrapper {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1rem;
+            margin-top: 0.25rem;
+          }}
+          .{dom_key}-card {{
+            border: 1px solid var(--card-accent);
+            background: linear-gradient(180deg, var(--card-background) 0%, #ffffff 100%);
+            border-radius: 1rem;
+            padding: 1rem 1rem 1.05rem 1rem;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
+            color: #111827;
+            font-size: {base_font_size:.3f}rem;
+            line-height: 1.58;
+          }}
+          .{dom_key}-card-header {{
+            display: flex;
+            justify-content: space-between;
+            gap: 0.75rem;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            margin-bottom: 0.85rem;
+          }}
+          .{dom_key}-level-badge {{
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            background: var(--card-accent);
+            color: #ffffff;
+            padding: 0.28rem 0.75rem;
+            font-size: {badge_font_size:.3f}rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+          }}
+          .{dom_key}-count-badge {{
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            background: var(--card-surface);
+            color: var(--card-text);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            padding: 0.28rem 0.7rem;
+            font-size: {badge_font_size:.3f}rem;
+            font-weight: 700;
+          }}
+          .{dom_key}-indicator {{
+            background: var(--card-surface);
+            border-left: 5px solid var(--card-accent);
+            border-radius: 0.8rem;
+            padding: 0.75rem 0.85rem;
+            margin-bottom: 0.9rem;
+            color: var(--card-text);
+            font-size: {indicator_font_size:.3f}rem;
+          }}
+          .{dom_key}-element-strip {{
+            margin-bottom: 0.9rem;
+            padding: 0.65rem 0.85rem;
+            border-radius: 0.8rem;
+            border: 1px dashed rgba(15, 23, 42, 0.14);
+            background: rgba(255, 255, 255, 0.68);
+            color: #0f172a;
+            font-size: {indicator_font_size:.3f}rem;
+            line-height: 1.5;
+          }}
+          .{dom_key}-element-strip-label {{
+            font-weight: 800;
+            color: var(--card-text);
+          }}
+          .{dom_key}-element-strip-values {{
+            font-family: "Consolas", "Courier New", monospace;
+            word-break: break-word;
+          }}
+          .{dom_key}-section-block + .{dom_key}-section-block {{
+            margin-top: 0.8rem;
+          }}
+          .{dom_key}-section-title {{
+            font-size: {section_title_size:.3f}rem;
+            font-weight: 800;
+            color: #0f172a;
+            margin-bottom: 0.35rem;
+          }}
+          .{dom_key}-section-block ul {{
+            margin: 0;
+            padding-left: 1.15rem;
+          }}
+          .{dom_key}-section-block li {{
+            margin: 0.18rem 0;
+          }}
+          @media (max-width: 760px) {{
+            .{dom_key}-wrapper {{
+              grid-template-columns: 1fr;
+            }}
+          }}
+        </style>
+        """
+    ).strip()
+    wrapper_markup = f'<div class="{dom_key}-wrapper">{"".join(cards_markup)}</div>'
+    return "\n".join([style_markup, wrapper_markup])
+
+
+def render_risk_map_technical_recommendations(risk_df: pd.DataFrame,
+                                              level_column: str,
+                                              heading_level: str = "####",
+                                              section_key: str = "risk-recommendation") -> None:
+    """Tampilkan daftar rekomendasi teknis berbasis level risiko pada tab Risk Map."""
+    if risk_df is None or risk_df.empty or level_column not in risk_df.columns:
+        return
+
+    level_counts = build_risk_recommendation_level_counts(risk_df, level_column)
+    element_lists = build_risk_recommendation_element_lists(risk_df, level_column)
+    zoom_percent = st.slider(
+        "Zoom daftar rekomendasi teknis (%)",
+        min_value=90,
+        max_value=180,
+        value=110,
+        step=5,
+        key=f"{section_key}-zoom"
+    )
+    zoom_scale = float(zoom_percent) / 100.0
+
+    st.markdown(f"{heading_level} Daftar Rekomendasi Teknis berdasarkan Level Risiko")
+    st.caption(
+        "Daftar ini adalah panduan teknis praktis berdasarkan jenis elemen dan level risiko "
+        "pada model aktif. Konten ini tidak mengubah hasil perhitungan struktur maupun reliability."
+    )
+    st.caption(
+        "Gunakan slider `zoom` untuk memperbesar atau memperkecil ukuran teks rekomendasi "
+        "agar nyaman dibaca pada desktop maupun HP."
+    )
+
+    beam_count = int((risk_df['Kode'].astype(str).str.upper() == 'B').sum()) if 'Kode' in risk_df.columns else 0
+    column_count = int((risk_df['Kode'].astype(str).str.upper() == 'K').sum()) if 'Kode' in risk_df.columns else 0
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Zoom Teks", f"{int(zoom_percent)}%")
+    metric_cols[1].metric("Balok Terpetakan", str(beam_count))
+    metric_cols[2].metric("Kolom Terpetakan", str(column_count))
+    metric_cols[3].metric(
+        "Level Acuan",
+        ", ".join(
+            level for level in ('Kritis', 'Tinggi', 'Sedang', 'Rendah')
+            if level in set(risk_df[level_column].astype(str).str.title())
+        ) or "-"
+    )
+
+    beam_tab, column_tab = st.tabs(["Balok", "Kolom"])
+    with beam_tab:
+        st.caption(
+            "Rekomendasi balok difokuskan pada kontrol lentur, geser, detailing, "
+            "retrofit, dan perawatan."
+        )
+        st.markdown(
+            build_risk_recommendation_cards_html(
+                element_code='B',
+                level_counts=level_counts.get('B', {}),
+                element_lists=element_lists.get('B', {}),
+                zoom_scale=zoom_scale,
+                section_key=f"{section_key}-beam"
+            ),
+            unsafe_allow_html=True
+        )
+
+    with column_tab:
+        st.caption(
+            "Rekomendasi kolom difokuskan pada interaksi aksial-lentur, confinement, "
+            "SCWB, stabilitas, dan perawatan."
+        )
+        st.markdown(
+            build_risk_recommendation_cards_html(
+                element_code='K',
+                level_counts=level_counts.get('K', {}),
+                element_lists=element_lists.get('K', {}),
+                zoom_scale=zoom_scale,
+                section_key=f"{section_key}-column"
+            ),
+            unsafe_allow_html=True
+        )
 
 
 def render_risk_map_output_section(results_bundle: Dict,
@@ -2953,6 +3555,12 @@ def render_risk_map_output_section(results_bundle: Dict,
         render_input_table(
             risk_df,
             styler=style_probabilistic_risk_map_df(risk_df)
+        )
+        render_risk_map_technical_recommendations(
+            risk_df,
+            level_column='Level Risiko',
+            heading_level=heading_level,
+            section_key="probabilistic-risk-recommendation"
         )
         return
 
@@ -3055,9 +3663,26 @@ def render_risk_map_output_section(results_bundle: Dict,
         "Kolom `Daftar Variabel Sensitivitas Elemen (-)` menuliskan nama variabel yang "
         "terkait dengan elemen itu, diurutkan dari `|Delta g|max` terbesar ke terkecil."
     )
+    st.caption(
+        "Kolom `g(x) Awal` adalah nilai fungsi kinerja elemen pada kondisi baseline "
+        "sebelum perturbasi sensitivitas. Nilai positif berarti margin keamanan masih ada, "
+        "sedangkan nilai negatif berarti margin keamanan sudah terlampaui."
+    )
+    st.caption(
+        "Kolom `Delta g Variabel Dominan` menunjukkan perubahan `g(x)` bertanda dari "
+        "variabel yang paling dominan pada elemen tersebut. Nilai positif berarti margin "
+        "keamanan membesar, sedangkan nilai negatif berarti margin keamanan mengecil."
+    )
+    deterministic_risk_table_df = risk_df.drop(columns=['Elemen (-)'], errors='ignore')
     render_input_table(
+        deterministic_risk_table_df,
+        styler=style_deterministic_risk_priority_df(deterministic_risk_table_df)
+    )
+    render_risk_map_technical_recommendations(
         risk_df,
-        styler=style_deterministic_risk_priority_df(risk_df)
+        level_column='Level Prioritas',
+        heading_level=heading_level,
+        section_key="deterministic-risk-recommendation"
     )
 
 
@@ -3383,6 +4008,113 @@ def plot_histogram_summary_on_axis(axis,
     return True
 
 
+def plot_histogram_theoretical_pdf_on_axis(axis,
+                                           hist_summary: Dict[str, Any],
+                                           color: str,
+                                           label: str,
+                                           distribution: str = 'normal',
+                                           linestyle: str = '-',
+                                           linewidth: float = 1.8,
+                                           alpha: float = 0.95) -> bool:
+    """Overlay PDF teoritis/aproksimasi berdasarkan mean dan simpangan baku respons."""
+    hist_edges = np.asarray((hist_summary or {}).get('hist_bin_edges', []), dtype=float)
+    if hist_edges.size < 2:
+        return False
+
+    pdf_x = np.linspace(hist_edges[0], hist_edges[-1], 320)
+    pdf_y = build_probability_density_curve(
+        distribution,
+        (hist_summary or {}).get('sample_mean'),
+        (hist_summary or {}).get('sample_std'),
+        pdf_x
+    )
+    if pdf_y is None or not np.all(np.isfinite(pdf_y)):
+        return False
+
+    axis.plot(
+        pdf_x,
+        pdf_y,
+        color=color,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        alpha=alpha,
+        label=label
+    )
+    return True
+
+
+def build_histogram_frequency_summary(hist_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Ubah histogram kerapatan menjadi histogram frekuensi per bin."""
+    hist_edges = np.asarray((hist_summary or {}).get('hist_bin_edges', []), dtype=float)
+    hist_density = np.asarray((hist_summary or {}).get('hist_values', []), dtype=float)
+    sample_count = int((hist_summary or {}).get('sample_count', 0) or 0)
+    if hist_edges.size < 2 or hist_density.size == 0 or sample_count <= 0:
+        return {}
+
+    bin_widths = np.diff(hist_edges)
+    if bin_widths.size == 0 or not np.all(np.isfinite(bin_widths)):
+        return {}
+
+    raw_counts = np.clip(hist_density * bin_widths * float(sample_count), 0.0, None)
+    count_values = np.rint(raw_counts).astype(int)
+    count_difference = int(sample_count - np.sum(count_values))
+
+    if count_difference != 0 and count_values.size > 0:
+        residuals = raw_counts - count_values.astype(float)
+        if count_difference > 0:
+            candidate_indices = np.argsort(-residuals)
+            for idx in candidate_indices[:count_difference]:
+                count_values[int(idx)] += 1
+        else:
+            candidate_indices = np.argsort(residuals)
+            remaining = abs(count_difference)
+            for idx in candidate_indices:
+                idx = int(idx)
+                if remaining <= 0:
+                    break
+                if count_values[idx] <= 0:
+                    continue
+                count_values[idx] -= 1
+                remaining -= 1
+
+    return {
+        'hist_bin_edges': hist_edges.astype(float).tolist(),
+        'hist_values': count_values.astype(int).tolist(),
+        'sample_count': sample_count
+    }
+
+
+def plot_histogram_frequency_on_axis(axis,
+                                     hist_summary: Dict[str, Any],
+                                     color: str,
+                                     label: str,
+                                     alpha_fill: float = 0.24) -> bool:
+    """Plot histogram frekuensi absolut ke axis matplotlib."""
+    frequency_summary = build_histogram_frequency_summary(hist_summary)
+    hist_edges = np.asarray(frequency_summary.get('hist_bin_edges', []), dtype=float)
+    hist_values = np.asarray(frequency_summary.get('hist_values', []), dtype=float)
+    if hist_edges.size < 2 or hist_values.size == 0:
+        return False
+
+    axis.stairs(
+        hist_values,
+        hist_edges,
+        fill=True,
+        alpha=alpha_fill,
+        color=color,
+        linewidth=1.0,
+        label=label
+    )
+    axis.stairs(
+        hist_values,
+        hist_edges,
+        fill=False,
+        color=color,
+        linewidth=1.6
+    )
+    return True
+
+
 def build_probabilistic_limit_state_histogram_figure(
     histogram_data: Dict[str, Dict[str, Any]],
     elem_id: int
@@ -3442,6 +4174,24 @@ def build_probabilistic_limit_state_histogram_figure(
             color='#2563eb',
             label='Q'
         )
+        rq_plotted |= plot_histogram_theoretical_pdf_on_axis(
+            left_axis,
+            r_summary,
+            color='#991b1b',
+            label='PDF normal R',
+            distribution='normal',
+            linestyle='--',
+            linewidth=1.6
+        )
+        rq_plotted |= plot_histogram_theoretical_pdf_on_axis(
+            left_axis,
+            q_summary,
+            color='#1d4ed8',
+            label='PDF normal Q',
+            distribution='normal',
+            linestyle='-.',
+            linewidth=1.6
+        )
         r_mean = coerce_finite_float(r_summary.get('sample_mean'))
         q_mean = coerce_finite_float(q_summary.get('sample_mean'))
         if r_mean is not None:
@@ -3473,6 +4223,15 @@ def build_probabilistic_limit_state_histogram_figure(
             color=spec['color'],
             label='g(x)',
             alpha_fill=0.24
+        )
+        g_plotted |= plot_histogram_theoretical_pdf_on_axis(
+            right_axis,
+            g_summary,
+            color='#111827',
+            label='PDF normal g(x)',
+            distribution='normal',
+            linestyle='-',
+            linewidth=1.8
         )
         right_axis.axvline(
             0.0,
@@ -3533,6 +4292,111 @@ def build_probabilistic_limit_state_histogram_figure(
         y=0.995
     )
     fig.tight_layout(rect=[0, 0, 1, 0.985])
+    return fig
+
+
+def build_probabilistic_limit_state_g_frequency_figure(
+    histogram_data: Dict[str, Dict[str, Any]],
+    elem_id: int
+) -> Optional[plt.Figure]:
+    """Bangun figure histogram g(x) terhadap frekuensi untuk seluruh limit-state."""
+    state_specs = get_probabilistic_limit_state_histogram_specs()
+    fig, axes = plt.subplots(2, 2, figsize=(15.2, 10.8), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    plotted_any = False
+
+    for axis, spec in zip(axes_list, state_specs):
+        record = histogram_data.get(
+            build_limit_state_histogram_record_name(spec['key'], int(elem_id))
+        )
+        if not record:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                (
+                    f"Data {spec['label']} untuk E{int(elem_id)}\n"
+                    "tidak tersedia atau tidak berlaku."
+                ),
+                ha='center',
+                va='center',
+                fontsize=10,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#f8fafc',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            axis.set_title(f"{spec['label']} | Histogram g(x) vs Frekuensi", fontsize=10.5, pad=10)
+            continue
+
+        g_summary = record.get('g', {}) or {}
+        unit_label = record.get('unit', spec['unit'])
+        g_plotted = plot_histogram_frequency_on_axis(
+            axis,
+            g_summary,
+            color=spec['color'],
+            label='Frekuensi g(x)',
+            alpha_fill=0.26
+        )
+        axis.axvline(
+            0.0,
+            color='#111827',
+            linestyle='--',
+            linewidth=1.1,
+            alpha=0.9,
+            label='g = 0'
+        )
+        g_mean = coerce_finite_float(g_summary.get('sample_mean'))
+        if g_mean is not None:
+            axis.axvline(
+                g_mean,
+                color=spec['color'],
+                linestyle=':',
+                linewidth=1.2,
+                alpha=0.95,
+                label='Mean g(x)'
+            )
+
+        axis.set_title(f"{spec['label']} | Histogram g(x) vs Frekuensi", fontsize=10.5, pad=10)
+        axis.set_xlabel(f"g(x) ({unit_label})")
+        axis.set_ylabel('Frekuensi')
+        axis.grid(True, alpha=0.22, linestyle='--')
+        if g_plotted:
+            axis.legend(loc='best', fontsize=8)
+
+        axis.text(
+            0.98,
+            0.96,
+            (
+                f"N valid = {int(record.get('sample_count', 0))}\n"
+                f"Gagal = {int(record.get('failure_count', 0))}\n"
+                f"Pf = {float(record.get('Pf_from_g', 0.0)):.4f}"
+            ),
+            transform=axis.transAxes,
+            ha='right',
+            va='top',
+            fontsize=8.5,
+            bbox=dict(
+                boxstyle='round,pad=0.25',
+                facecolor='white',
+                alpha=0.88,
+                edgecolor='#cbd5e1'
+            )
+        )
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Histogram g(x) terhadap Frekuensi per Elemen | E{int(elem_id)}",
+        fontsize=13,
+        y=0.99
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
 
 
@@ -3642,6 +4506,10 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
         "`R` dan `Q` dalam satu grafik, sedangkan panel kanan memperlihatkan histogram `g(x)`."
     )
     st.caption(
+        "Setiap panel juga dilengkapi kurva `PDF` teoritis aproksimasi normal yang "
+        "dibentuk dari `mean` dan `simpangan baku` respons Monte Carlo pada elemen terpilih."
+    )
+    st.caption(
         "Nilai `R`, `Q`, dan `g(x)` diambil langsung dari hasil setiap simulasi Monte Carlo "
         "yang sudah dihitung sebelumnya, sehingga tampilan ini tidak mengubah hasil perhitungan."
     )
@@ -3669,6 +4537,25 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
         )
     else:
         st.info("Histogram respons limit state untuk elemen yang dipilih belum dapat dibentuk.")
+
+    st.caption(
+        "Grafik berikut menampilkan hubungan `g(x)` dengan `frekuensi` absolut "
+        "(jumlah sampel per bin), sehingga lebih mudah melihat sebaran jumlah kejadian."
+    )
+    limit_state_frequency_fig = build_probabilistic_limit_state_g_frequency_figure(
+        limit_state_histogram_data,
+        elem_id=int(selected_element_id)
+    )
+    if limit_state_frequency_fig is not None:
+        render_plot(
+            limit_state_frequency_fig,
+            interactive=True,
+            viewer_key=f"probabilistic-histogram-limit-state-frequency-e{int(selected_element_id)}",
+            alt_text=f"Histogram g(x) terhadap frekuensi elemen {int(selected_element_id)}",
+            viewer_height=780
+        )
+    else:
+        st.info("Histogram frekuensi g(x) untuk elemen yang dipilih belum dapat dibentuk.")
 
     limit_state_histogram_summary_df = build_probabilistic_limit_state_histogram_summary_df(
         limit_state_histogram_data,
@@ -6740,28 +7627,28 @@ analysis_input_data = (
 )
 
 dashboard_tabs = [
-    "Input",
+    "Input Data",
     "Output Analisis Struktur",
+    "Plot Simulasi Terakhir",
     "Output Reliability",
+    "Kurva Interasi P-M",
+    "Output Sensitivitas Deterministik",
     "Output Sensitivitas Probabilistik",
     "Histogram",
     "Simulasi MC",
-    "Output Sensitivitas Deterministik",
     "Risk Map",
-    "Plot Simulasi Terakhir",
-    "Kurva Interasi P-M",
     "Laporan"
 ]
 active_dashboard_tab = st.radio(
     "Navigasi Dashboard",
     options=dashboard_tabs,
     index=0,
-    horizontal=True,
+    horizontal=False,
     key="active_dashboard_tab",
     label_visibility="collapsed"
 )
 
-if active_dashboard_tab == "Input":
+if active_dashboard_tab == "Input Data":
     input_plot_nodes = preview_portal_nodes if preview_portal_nodes is not None else portal_nodes
     input_plot_elements = preview_portal_elements if preview_portal_elements is not None else portal_elements
 
@@ -6773,48 +7660,7 @@ if active_dashboard_tab == "Input":
 
     preview_distributed_loads = build_preview_distributed_loads(input_data, selected_is_probabilistic)
 
-    if results_bundle and not input_preview_differs_from_results:
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            sample_title = (
-                "#### Input Acak Simulasi Terakhir"
-                if is_probabilistic else
-                "#### Input Acuan Deterministik"
-            )
-            st.markdown(sample_title)
-            latest_sample_df = build_latest_sample_df(latest_simulation)
-            if latest_sample_df.empty:
-                st.info("Tidak ada sampel acak yang perlu ditampilkan.")
-            else:
-                render_input_table(latest_sample_df)
-
-        with col_right:
-            if is_probabilistic:
-                st.markdown("#### Definisi Variabel Random")
-                render_input_table(build_random_variable_df(results_bundle['random_variables']))
-            else:
-                st.markdown("#### Keterangan Mode")
-                st.info(
-                    "Mode deterministik tidak melakukan sampling Monte Carlo. "
-                    "Analisis dijalankan satu kali dengan nilai deterministic tiap elemen."
-                )
-
-        if is_probabilistic:
-            effective_modulus_df = build_effective_modulus_snapshot_df(
-                input_data,
-                latest_simulation,
-                is_probabilistic
-            )
-            if not effective_modulus_df.empty:
-                st.markdown("#### Snapshot E Dipakai DSM")
-                st.caption(
-                    "`E_dipakai_DSM (MPa)` adalah nilai yang benar-benar dipakai solver DSM "
-                    "untuk simulasi yang sedang ditampilkan. "
-                    "`E_acuan_mean (MPa)` hanya nilai acuan hasil `E_mean x fb_mean`."
-                )
-                render_input_table(effective_modulus_df)
-    else:
+    if not (results_bundle and not input_preview_differs_from_results):
         mode_caption = "mean" if selected_is_probabilistic else "deterministic"
         st.caption(
             "Preview gambar input ditampilkan sebelum analisis. "
@@ -6831,6 +7677,52 @@ if active_dashboard_tab == "Input":
         title="Preview Input Struktur"
     )
     render_plot(geometry_fig)
+
+    if results_bundle and not input_preview_differs_from_results:
+        sample_expander_title = (
+            "Input Acak Simulasi Terakhir"
+            if is_probabilistic else
+            "Input Acuan Deterministik"
+        )
+        with st.expander(sample_expander_title, expanded=True):
+            latest_sample_df = build_latest_sample_df(latest_simulation)
+            if is_probabilistic:
+                if latest_sample_df.empty:
+                    st.info("Tidak ada sampel acak yang perlu ditampilkan.")
+                else:
+                    render_input_table(latest_sample_df)
+            else:
+                sample_col, mode_col = st.columns([1.1, 1.9])
+                with sample_col:
+                    if latest_sample_df.empty:
+                        st.info("Tidak ada sampel acuan yang perlu ditampilkan.")
+                    else:
+                        render_input_table(latest_sample_df)
+                with mode_col:
+                    st.markdown("#### Keterangan Mode")
+                    st.info(
+                        "Mode deterministik tidak melakukan sampling Monte Carlo. "
+                        "Analisis dijalankan satu kali dengan nilai deterministic tiap elemen."
+                    )
+
+        if is_probabilistic:
+            with st.expander("Definisi Variabel Random", expanded=False):
+                render_input_table(build_random_variable_df(results_bundle['random_variables']))
+
+        if is_probabilistic:
+            effective_modulus_df = build_effective_modulus_snapshot_df(
+                input_data,
+                latest_simulation,
+                is_probabilistic
+            )
+            if not effective_modulus_df.empty:
+                with st.expander("Snapshot E Dipakai DSM", expanded=False):
+                    st.caption(
+                        "`E_dipakai_DSM (MPa)` adalah nilai yang benar-benar dipakai solver DSM "
+                        "untuk simulasi yang sedang ditampilkan. "
+                        "`E_acuan_mean (MPa)` hanya nilai acuan hasil `E_mean x fb_mean`."
+                    )
+                    render_input_table(effective_modulus_df)
 
     with st.expander("Geometri Portal", expanded=True):
         geom_col_1, geom_col_2 = st.columns(2)
