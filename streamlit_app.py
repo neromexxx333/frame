@@ -2830,7 +2830,7 @@ def style_probabilistic_risk_map_df(df: pd.DataFrame):
         df,
         level_column='Level Risiko',
         grouped_columns={
-            'identity': ['Nomor Elemen', 'Elemen (-)', 'Kode'],
+            'identity': ['Nomor Elemen', 'Kode'],
             'summary': ['Limit State Kontrol'],
             'overall': [
                 'Pf Elemen (-)',
@@ -3552,9 +3552,10 @@ def render_risk_map_output_section(results_bundle: Dict,
         )
 
         st.markdown(f"{heading_level} Tabel Risk Map Probabilistik")
+        probabilistic_risk_table_df = risk_df.drop(columns=['Elemen (-)'], errors='ignore')
         render_input_table(
-            risk_df,
-            styler=style_probabilistic_risk_map_df(risk_df)
+            probabilistic_risk_table_df,
+            styler=style_probabilistic_risk_map_df(probabilistic_risk_table_df)
         )
         render_risk_map_technical_recommendations(
             risk_df,
