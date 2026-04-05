@@ -3231,16 +3231,10 @@ def build_risk_recommendation_cards_html(element_code: str,
             continue
 
         palette = get_risk_recommendation_card_palette(level)
-        active_count = int((level_counts or {}).get(level, 0) or 0)
         active_elements = list((element_lists or {}).get(level, []) or [])
         element_list_text = (
             ", ".join(f"E{int(elem_id)}" for elem_id in active_elements)
             if active_elements else
-            f"Belum muncul pada elemen {element_label.lower()} model aktif"
-        )
-        count_text = (
-            f"{active_count} elemen {element_label.lower()} pada model aktif"
-            if active_count > 0 else
             f"Belum muncul pada elemen {element_label.lower()} model aktif"
         )
 
@@ -3273,7 +3267,6 @@ def build_risk_recommendation_cards_html(element_code: str,
                 f'">'
                 f'<div class="{dom_key}-card-header">'
                 f'<div class="{dom_key}-level-badge">{html.escape(level.upper())}</div>'
-                f'<div class="{dom_key}-count-badge">{html.escape(count_text)}</div>'
                 f'</div>'
                 f'<div class="{dom_key}-indicator">'
                 f'<strong>Indikasi:</strong> {html.escape(str(recommendation.get("indikasi", "-")))}'
@@ -3313,7 +3306,7 @@ def build_risk_recommendation_cards_html(element_code: str,
           }}
           .{dom_key}-card-header {{
             display: flex;
-            justify-content: space-between;
+            justify-content: flex-start;
             gap: 0.75rem;
             align-items: flex-start;
             flex-wrap: wrap;
@@ -3329,17 +3322,6 @@ def build_risk_recommendation_cards_html(element_code: str,
             font-size: {badge_font_size:.3f}rem;
             font-weight: 800;
             letter-spacing: 0.04em;
-          }}
-          .{dom_key}-count-badge {{
-            display: inline-flex;
-            align-items: center;
-            border-radius: 999px;
-            background: var(--card-surface);
-            color: var(--card-text);
-            border: 1px solid rgba(15, 23, 42, 0.08);
-            padding: 0.28rem 0.7rem;
-            font-size: {badge_font_size:.3f}rem;
-            font-weight: 700;
           }}
           .{dom_key}-indicator {{
             background: var(--card-surface);
