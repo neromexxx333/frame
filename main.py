@@ -56,6 +56,8 @@ class PortalReliabilityAnalysis:
         self._element_design_code_cache = {}
         self._limit_state_applicability_cache = None
         self._node_coordinate_cache = None
+        self._probabilistic_mc_convergence_cache = None
+        self._probabilistic_limit_state_histogram_cache = None
         
         print(
             f"Initializing {self.get_analysis_mode_label()} analysis "
@@ -245,6 +247,20 @@ class PortalReliabilityAnalysis:
             unit
         )
         return f"mu={mean_text}, sigma={std_text}"
+
+    @staticmethod
+    def _get_by_element_dict_value(source: Optional[Dict],
+                                   elem_id: int,
+                                   default=None):
+        """Ambil nilai dict dengan key elemen int/string."""
+        if not isinstance(source, dict):
+            return default
+        if elem_id in source:
+            return source[elem_id]
+        elem_id_str = str(int(elem_id))
+        if elem_id_str in source:
+            return source[elem_id_str]
+        return default
 
     def _get_random_variable_definitions(self) -> Dict[str, Dict[str, float]]:
         """Bangun definisi variabel random per elemen dari data input."""
@@ -1462,6 +1478,8 @@ class PortalReliabilityAnalysis:
         self._section_capacity_inputs_cache = {}
         self._element_design_code_cache = {}
         self._limit_state_applicability_cache = None
+        self._probabilistic_mc_convergence_cache = None
+        self._probabilistic_limit_state_histogram_cache = None
         
         print(f"  [OK] Geometry loaded: {len(self.data['geometry']['nodes'])} nodes")
         print(f"  [OK] Elements loaded: {len(self.data['geometry']['elements'])} elements")
@@ -1620,6 +1638,10 @@ class PortalReliabilityAnalysis:
                 )
             },
             'probabilistic_histogram_data': self._build_probabilistic_histogram_data(),
+            'probabilistic_limit_state_histogram_data': (
+                self._build_probabilistic_limit_state_histogram_data()
+            ),
+            'probabilistic_mc_convergence_data': self._build_probabilistic_mc_convergence_data(),
             'sensitivity_results': self.sensitivity_results,
             'latest_simulation': latest_simulation,
             'report': self.output_data.get('report', '')
@@ -1683,6 +1705,523 @@ class PortalReliabilityAnalysis:
             }
 
         return histogram_data
+
+    @staticmethod
+    def _build_numeric_histogram_summary(values: np.ndarray,
+                                         max_bins: int = 28,
+                                         density: bool = True,
+                                         value_range: Optional[tuple[float, float]] = None,
+                                         num_bins: Optional[int] = None) -> Dict[str, Any]:
+        """Ringkas histogram numerik menjadi statistik dan bin histogram."""
+        data = np.asarray(values, dtype=float)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return {}
+
+        data_min = float(np.min(data))
+        data_max = float(np.max(data))
+        hist_min = data_min
+        hist_max = data_max
+        if value_range is not None:
+            hist_min = float(value_range[0])
+            hist_max = float(value_range[1])
+
+        if np.isclose(hist_min, hist_max, atol=1e-12, rtol=1e-9):
+            span = max(abs(hist_min) * 0.05, 1e-6)
+            hist_min -= span
+            hist_max += span
+            bins = 1
+        else:
+            bins = (
+                int(num_bins)
+                if num_bins is not None else
+                int(np.clip(np.sqrt(data.size), 12, max_bins))
+            )
+
+        hist_values, hist_edges = np.histogram(
+            data,
+            bins=bins,
+            range=(hist_min, hist_max),
+            density=density
+        )
+        return {
+            'sample_count': int(data.size),
+            'sample_mean': float(np.mean(data)),
+            'sample_std': float(np.std(data)),
+            'sample_min': data_min,
+            'sample_max': data_max,
+            'hist_values': hist_values.astype(float).tolist(),
+            'hist_bin_edges': hist_edges.astype(float).tolist()
+        }
+
+    def _extract_limit_state_histogram_response(self,
+                                                analysis_result: Optional[Dict],
+                                                elem_id: int,
+                                                limit_state: str) -> Optional[Dict[str, float]]:
+        """Ambil pasangan R, Q, dan g per elemen dari hasil simulasi yang sudah dihitung."""
+        if not analysis_result:
+            return None
+
+        max_forces_values = analysis_result.get('max_forces', {}) or {}
+        max_forces_entry = self._get_by_element_dict_value(max_forces_values, elem_id, {}) or {}
+
+        if limit_state == 'moment':
+            performance_values = analysis_result.get('performance', {}) or {}
+            metadata_values = analysis_result.get('performance_metadata', {}) or {}
+            demand = max_forces_entry.get('max_moment')
+            demand = abs(float(demand)) if demand is not None else None
+            g_value = self._get_by_element_dict_value(performance_values, elem_id)
+            meta = self._get_by_element_dict_value(metadata_values, elem_id, {}) or {}
+            capacity = meta.get('phi_Mn')
+        elif limit_state == 'shear':
+            performance_values = analysis_result.get('performance_shear', {}) or {}
+            metadata_values = analysis_result.get('performance_shear_metadata', {}) or {}
+            demand = max_forces_entry.get('max_shear')
+            demand = abs(float(demand)) if demand is not None else None
+            g_value = self._get_by_element_dict_value(performance_values, elem_id)
+            meta = self._get_by_element_dict_value(metadata_values, elem_id, {}) or {}
+            capacity = meta.get('phi_Vn')
+        elif limit_state == 'axial':
+            performance_values = analysis_result.get('performance_axial', {}) or {}
+            metadata_values = analysis_result.get('performance_axial_metadata', {}) or {}
+            g_value = self._get_by_element_dict_value(performance_values, elem_id)
+            meta = self._get_by_element_dict_value(metadata_values, elem_id, {}) or {}
+            force_data = max_forces_entry.get('forces', {}) or {}
+            demands = self._get_axial_demand_components(force_data)
+            controlling_state = str(meta.get('controlling_state', '') or '').strip().lower()
+            phi_pn = meta.get('phi_Pn')
+
+            if controlling_state == 'absolute-axial':
+                demand = meta.get('demand_axial_abs')
+                if demand is None:
+                    demand = max(
+                        float(demands['compression']),
+                        float(demands['tension'])
+                    )
+                capacity = (
+                    meta.get('phi_Pn_tekan')
+                    if meta.get('phi_Pn_tekan') is not None else
+                    phi_pn
+                )
+            elif controlling_state == 'tension':
+                demand = float(demands['tension'])
+                capacity = max(-float(phi_pn), 0.0) if phi_pn is not None else None
+            else:
+                demand = float(demands['compression'])
+                capacity = phi_pn
+        elif limit_state == 'axial_moment':
+            performance_values = analysis_result.get('performance_axial_moment', {}) or {}
+            metadata_values = analysis_result.get('performance_axial_moment_metadata', {}) or {}
+            g_value = self._get_by_element_dict_value(performance_values, elem_id)
+            meta = self._get_by_element_dict_value(metadata_values, elem_id, {}) or {}
+            capacity = meta.get('lambda')
+            demand = 1.0 if capacity is not None or g_value is not None else None
+        else:
+            return None
+
+        try:
+            g_numeric = float(g_value)
+            demand_numeric = float(demand)
+        except (TypeError, ValueError):
+            return None
+
+        if capacity is None and np.isfinite(g_numeric) and np.isfinite(demand_numeric):
+            capacity = g_numeric + demand_numeric
+
+        try:
+            capacity_numeric = float(capacity)
+        except (TypeError, ValueError):
+            return None
+
+        if not (
+            np.isfinite(capacity_numeric)
+            and np.isfinite(demand_numeric)
+            and np.isfinite(g_numeric)
+        ):
+            return None
+
+        return {
+            'R': float(capacity_numeric),
+            'Q': float(demand_numeric),
+            'g': float(g_numeric)
+        }
+
+    def _build_probabilistic_limit_state_histogram_data(self,
+                                                        max_bins: int = 28) -> Dict[str, Dict[str, Any]]:
+        """Ringkas histogram R, Q, dan g(x) per elemen untuk tiap limit-state."""
+        if self._probabilistic_limit_state_histogram_cache is not None:
+            return self._probabilistic_limit_state_histogram_cache
+
+        if not self.is_probabilistic or not self.mc_results:
+            self._probabilistic_limit_state_histogram_cache = {}
+            return {}
+
+        analysis_history = self.mc_results.get('max_forces_history', []) or []
+        if not analysis_history:
+            self._probabilistic_limit_state_histogram_cache = {}
+            return {}
+
+        state_specs = {
+            'moment': {
+                'label': 'Lentur',
+                'unit': 'kN.m'
+            },
+            'shear': {
+                'label': 'Geser',
+                'unit': 'kN'
+            },
+            'axial': {
+                'label': 'Aksial',
+                'unit': 'kN'
+            },
+            'axial_moment': {
+                'label': 'Aksial+Lentur',
+                'unit': '(-)'
+            }
+        }
+
+        histogram_data: Dict[str, Dict[str, Any]] = {}
+        applicable_by_state = self._get_applicable_element_ids_by_limit_state()
+        for limit_state, elem_ids in applicable_by_state.items():
+            spec = state_specs.get(limit_state)
+            if spec is None:
+                continue
+
+            for elem_id in sorted(int(value) for value in elem_ids):
+                r_values = []
+                q_values = []
+                g_values = []
+
+                for analysis_result in analysis_history:
+                    response = self._extract_limit_state_histogram_response(
+                        analysis_result,
+                        elem_id,
+                        limit_state
+                    )
+                    if not response:
+                        continue
+                    r_values.append(float(response['R']))
+                    q_values.append(float(response['Q']))
+                    g_values.append(float(response['g']))
+
+                if not g_values:
+                    continue
+
+                r_array = np.asarray(r_values, dtype=float)
+                q_array = np.asarray(q_values, dtype=float)
+                g_array = np.asarray(g_values, dtype=float)
+
+                rq_min = float(min(np.min(r_array), np.min(q_array)))
+                rq_max = float(max(np.max(r_array), np.max(q_array)))
+                rq_num_bins = int(np.clip(np.sqrt(max(r_array.size, q_array.size)), 12, max_bins))
+
+                r_summary = self._build_numeric_histogram_summary(
+                    r_array,
+                    max_bins=max_bins,
+                    density=True,
+                    value_range=(rq_min, rq_max),
+                    num_bins=rq_num_bins
+                )
+                q_summary = self._build_numeric_histogram_summary(
+                    q_array,
+                    max_bins=max_bins,
+                    density=True,
+                    value_range=(rq_min, rq_max),
+                    num_bins=rq_num_bins
+                )
+                g_summary = self._build_numeric_histogram_summary(
+                    g_array,
+                    max_bins=max_bins,
+                    density=True
+                )
+
+                histogram_data[f"{limit_state}_E{int(elem_id)}"] = {
+                    'element_id': int(elem_id),
+                    'code': self._get_element_design_code(int(elem_id)),
+                    'limit_state': str(limit_state),
+                    'limit_state_label': spec['label'],
+                    'unit': spec['unit'],
+                    'sample_count': int(g_array.size),
+                    'failure_count': int(np.sum(g_array < 0.0)),
+                    'Pf_from_g': float(np.mean(g_array < 0.0)),
+                    'R': r_summary,
+                    'Q': q_summary,
+                    'g': g_summary
+                }
+
+        self._probabilistic_limit_state_histogram_cache = histogram_data
+        return histogram_data
+
+    def _build_probabilistic_mc_convergence_data(self,
+                                                 max_points: int = 450) -> Dict[str, Any]:
+        """Ringkas kurva konvergensi Monte Carlo per elemen untuk UI."""
+        if self._probabilistic_mc_convergence_cache is not None:
+            return self._probabilistic_mc_convergence_cache
+
+        if not self.is_probabilistic or not self.mc_results:
+            self._probabilistic_mc_convergence_cache = {}
+            return {}
+
+        analysis_history = list(self.mc_results.get('max_forces_history', []) or [])
+        if not analysis_history:
+            self._probabilistic_mc_convergence_cache = {}
+            return {}
+
+        state_specs = {
+            'moment': {
+                'label': 'Lentur',
+                'unit': 'kN.m',
+                'performance_key': 'performance'
+            },
+            'shear': {
+                'label': 'Geser',
+                'unit': 'kN',
+                'performance_key': 'performance_shear'
+            },
+            'axial': {
+                'label': 'Aksial',
+                'unit': 'kN',
+                'performance_key': 'performance_axial'
+            },
+            'axial_moment': {
+                'label': 'Aksial+Lentur',
+                'unit': '(-)',
+                'performance_key': 'performance_axial_moment'
+            }
+        }
+
+        applicable_by_state = {
+            state_name: sorted(
+                int(elem_id)
+                for elem_id in self._get_applicable_element_ids_by_limit_state().get(
+                    state_name,
+                    []
+                )
+            )
+            for state_name in state_specs
+        }
+        applicable_sets = {
+            state_name: set(elem_ids)
+            for state_name, elem_ids in applicable_by_state.items()
+        }
+
+        design_groups = self._get_element_ids_by_design_group()
+        all_element_ids = sorted({
+            int(elem_id)
+            for elem_id in (
+                list(design_groups.get('beam', []))
+                + list(design_groups.get('column', []))
+            )
+        })
+        if not all_element_ids:
+            self._probabilistic_mc_convergence_cache = {}
+            return {}
+
+        checkpoint_values = np.linspace(
+            1,
+            len(analysis_history),
+            num=max(1, min(int(max_points), len(analysis_history))),
+            dtype=int
+        )
+        checkpoint_indices = sorted({
+            int(value)
+            for value in checkpoint_values
+            if int(value) >= 1
+        })
+        if checkpoint_indices[-1] != len(analysis_history):
+            checkpoint_indices.append(len(analysis_history))
+        checkpoint_set = set(checkpoint_indices)
+        beta_plot_cap = 8.0
+
+        g_sums = {
+            state_name: {elem_id: 0.0 for elem_id in applicable_by_state[state_name]}
+            for state_name in state_specs
+        }
+        g_counts = {
+            state_name: {elem_id: 0 for elem_id in applicable_by_state[state_name]}
+            for state_name in state_specs
+        }
+        failure_counts = {
+            state_name: {elem_id: 0 for elem_id in applicable_by_state[state_name]}
+            for state_name in state_specs
+        }
+        system_failures = 0
+        system_pf_series = []
+        system_beta_series = []
+
+        elements_data: Dict[int, Dict[str, Any]] = {}
+        for elem_id in all_element_ids:
+            code = self._get_element_design_code(int(elem_id))
+            if code == 'B':
+                group = 'beam'
+            elif code == 'K':
+                group = 'column'
+            else:
+                group = 'other'
+
+            elements_data[int(elem_id)] = {
+                'element_id': int(elem_id),
+                'code': code,
+                'group': group,
+                'states': {
+                    state_name: {
+                        'applicable': int(elem_id) in applicable_sets[state_name],
+                        'label': spec['label'],
+                        'unit': spec['unit'],
+                        'g_running_mean': [],
+                        'pf': [],
+                        'beta': []
+                    }
+                    for state_name, spec in state_specs.items()
+                }
+            }
+
+        for sample_index, analysis_result in enumerate(analysis_history, start=1):
+            if analysis_result is None:
+                state_failed_ids = {
+                    state_name: set(applicable_sets[state_name])
+                    for state_name in state_specs
+                }
+            else:
+                state_failed_ids = {}
+                for state_name, spec in state_specs.items():
+                    performance_values = (
+                        analysis_result.get(spec['performance_key'], {}) or {}
+                    )
+                    failed_ids = set()
+                    for raw_elem_id, raw_g_value in performance_values.items():
+                        try:
+                            elem_id = int(raw_elem_id)
+                            g_value = float(raw_g_value)
+                        except (TypeError, ValueError):
+                            continue
+
+                        if elem_id not in applicable_sets[state_name] or not np.isfinite(g_value):
+                            continue
+
+                        g_sums[state_name][elem_id] += float(g_value)
+                        g_counts[state_name][elem_id] += 1
+                        if g_value < 0.0:
+                            failed_ids.add(elem_id)
+
+                    state_failed_ids[state_name] = failed_ids
+
+            for state_name, failed_ids in state_failed_ids.items():
+                for elem_id in failed_ids:
+                    failure_counts[state_name][int(elem_id)] += 1
+
+            if any(bool(failed_ids) for failed_ids in state_failed_ids.values()):
+                system_failures += 1
+
+            if sample_index not in checkpoint_set:
+                continue
+
+            system_pf_value, system_beta_value = MonteCarloAnalysis.calculate_pf_and_beta(
+                system_failures,
+                sample_index
+            )
+            system_pf_series.append(float(system_pf_value))
+            if np.isfinite(system_beta_value):
+                system_beta_plot_value = float(system_beta_value)
+            else:
+                system_beta_plot_value = (
+                    float(beta_plot_cap)
+                    if system_beta_value > 0.0 else
+                    float(-beta_plot_cap)
+                )
+            system_beta_series.append(system_beta_plot_value)
+
+            for elem_id in all_element_ids:
+                element_states = elements_data[int(elem_id)]['states']
+                for state_name in state_specs:
+                    state_record = element_states[state_name]
+                    if not state_record.get('applicable'):
+                        continue
+
+                    valid_count = g_counts[state_name].get(int(elem_id), 0)
+                    mean_g = (
+                        g_sums[state_name][int(elem_id)] / valid_count
+                        if valid_count > 0 else
+                        None
+                    )
+                    failures = failure_counts[state_name].get(int(elem_id), 0)
+                    pf_value, beta_value = MonteCarloAnalysis.calculate_pf_and_beta(
+                        failures,
+                        sample_index
+                    )
+
+                    state_record['g_running_mean'].append(
+                        None if mean_g is None else float(mean_g)
+                    )
+                    state_record['pf'].append(float(pf_value))
+                    if np.isfinite(beta_value):
+                        beta_plot_value = float(beta_value)
+                    else:
+                        beta_plot_value = (
+                            float(beta_plot_cap)
+                            if beta_value > 0.0 else
+                            float(-beta_plot_cap)
+                        )
+                    state_record['beta'].append(beta_plot_value)
+
+        total_samples = max(int(self.mc_results.get('num_simulations', 0)), len(analysis_history))
+        for elem_id in all_element_ids:
+            element_states = elements_data[int(elem_id)]['states']
+            for state_name in state_specs:
+                state_record = element_states[state_name]
+                if not state_record.get('applicable'):
+                    continue
+
+                valid_count = int(g_counts[state_name].get(int(elem_id), 0))
+                mean_g = (
+                    g_sums[state_name][int(elem_id)] / valid_count
+                    if valid_count > 0 else
+                    None
+                )
+                failures = int(failure_counts[state_name].get(int(elem_id), 0))
+                pf_value, beta_value = MonteCarloAnalysis.calculate_pf_and_beta(
+                    failures,
+                    total_samples
+                )
+                state_record['g_valid_samples'] = valid_count
+                state_record['final_failures'] = failures
+                state_record['g_mean_final'] = (
+                    None if mean_g is None else float(mean_g)
+                )
+                state_record['pf_final'] = float(pf_value)
+                state_record['beta_final'] = float(beta_value)
+
+        convergence_data = {
+            'num_simulations': total_samples,
+            'analysis_failures': int(self.mc_results.get('analysis_failures', 0)),
+            'beta_plot_cap': float(beta_plot_cap),
+            'sample_counts': checkpoint_indices,
+            'system': {
+                'final_failures': int(system_failures),
+                'pf': system_pf_series,
+                'beta': system_beta_series,
+                'pf_final': float(self.mc_results.get('Pf')),
+                'beta_final': float(self.mc_results.get('Beta'))
+            },
+            'state_order': list(state_specs.keys()),
+            'state_specs': {
+                state_name: {
+                    'label': spec['label'],
+                    'unit': spec['unit']
+                }
+                for state_name, spec in state_specs.items()
+            },
+            'element_groups': {
+                'beam': [int(elem_id) for elem_id in design_groups.get('beam', [])],
+                'column': [int(elem_id) for elem_id in design_groups.get('column', [])]
+            },
+            'elements': {
+                str(elem_id): elements_data[int(elem_id)]
+                for elem_id in all_element_ids
+            }
+        }
+        self._probabilistic_mc_convergence_cache = convergence_data
+        return convergence_data
 
     def _get_element_reliability_results(self,
                                          limit_state: str = 'overall') -> Dict[int, Dict[str, float]]:
@@ -2275,6 +2814,8 @@ class PortalReliabilityAnalysis:
             return self._evaluate_analysis_result_failure(analysis_result)
         
         mc = MonteCarloAnalysis(self.num_mc_simulations)
+        self._probabilistic_mc_convergence_cache = None
+        self._probabilistic_limit_state_histogram_cache = None
         self.mc_results = mc.run_simulation(
             self.analysis_function,
             self.random_variables,
