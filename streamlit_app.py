@@ -3285,10 +3285,260 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
     return fig
 
 
+def get_probabilistic_limit_state_histogram_specs() -> List[Dict[str, str]]:
+    """Spesifikasi limit-state untuk histogram respons R, Q, dan g(x)."""
+    return [
+        {
+            'key': 'moment',
+            'label': 'Lentur',
+            'unit': 'kN.m',
+            'color': '#f59e0b'
+        },
+        {
+            'key': 'shear',
+            'label': 'Geser',
+            'unit': 'kN',
+            'color': '#16a34a'
+        },
+        {
+            'key': 'axial',
+            'label': 'Aksial',
+            'unit': 'kN',
+            'color': '#2563eb'
+        },
+        {
+            'key': 'axial_moment',
+            'label': 'Aksial+Lentur',
+            'unit': '(-)',
+            'color': '#7c3aed'
+        }
+    ]
+
+
+def build_limit_state_histogram_record_name(limit_state: str, elem_id: int) -> str:
+    """Nama record histogram respons limit-state per elemen."""
+    return f"{str(limit_state).strip()}_E{int(elem_id)}"
+
+
+def build_probabilistic_limit_state_histogram_summary_df(
+    histogram_data: Dict[str, Dict[str, Any]],
+    elem_id: int
+) -> pd.DataFrame:
+    """Ringkas statistik histogram R, Q, dan g(x) per limit-state untuk satu elemen."""
+    rows = []
+    for spec in get_probabilistic_limit_state_histogram_specs():
+        record = histogram_data.get(
+            build_limit_state_histogram_record_name(spec['key'], int(elem_id))
+        )
+        if not record:
+            continue
+
+        r_summary = record.get('R', {}) or {}
+        q_summary = record.get('Q', {}) or {}
+        g_summary = record.get('g', {}) or {}
+        rows.append({
+            'Limit State': record.get('limit_state_label', spec['label']),
+            'Mean R': r_summary.get('sample_mean'),
+            'Mean Q': q_summary.get('sample_mean'),
+            'Mean g(x)': g_summary.get('sample_mean'),
+            'StdDev g(x)': g_summary.get('sample_std'),
+            'Minimum g(x)': g_summary.get('sample_min'),
+            'Maksimum g(x)': g_summary.get('sample_max'),
+            'Jumlah Sampel Valid (-)': record.get('sample_count'),
+            'Jumlah Gagal dari g(x) (-)': record.get('failure_count'),
+            'Pf dari g(x) (-)': record.get('Pf_from_g'),
+            'Satuan': record.get('unit', spec['unit'])
+        })
+
+    return pd.DataFrame(rows)
+
+
+def plot_histogram_summary_on_axis(axis,
+                                   hist_summary: Dict[str, Any],
+                                   color: str,
+                                   label: str,
+                                   alpha_fill: float = 0.16) -> bool:
+    """Plot histogram teringkas ke axis matplotlib tanpa data mentah."""
+    hist_edges = np.asarray((hist_summary or {}).get('hist_bin_edges', []), dtype=float)
+    hist_values = np.asarray((hist_summary or {}).get('hist_values', []), dtype=float)
+    if hist_edges.size < 2 or hist_values.size == 0:
+        return False
+
+    axis.stairs(
+        hist_values,
+        hist_edges,
+        fill=True,
+        alpha=alpha_fill,
+        color=color,
+        linewidth=1.0,
+        label=label
+    )
+    axis.stairs(
+        hist_values,
+        hist_edges,
+        fill=False,
+        color=color,
+        linewidth=1.6
+    )
+    return True
+
+
+def build_probabilistic_limit_state_histogram_figure(
+    histogram_data: Dict[str, Dict[str, Any]],
+    elem_id: int
+) -> Optional[plt.Figure]:
+    """Bangun figure histogram R/Q dan g(x) untuk seluruh limit-state elemen terpilih."""
+    state_specs = get_probabilistic_limit_state_histogram_specs()
+    fig, axes = plt.subplots(4, 2, figsize=(15.5, 16.0), dpi=180)
+    plotted_any = False
+
+    for row_index, spec in enumerate(state_specs):
+        left_axis = axes[row_index, 0]
+        right_axis = axes[row_index, 1]
+        record = histogram_data.get(
+            build_limit_state_histogram_record_name(spec['key'], int(elem_id))
+        )
+        if not record:
+            for axis, panel_title in (
+                (left_axis, f"{spec['label']} | Histogram R & Q"),
+                (right_axis, f"{spec['label']} | Histogram g(x)")
+            ):
+                axis.axis('off')
+                axis.text(
+                    0.5,
+                    0.5,
+                    (
+                        f"Data {spec['label']} untuk E{int(elem_id)}\n"
+                        "tidak tersedia atau tidak berlaku."
+                    ),
+                    ha='center',
+                    va='center',
+                    fontsize=10,
+                    color='#475569',
+                    bbox=dict(
+                        boxstyle='round,pad=0.25',
+                        facecolor='#f8fafc',
+                        edgecolor='#cbd5e1'
+                    )
+                )
+                axis.set_title(panel_title, fontsize=10.5, pad=10)
+            continue
+
+        r_summary = record.get('R', {}) or {}
+        q_summary = record.get('Q', {}) or {}
+        g_summary = record.get('g', {}) or {}
+        unit_label = record.get('unit', spec['unit'])
+
+        rq_plotted = False
+        rq_plotted |= plot_histogram_summary_on_axis(
+            left_axis,
+            r_summary,
+            color='#dc2626',
+            label='R'
+        )
+        rq_plotted |= plot_histogram_summary_on_axis(
+            left_axis,
+            q_summary,
+            color='#2563eb',
+            label='Q'
+        )
+        r_mean = coerce_finite_float(r_summary.get('sample_mean'))
+        q_mean = coerce_finite_float(q_summary.get('sample_mean'))
+        if r_mean is not None:
+            left_axis.axvline(
+                r_mean,
+                color='#dc2626',
+                linestyle='--',
+                linewidth=1.1,
+                alpha=0.9
+            )
+        if q_mean is not None:
+            left_axis.axvline(
+                q_mean,
+                color='#2563eb',
+                linestyle=':',
+                linewidth=1.2,
+                alpha=0.95
+            )
+        left_axis.set_title(f"{spec['label']} | Histogram R dan Q", fontsize=10.5, pad=10)
+        left_axis.set_xlabel(f"Nilai ({unit_label})")
+        left_axis.set_ylabel('Kerapatan')
+        left_axis.grid(True, alpha=0.22, linestyle='--')
+        if rq_plotted:
+            left_axis.legend(loc='best', fontsize=8)
+
+        g_plotted = plot_histogram_summary_on_axis(
+            right_axis,
+            g_summary,
+            color=spec['color'],
+            label='g(x)',
+            alpha_fill=0.24
+        )
+        right_axis.axvline(
+            0.0,
+            color='#111827',
+            linestyle='--',
+            linewidth=1.1,
+            alpha=0.9,
+            label='g = 0'
+        )
+        g_mean = coerce_finite_float(g_summary.get('sample_mean'))
+        if g_mean is not None:
+            right_axis.axvline(
+                g_mean,
+                color=spec['color'],
+                linestyle=':',
+                linewidth=1.2,
+                alpha=0.95
+            )
+        right_axis.set_title(f"{spec['label']} | Histogram g(x)", fontsize=10.5, pad=10)
+        right_axis.set_xlabel(f"g(x) ({unit_label})")
+        right_axis.set_ylabel('Kerapatan')
+        right_axis.grid(True, alpha=0.22, linestyle='--')
+        if g_plotted:
+            right_axis.legend(loc='best', fontsize=8)
+
+        right_axis.text(
+            0.98,
+            0.96,
+            (
+                f"N valid = {int(record.get('sample_count', 0))}\n"
+                f"Gagal = {int(record.get('failure_count', 0))}\n"
+                f"Pf = {float(record.get('Pf_from_g', 0.0)):.4f}"
+            ),
+            transform=right_axis.transAxes,
+            ha='right',
+            va='top',
+            fontsize=8.5,
+            bbox=dict(
+                boxstyle='round,pad=0.25',
+                facecolor='white',
+                alpha=0.88,
+                edgecolor='#cbd5e1'
+            )
+        )
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Histogram Respons Limit State per Elemen | E{int(elem_id)}",
+        fontsize=13,
+        y=0.995
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.985])
+    return fig
+
+
 def render_probabilistic_histogram_output_section(results_bundle: Dict,
                                                   heading_level: str = "####") -> None:
     """Tampilkan histogram variabel random untuk mode probabilistik."""
     histogram_data = (results_bundle or {}).get('probabilistic_histogram_data', {}) or {}
+    limit_state_histogram_data = (
+        (results_bundle or {}).get('probabilistic_limit_state_histogram_data', {}) or {}
+    )
     summary = (results_bundle or {}).get('summary', {}) or {}
     if not histogram_data:
         st.info(
@@ -3378,6 +3628,490 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
                 table_min_width_px=1700
             )
         )
+
+    st.markdown(f"{heading_level} Histogram Respons Limit State")
+    st.caption(
+        "Bagian ini menampilkan histogram `g(x)` untuk lentur, geser, aksial, dan "
+        "aksial-lentur. Pada setiap limit state, panel kiri memperlihatkan histogram "
+        "`R` dan `Q` dalam satu grafik, sedangkan panel kanan memperlihatkan histogram `g(x)`."
+    )
+    st.caption(
+        "Nilai `R`, `Q`, dan `g(x)` diambil langsung dari hasil setiap simulasi Monte Carlo "
+        "yang sudah dihitung sebelumnya, sehingga tampilan ini tidak mengubah hasil perhitungan."
+    )
+    if int(summary.get('analysis_failures', 0) or 0) > 0:
+        st.caption(
+            "Simulasi yang gagal dieksekusi tidak ikut dihitung pada histogram respons limit state, "
+            "karena tidak menghasilkan pasangan `R/Q/g(x)` yang valid."
+        )
+
+    if not limit_state_histogram_data:
+        st.info("Histogram respons limit state belum tersedia untuk hasil analisis ini.")
+        return
+
+    limit_state_histogram_fig = build_probabilistic_limit_state_histogram_figure(
+        limit_state_histogram_data,
+        elem_id=int(selected_element_id)
+    )
+    if limit_state_histogram_fig is not None:
+        render_plot(
+            limit_state_histogram_fig,
+            interactive=False,
+            alt_text=f"Histogram limit state probabilistik elemen {int(selected_element_id)}"
+        )
+    else:
+        st.info("Histogram respons limit state untuk elemen yang dipilih belum dapat dibentuk.")
+
+    limit_state_histogram_summary_df = build_probabilistic_limit_state_histogram_summary_df(
+        limit_state_histogram_data,
+        elem_id=int(selected_element_id)
+    )
+    st.markdown(f"{heading_level} Tabel Ringkasan Histogram Respons")
+    st.caption(
+        "Tabel ini merangkum statistik akhir distribusi `R`, `Q`, dan `g(x)` "
+        "untuk setiap limit state pada elemen terpilih."
+    )
+    if limit_state_histogram_summary_df.empty:
+        st.info("Ringkasan histogram respons limit state untuk elemen yang dipilih belum tersedia.")
+    else:
+        render_input_table(
+            limit_state_histogram_summary_df,
+            styler=style_input_dataframe(
+                limit_state_histogram_summary_df,
+                table_min_width_px=1650
+            )
+        )
+
+
+def get_probabilistic_mc_convergence_state_specs() -> List[Dict[str, str]]:
+    """Spesifikasi warna dan label limit-state pada tab Simulasi MC."""
+    return [
+        {
+            'key': 'moment',
+            'label': 'Lentur',
+            'unit': 'kN.m',
+            'color': '#f59e0b'
+        },
+        {
+            'key': 'shear',
+            'label': 'Geser',
+            'unit': 'kN',
+            'color': '#16a34a'
+        },
+        {
+            'key': 'axial',
+            'label': 'Aksial',
+            'unit': 'kN',
+            'color': '#2563eb'
+        },
+        {
+            'key': 'axial_moment',
+            'label': 'Aksial+Lentur',
+            'unit': '(-)',
+            'color': '#7c3aed'
+        }
+    ]
+
+
+def get_probabilistic_mc_convergence_element_record(convergence_data: Dict,
+                                                    elem_id: int) -> Dict[str, Any]:
+    """Ambil record konvergensi per elemen dari hasil MC."""
+    elements_data = (convergence_data or {}).get('elements', {}) or {}
+    return (
+        elements_data.get(str(int(elem_id)))
+        or elements_data.get(int(elem_id))
+        or {}
+    )
+
+
+def build_probabilistic_mc_system_convergence_figure(
+    convergence_data: Dict
+) -> Optional[plt.Figure]:
+    """Bangun figure konvergensi Pf dan Beta sistem portal."""
+    sample_counts = np.asarray(
+        (convergence_data or {}).get('sample_counts', []),
+        dtype=float
+    )
+    system_record = (convergence_data or {}).get('system', {}) or {}
+    if sample_counts.size == 0 or not system_record:
+        return None
+
+    pf_values = np.asarray(system_record.get('pf', []), dtype=float)
+    beta_values = np.asarray(system_record.get('beta', []), dtype=float)
+    if pf_values.size == 0 and beta_values.size == 0:
+        return None
+
+    fig, axes = plt.subplots(2, 1, figsize=(13.5, 7.8), dpi=180, sharex=True)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    marker_style = 'o' if sample_counts.size <= 32 else None
+    system_color = '#0f4c81'
+
+    panel_specs = [
+        {
+            'axis': axes_list[0],
+            'values': pf_values,
+            'title': 'Konvergensi Pf Sistem',
+            'ylabel': 'Pf system (-)',
+            'ylim': (-0.02, 1.02)
+        },
+        {
+            'axis': axes_list[1],
+            'values': beta_values,
+            'title': 'Konvergensi Beta Sistem',
+            'ylabel': 'Beta system (-)',
+            'ylim': None
+        }
+    ]
+
+    for panel_spec in panel_specs:
+        axis = panel_spec['axis']
+        values = panel_spec['values']
+        if values.size == 0 or np.all(np.isnan(values)):
+            axis.text(
+                0.5,
+                0.5,
+                'Data tidak tersedia untuk panel ini.',
+                ha='center',
+                va='center',
+                transform=axis.transAxes,
+                fontsize=10,
+                color='#64748b',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#f8fafc',
+                    edgecolor='#cbd5e1'
+                )
+            )
+        else:
+            x_values = sample_counts[:values.size]
+            axis.plot(
+                x_values,
+                values,
+                color=system_color,
+                linewidth=2.2,
+                marker=marker_style,
+                markersize=3.4 if marker_style else 0.0
+            )
+        axis.set_title(panel_spec['title'], fontsize=11, pad=10)
+        axis.set_ylabel(panel_spec['ylabel'])
+        axis.grid(True, alpha=0.24, linestyle='--')
+        if panel_spec['ylim'] is not None:
+            axis.set_ylim(*panel_spec['ylim'])
+
+    axes_list[-1].set_xlabel('Jumlah simulasi, N (-)')
+    axes_list[0].text(
+        0.98,
+        0.08,
+        (
+            f"Jumlah gagal = {int(system_record.get('final_failures', 0))}\n"
+            f"Pf akhir = {format_metric(system_record.get('pf_final'), 6)}\n"
+            f"Beta akhir = {format_metric(system_record.get('beta_final'), 4)}"
+        ),
+        transform=axes_list[0].transAxes,
+        ha='right',
+        va='bottom',
+        fontsize=8.5,
+        bbox=dict(
+            boxstyle='round,pad=0.25',
+            facecolor='white',
+            alpha=0.88,
+            edgecolor='#cbd5e1'
+        )
+    )
+    fig.suptitle(
+        "Konvergensi Simulasi Monte Carlo | Sistem Portal",
+        fontsize=13,
+        y=0.985
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    return fig
+
+
+def build_probabilistic_mc_convergence_summary_df(convergence_data: Dict,
+                                                  elem_id: int) -> pd.DataFrame:
+    """Bangun ringkasan akhir konvergensi MC untuk satu elemen."""
+    element_record = get_probabilistic_mc_convergence_element_record(
+        convergence_data,
+        elem_id
+    )
+    if not element_record:
+        return pd.DataFrame()
+
+    rows = []
+    element_states = element_record.get('states', {}) or {}
+    for spec in get_probabilistic_mc_convergence_state_specs():
+        state_record = element_states.get(spec['key'], {}) or {}
+        if not state_record.get('applicable'):
+            continue
+
+        rows.append({
+            'Limit State': state_record.get('label', spec['label']),
+            'g Mean Kumulatif': state_record.get('g_mean_final'),
+            'Pf Akhir (-)': state_record.get('pf_final'),
+            'Beta Akhir (-)': state_record.get('beta_final'),
+            'Jumlah Gagal (-)': state_record.get('final_failures'),
+            'Sampel g Valid (-)': state_record.get('g_valid_samples'),
+            'Satuan g': state_record.get('unit', spec['unit'])
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_probabilistic_mc_convergence_figure(convergence_data: Dict,
+                                              input_data: Optional[Dict],
+                                              elem_id: int) -> Optional[plt.Figure]:
+    """Bangun figure konvergensi MC per elemen."""
+    sample_counts = np.asarray(
+        (convergence_data or {}).get('sample_counts', []),
+        dtype=float
+    )
+    if sample_counts.size == 0:
+        return None
+
+    element_record = get_probabilistic_mc_convergence_element_record(
+        convergence_data,
+        elem_id
+    )
+    if not element_record:
+        return None
+
+    state_specs = get_probabilistic_mc_convergence_state_specs()
+    series_specs = [
+        {
+            'series_key': 'g_running_mean',
+            'title': 'Konvergensi g Rata-rata Kumulatif',
+            'ylabel': 'g mean kumulatif'
+        },
+        {
+            'series_key': 'pf',
+            'title': 'Konvergensi Pf Kumulatif',
+            'ylabel': 'Pf (-)'
+        },
+        {
+            'series_key': 'beta',
+            'title': 'Konvergensi Beta Kumulatif',
+            'ylabel': 'Beta (-)'
+        }
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(13.5, 10.2), dpi=180, sharex=True)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    element_states = element_record.get('states', {}) or {}
+    marker_style = 'o' if sample_counts.size <= 32 else None
+
+    for axis, series_spec in zip(axes_list, series_specs):
+        plotted_any = False
+        for state_spec in state_specs:
+            state_record = element_states.get(state_spec['key'], {}) or {}
+            if not state_record.get('applicable'):
+                continue
+
+            series_values = np.asarray([
+                np.nan if value is None else float(value)
+                for value in state_record.get(series_spec['series_key'], [])
+            ], dtype=float)
+            if series_values.size == 0 or np.all(np.isnan(series_values)):
+                continue
+
+            x_values = sample_counts[:series_values.size]
+            axis.plot(
+                x_values,
+                series_values,
+                color=state_spec['color'],
+                linewidth=2.0,
+                marker=marker_style,
+                markersize=3.2 if marker_style else 0.0,
+                label=state_record.get('label', state_spec['label'])
+            )
+            plotted_any = True
+
+        axis.set_title(series_spec['title'], fontsize=11, pad=10)
+        axis.set_ylabel(series_spec['ylabel'])
+        axis.grid(True, alpha=0.24, linestyle='--')
+        if series_spec['series_key'] == 'pf':
+            axis.set_ylim(-0.02, 1.02)
+
+        if plotted_any:
+            axis.legend(loc='best', fontsize=8, ncol=2)
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                'Data tidak tersedia untuk panel ini.',
+                ha='center',
+                va='center',
+                transform=axis.transAxes,
+                fontsize=10,
+                color='#64748b',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#f8fafc',
+                    edgecolor='#cbd5e1'
+                )
+            )
+
+    axes_list[-1].set_xlabel('Jumlah simulasi, N (-)')
+
+    element_code = str(
+        element_record.get('code') or get_element_code_from_input(input_data, int(elem_id))
+    ).strip().upper()
+    element_type = get_element_type_label(element_code)
+    fig.suptitle(
+        f"Konvergensi Simulasi Monte Carlo | E{int(elem_id)} | {element_type}",
+        fontsize=13,
+        y=0.98
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    return fig
+
+
+def render_probabilistic_mc_convergence_output_section(results_bundle: Dict,
+                                                       input_data: Optional[Dict],
+                                                       heading_level: str = "####") -> None:
+    """Tampilkan tab Simulasi MC untuk mode probabilistik."""
+    convergence_data = (
+        (results_bundle or {}).get('probabilistic_mc_convergence_data', {}) or {}
+    )
+    if not convergence_data:
+        st.info(
+            "Data konvergensi Monte Carlo belum tersedia. Jalankan analisis probabilistik "
+            "agar tab `Simulasi MC` dapat menampilkan kurva per elemen."
+        )
+        return
+
+    sample_counts = list(convergence_data.get('sample_counts', []) or [])
+    beam_ids = [
+        int(elem_id)
+        for elem_id in (convergence_data.get('element_groups', {}).get('beam', []) or [])
+    ]
+    column_ids = [
+        int(elem_id)
+        for elem_id in (convergence_data.get('element_groups', {}).get('column', []) or [])
+    ]
+
+    st.markdown(f"{heading_level} Simulasi Monte Carlo per Elemen")
+    st.caption(
+        "Sumbu `X` menunjukkan jumlah simulasi `N`. Kurva `g` ditampilkan sebagai "
+        "rata-rata kumulatif nilai `g(x)` per elemen, sedangkan `Pf/Beta` dihitung "
+        "kumulatif per elemen untuk limit state lentur, geser, aksial, dan aksial-lentur."
+    )
+    st.caption(
+        "Setiap elemen ditampilkan dalam `expander` terpisah. Grafik mendukung zoom "
+        "dengan scroll mouse atau pinch."
+    )
+    beta_plot_cap = coerce_finite_float(convergence_data.get('beta_plot_cap'))
+    if beta_plot_cap is not None and beta_plot_cap > 0.0:
+        st.caption(
+            f"Jika `Pf = 0` atau `Pf = 1`, maka `Beta` teoritis menjadi tak hingga. "
+            f"Untuk kebutuhan visual grafik, nilai tersebut dipotong pada `+/-{beta_plot_cap:.1f}`, "
+            "sedangkan tabel ringkasan tetap menampilkan nilai akhir aslinya."
+        )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(
+        "Jumlah Simulasi",
+        format_metric_comma(convergence_data.get('num_simulations'), 0)
+    )
+    metric_cols[1].metric("Jumlah Checkpoint", format_metric_comma(len(sample_counts), 0))
+    metric_cols[2].metric("Jumlah Balok", format_metric_comma(len(beam_ids), 0))
+    metric_cols[3].metric("Jumlah Kolom", format_metric_comma(len(column_ids), 0))
+
+    analysis_failures = int(convergence_data.get('analysis_failures', 0) or 0)
+    if analysis_failures > 0:
+        st.warning(
+            f"{analysis_failures:,} simulasi tidak menghasilkan output struktur valid. "
+            "Simulasi gagal tetap diperhitungkan konservatif pada kurva `Pf/Beta`, "
+            "sedangkan kurva `g` hanya dirata-ratakan dari simulasi yang valid."
+        )
+
+    system_record = (convergence_data or {}).get('system', {}) or {}
+    st.markdown("##### Sistem Portal")
+    st.caption(
+        "Grafik berikut menunjukkan konvergensi `Pf system` dan `Beta system` portal "
+        "secara kumulatif terhadap jumlah simulasi `N`."
+    )
+    system_metric_cols = st.columns(3)
+    system_metric_cols[0].metric(
+        "Jumlah Gagal Sistem",
+        format_metric_comma(system_record.get('final_failures'), 0)
+    )
+    system_metric_cols[1].metric(
+        "Pf System Akhir",
+        format_metric(system_record.get('pf_final'), 6)
+    )
+    system_metric_cols[2].metric(
+        "Beta System Akhir",
+        format_metric(system_record.get('beta_final'), 4)
+    )
+
+    system_fig = build_probabilistic_mc_system_convergence_figure(convergence_data)
+    if system_fig is not None:
+        render_plot(
+            system_fig,
+            interactive=True,
+            viewer_key="probabilistic-mc-convergence-system",
+            alt_text="Konvergensi Monte Carlo sistem portal",
+            viewer_height=640
+        )
+    else:
+        st.info("Grafik konvergensi sistem portal belum tersedia.")
+
+    group_specs = [
+        ('Balok', beam_ids),
+        ('Kolom', column_ids)
+    ]
+    for group_label, element_ids in group_specs:
+        st.markdown(f"##### {group_label}")
+        if not element_ids:
+            st.info(f"Tidak ada elemen {group_label.lower()} yang dapat ditampilkan.")
+            continue
+
+        for index, elem_id in enumerate(element_ids):
+            element_record = get_probabilistic_mc_convergence_element_record(
+                convergence_data,
+                elem_id
+            )
+            if not element_record:
+                continue
+
+            with st.expander(
+                f"E{int(elem_id)} | {group_label}",
+                expanded=(index == 0)
+            ):
+                convergence_fig = build_probabilistic_mc_convergence_figure(
+                    convergence_data,
+                    input_data=input_data,
+                    elem_id=int(elem_id)
+                )
+                if convergence_fig is not None:
+                    render_plot(
+                        convergence_fig,
+                        interactive=True,
+                        viewer_key=f"probabilistic-mc-convergence-e{int(elem_id)}",
+                        alt_text=f"Konvergensi Monte Carlo elemen {int(elem_id)}",
+                        viewer_height=760
+                    )
+                else:
+                    st.info("Grafik konvergensi belum bisa dibentuk untuk elemen ini.")
+
+                summary_df = build_probabilistic_mc_convergence_summary_df(
+                    convergence_data,
+                    elem_id=int(elem_id)
+                )
+                st.caption(
+                    "Ringkasan berikut menampilkan nilai akhir pada checkpoint terakhir "
+                    "untuk setiap limit state yang relevan pada elemen ini."
+                )
+                if summary_df.empty:
+                    st.info("Ringkasan konvergensi untuk elemen ini belum tersedia.")
+                else:
+                    render_input_table(
+                        summary_df,
+                        styler=style_input_dataframe(
+                            summary_df,
+                            table_min_width_px=1100
+                        )
+                    )
 
 
 def build_sensitivity_df(sensitivity_results: Dict,
@@ -6003,6 +6737,7 @@ dashboard_tabs = [
     "Output Reliability",
     "Output Sensitivitas Probabilistik",
     "Histogram",
+    "Simulasi MC",
     "Output Sensitivitas Deterministik",
     "Risk Map",
     "Plot Simulasi Terakhir",
@@ -6411,6 +7146,21 @@ elif active_dashboard_tab == "Histogram":
     else:
         render_probabilistic_histogram_output_section(
             results_bundle,
+            heading_level="####"
+        )
+
+elif active_dashboard_tab == "Simulasi MC":
+    if not results_bundle:
+        st.info("Grafik konvergensi Monte Carlo akan tersedia setelah analisis dijalankan.")
+    elif not is_probabilistic:
+        st.info(
+            "Tab `Simulasi MC` khusus untuk mode probabilistik. "
+            "Jalankan analisis probabilistik agar konvergensi Monte Carlo per elemen dapat ditampilkan."
+        )
+    else:
+        render_probabilistic_mc_convergence_output_section(
+            results_bundle,
+            input_data=analysis_input_data,
             heading_level="####"
         )
 
