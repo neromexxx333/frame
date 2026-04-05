@@ -3496,7 +3496,11 @@ def build_probabilistic_limit_state_histogram_figure(
         right_axis.set_ylabel('Kerapatan')
         right_axis.grid(True, alpha=0.22, linestyle='--')
         if g_plotted:
-            right_axis.legend(loc='best', fontsize=8)
+            right_axis.legend(
+                loc='center right',
+                bbox_to_anchor=(1.0, 0.5),
+                fontsize=8
+            )
 
         right_axis.text(
             0.98,
@@ -3603,8 +3607,10 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
     if histogram_fig is not None:
         render_plot(
             histogram_fig,
-            interactive=False,
-            alt_text=f"Histogram variabel acak probabilistik elemen {int(selected_element_id)}"
+            interactive=True,
+            viewer_key=f"probabilistic-histogram-random-e{int(selected_element_id)}",
+            alt_text=f"Histogram variabel acak probabilistik elemen {int(selected_element_id)}",
+            viewer_height=760
         )
     else:
         st.info("Histogram untuk elemen yang dipilih belum dapat dibentuk.")
@@ -3656,8 +3662,10 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
     if limit_state_histogram_fig is not None:
         render_plot(
             limit_state_histogram_fig,
-            interactive=False,
-            alt_text=f"Histogram limit state probabilistik elemen {int(selected_element_id)}"
+            interactive=True,
+            viewer_key=f"probabilistic-histogram-limit-state-e{int(selected_element_id)}",
+            alt_text=f"Histogram limit state probabilistik elemen {int(selected_element_id)}",
+            viewer_height=980
         )
     else:
         st.info("Histogram respons limit state untuk elemen yang dipilih belum dapat dibentuk.")
