@@ -3213,9 +3213,106 @@ def build_risk_recommendation_element_lists(risk_df: pd.DataFrame,
     return element_lists
 
 
+def normalize_risk_recommendation_limit_state(limit_state: Any) -> str:
+    """Normalisasi label limit state untuk dirangkum sebagai mode kegagalan."""
+    normalized = str(limit_state or '').strip().lower().replace('_', '-').replace(' ', '-')
+    mapping = {
+        'lentur': 'Lentur',
+        'geser': 'Geser',
+        'aksial': 'Aksial',
+        'aksial-lentur': 'Aksial-Lentur',
+        'aksial+lentur': 'Aksial-Lentur'
+    }
+    return mapping.get(normalized, '')
+
+
+def build_risk_recommendation_failure_mode_lists(
+    risk_df: pd.DataFrame,
+    level_column: str
+) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    """Kumpulkan limit state kontrol per level agar indikasi bisa berbasis mode gagal."""
+    levels = ('Kritis', 'Tinggi', 'Sedang', 'Rendah')
+    modes = ('Lentur', 'Geser', 'Aksial', 'Aksial-Lentur')
+    failure_mode_lists = {
+        'B': {level: {mode: [] for mode in modes} for level in levels},
+        'K': {level: {mode: [] for mode in modes} for level in levels}
+    }
+    if (
+        risk_df is None
+        or risk_df.empty
+        or level_column not in risk_df.columns
+        or 'Limit State Kontrol' not in risk_df.columns
+    ):
+        return failure_mode_lists
+
+    for _, row in risk_df.iterrows():
+        code = str(row.get('Kode', '') or '').strip().upper()
+        level = str(row.get(level_column, '') or '').strip().title()
+        elem_id = row.get('Elemen (-)')
+        mode = normalize_risk_recommendation_limit_state(row.get('Limit State Kontrol'))
+        if code not in failure_mode_lists or level not in failure_mode_lists[code] or not mode:
+            continue
+        if pd.isna(elem_id) or str(elem_id).strip() in {'', '-', 'nan'}:
+            continue
+        try:
+            failure_mode_lists[code][level][mode].append(int(float(elem_id)))
+        except (TypeError, ValueError):
+            continue
+
+    for code in failure_mode_lists:
+        for level in failure_mode_lists[code]:
+            for mode in failure_mode_lists[code][level]:
+                failure_mode_lists[code][level][mode] = sorted(
+                    set(failure_mode_lists[code][level][mode])
+                )
+    return failure_mode_lists
+
+
+def build_risk_recommendation_indication_text(mode_lists: Optional[Dict[str, List[int]]],
+                                              fallback_text: str) -> str:
+    """Ringkas indikasi dari distribusi limit state kontrol pada level aktif."""
+    display_labels = {
+        'Lentur': 'lentur',
+        'Geser': 'geser',
+        'Aksial': 'aksial',
+        'Aksial-Lentur': 'aksial+lentur'
+    }
+    active_modes = []
+    for mode in ('Lentur', 'Geser', 'Aksial', 'Aksial-Lentur'):
+        element_ids = sorted(set((mode_lists or {}).get(mode, []) or []))
+        if element_ids:
+            active_modes.append((mode, len(element_ids)))
+
+    if not active_modes:
+        return fallback_text
+
+    active_modes = sorted(
+        active_modes,
+        key=lambda item: (-int(item[1]), ('Lentur', 'Geser', 'Aksial', 'Aksial-Lentur').index(item[0]))
+    )
+    phrases = [
+        f"{display_labels.get(mode, str(mode).lower())} ({int(count)} elemen)"
+        for mode, count in active_modes
+    ]
+    if len(phrases) == 1:
+        return (
+            "Kemungkinan mode kegagalan pengontrol pada level ini didominasi "
+            f"{phrases[0]}, berdasarkan Limit State Kontrol elemen."
+        )
+    if len(phrases) == 2:
+        tail_text = f"{phrases[0]} dan {phrases[1]}"
+    else:
+        tail_text = f"{', '.join(phrases[:-1])}, dan {phrases[-1]}"
+    return (
+        "Kemungkinan mode kegagalan pengontrol pada level ini didominasi "
+        f"{tail_text}, berdasarkan Limit State Kontrol elemen."
+    )
+
+
 def build_risk_recommendation_cards_html(element_code: str,
                                          level_counts: Dict[str, int],
                                          element_lists: Optional[Dict[str, List[int]]] = None,
+                                         failure_mode_lists: Optional[Dict[str, Dict[str, List[int]]]] = None,
                                          zoom_scale: float = 1.0,
                                          section_key: str = "risk-rec") -> str:
     """Bangun HTML kartu rekomendasi teknis yang responsif dan mudah dibaca."""
@@ -3236,6 +3333,14 @@ def build_risk_recommendation_cards_html(element_code: str,
             ", ".join(f"E{int(elem_id)}" for elem_id in active_elements)
             if active_elements else
             f"Belum muncul pada elemen {element_label.lower()} model aktif"
+        )
+        indication_text = (
+            build_risk_recommendation_indication_text(
+                (failure_mode_lists or {}).get(level, {}),
+                str(recommendation.get("indikasi", "-"))
+            )
+            if active_elements else
+            "-"
         )
 
         section_blocks = []
@@ -3269,7 +3374,7 @@ def build_risk_recommendation_cards_html(element_code: str,
                 f'<div class="{dom_key}-level-badge">{html.escape(level.upper())}</div>'
                 f'</div>'
                 f'<div class="{dom_key}-indicator">'
-                f'<strong>Indikasi:</strong> {html.escape(str(recommendation.get("indikasi", "-")))}'
+                f'<strong>Indikasi:</strong> {html.escape(indication_text)}'
                 f'</div>'
                 f'<div class="{dom_key}-element-strip">'
                 f'<span class="{dom_key}-element-strip-label">Nomor elemen:</span> '
@@ -3388,6 +3493,7 @@ def render_risk_map_technical_recommendations(risk_df: pd.DataFrame,
 
     level_counts = build_risk_recommendation_level_counts(risk_df, level_column)
     element_lists = build_risk_recommendation_element_lists(risk_df, level_column)
+    failure_mode_lists = build_risk_recommendation_failure_mode_lists(risk_df, level_column)
     zoom_percent = st.slider(
         "Zoom daftar rekomendasi teknis (%)",
         min_value=90,
@@ -3406,6 +3512,10 @@ def render_risk_map_technical_recommendations(risk_df: pd.DataFrame,
     st.caption(
         "Gunakan slider `zoom` untuk memperbesar atau memperkecil ukuran teks rekomendasi "
         "agar nyaman dibaca pada desktop maupun HP."
+    )
+    st.caption(
+        "Baris `Indikasi` diringkas dari distribusi `Limit State Kontrol` elemen pada tiap level, "
+        "sehingga bisa menunjukkan kecenderungan gagal karena lentur, geser, aksial, atau aksial+lentur."
     )
 
     beam_count = int((risk_df['Kode'].astype(str).str.upper() == 'B').sum()) if 'Kode' in risk_df.columns else 0
@@ -3433,6 +3543,7 @@ def render_risk_map_technical_recommendations(risk_df: pd.DataFrame,
                 element_code='B',
                 level_counts=level_counts.get('B', {}),
                 element_lists=element_lists.get('B', {}),
+                failure_mode_lists=failure_mode_lists.get('B', {}),
                 zoom_scale=zoom_scale,
                 section_key=f"{section_key}-beam"
             ),
@@ -3449,6 +3560,7 @@ def render_risk_map_technical_recommendations(risk_df: pd.DataFrame,
                 element_code='K',
                 level_counts=level_counts.get('K', {}),
                 element_lists=element_lists.get('K', {}),
+                failure_mode_lists=failure_mode_lists.get('K', {}),
                 zoom_scale=zoom_scale,
                 section_key=f"{section_key}-column"
             ),
