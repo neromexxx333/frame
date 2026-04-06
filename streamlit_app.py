@@ -3787,36 +3787,42 @@ def get_probabilistic_histogram_variable_specs() -> List[Dict[str, str]]:
         {
             'type': 'fc',
             'label': 'Mutu Beton fc',
+            'plot_label': 'Concrete Compressive Strength fc',
             'distribution_label': 'Lognormal',
             'unit': 'MPa'
         },
         {
             'type': 'fy_tarik',
             'label': 'fy Tarik',
+            'plot_label': 'Tensile Yield Strength fy',
             'distribution_label': 'Normal',
             'unit': 'MPa'
         },
         {
             'type': 'fy_tekan',
             'label': 'fy Tekan',
+            'plot_label': 'Compressive Yield Strength fy',
             'distribution_label': 'Normal',
             'unit': 'MPa'
         },
         {
             'type': 'fy_geser',
             'label': 'fy Geser',
+            'plot_label': 'Shear Yield Strength fy',
             'distribution_label': 'Normal',
             'unit': 'MPa'
         },
         {
             'type': 'qDL',
             'label': 'Beban Mati qDL',
+            'plot_label': 'Dead Load qDL',
             'distribution_label': 'Normal',
             'unit': 'kN/m'
         },
         {
             'type': 'qLL',
             'label': 'Beban Hidup qLL',
+            'plot_label': 'Live Load qLL',
             'distribution_label': 'Lognormal',
             'unit': 'kN/m'
         }
@@ -3908,12 +3914,13 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
     for axis, spec in zip(axes_list, variable_specs):
         variable_name = build_histogram_variable_name(spec['type'], int(elem_id))
         record = histogram_data.get(variable_name)
+        plot_label = str(spec.get('plot_label', spec['label']))
         if not record:
             axis.axis('off')
             axis.text(
                 0.5,
                 0.5,
-                f"Data {spec['label']} untuk E{int(elem_id)}\ntidak tersedia.",
+                f"Data for {plot_label} in E{int(elem_id)}\nis unavailable.",
                 ha='center',
                 va='center',
                 fontsize=10,
@@ -3943,7 +3950,7 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
             alpha=0.38,
             edgecolor='#1f2937',
             linewidth=0.8,
-            label='Histogram MC'
+            label='Monte Carlo Histogram'
         )
 
         pdf_x = np.linspace(hist_edges[0], hist_edges[-1], 320)
@@ -3959,7 +3966,7 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
                 pdf_y,
                 color='#111827',
                 linewidth=1.8,
-                label='PDF teoritis'
+                label='Theoretical PDF'
             )
 
         input_mean = coerce_finite_float(record.get('mean'))
@@ -3970,7 +3977,7 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
                 color='#dc2626',
                 linestyle='--',
                 linewidth=1.1,
-                label='Mean input'
+                label='Input Mean'
             )
         if sample_mean is not None:
             axis.axvline(
@@ -3978,16 +3985,16 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
                 color='#2563eb',
                 linestyle=':',
                 linewidth=1.2,
-                label='Mean sampel'
+                label='Sample Mean'
             )
 
         axis.set_title(
-            f"{spec['label']} | E{int(elem_id)}\nDistribusi: {spec['distribution_label']}",
+            f"{plot_label} | E{int(elem_id)}\nDistribution: {spec['distribution_label']}",
             fontsize=10.5,
             pad=10
         )
-        axis.set_xlabel(f"Nilai ({record.get('unit', spec['unit'])})")
-        axis.set_ylabel('Kerapatan')
+        axis.set_xlabel(f"Value ({record.get('unit', spec['unit'])})")
+        axis.set_ylabel('Probability Density')
         axis.grid(True, alpha=0.22, linestyle='--')
         axis.legend(fontsize=8, loc='best')
         plotted_any = True
@@ -3997,7 +4004,7 @@ def build_probabilistic_histogram_figure(histogram_data: Dict[str, Dict[str, Any
         return None
 
     fig.suptitle(
-        f"Histogram Variabel Acak Probabilistik per Elemen | E{int(elem_id)}",
+        f"Probabilistic Random Variable Histograms | Element E{int(elem_id)}",
         fontsize=13,
         y=0.98
     )
@@ -4011,24 +4018,28 @@ def get_probabilistic_limit_state_histogram_specs() -> List[Dict[str, str]]:
         {
             'key': 'moment',
             'label': 'Lentur',
+            'plot_label': 'Flexure',
             'unit': 'kN.m',
             'color': '#f59e0b'
         },
         {
             'key': 'shear',
             'label': 'Geser',
+            'plot_label': 'Shear',
             'unit': 'kN',
             'color': '#16a34a'
         },
         {
             'key': 'axial',
             'label': 'Aksial',
+            'plot_label': 'Axial',
             'unit': 'kN',
             'color': '#2563eb'
         },
         {
             'key': 'axial_moment',
             'label': 'Aksial+Lentur',
+            'plot_label': 'Axial-Flexure Interaction',
             'unit': '(-)',
             'color': '#7c3aed'
         }
@@ -4222,21 +4233,22 @@ def build_probabilistic_limit_state_histogram_figure(
     for row_index, spec in enumerate(state_specs):
         left_axis = axes[row_index, 0]
         right_axis = axes[row_index, 1]
+        plot_label = str(spec.get('plot_label', spec['label']))
         record = histogram_data.get(
             build_limit_state_histogram_record_name(spec['key'], int(elem_id))
         )
         if not record:
             for axis, panel_title in (
-                (left_axis, f"{spec['label']} | Histogram R & Q"),
-                (right_axis, f"{spec['label']} | Histogram g(x)")
+                (left_axis, f"{plot_label} | R and Q Histograms"),
+                (right_axis, f"{plot_label} | g(x) Histogram")
             ):
                 axis.axis('off')
                 axis.text(
                     0.5,
                     0.5,
                     (
-                        f"Data {spec['label']} untuk E{int(elem_id)}\n"
-                        "tidak tersedia atau tidak berlaku."
+                        f"Data for {plot_label} in E{int(elem_id)}\n"
+                        "is unavailable or not applicable."
                     ),
                     ha='center',
                     va='center',
@@ -4261,19 +4273,19 @@ def build_probabilistic_limit_state_histogram_figure(
             left_axis,
             r_summary,
             color='#dc2626',
-            label='R'
+            label='R Histogram'
         )
         rq_plotted |= plot_histogram_summary_on_axis(
             left_axis,
             q_summary,
             color='#2563eb',
-            label='Q'
+            label='Q Histogram'
         )
         rq_plotted |= plot_histogram_theoretical_pdf_on_axis(
             left_axis,
             r_summary,
             color='#991b1b',
-            label='PDF normal R',
+            label='Normal PDF of R',
             distribution='normal',
             linestyle='--',
             linewidth=1.6
@@ -4282,7 +4294,7 @@ def build_probabilistic_limit_state_histogram_figure(
             left_axis,
             q_summary,
             color='#1d4ed8',
-            label='PDF normal Q',
+            label='Normal PDF of Q',
             distribution='normal',
             linestyle='-.',
             linewidth=1.6
@@ -4305,9 +4317,9 @@ def build_probabilistic_limit_state_histogram_figure(
                 linewidth=1.2,
                 alpha=0.95
             )
-        left_axis.set_title(f"{spec['label']} | Histogram R dan Q", fontsize=10.5, pad=10)
-        left_axis.set_xlabel(f"Nilai ({unit_label})")
-        left_axis.set_ylabel('Kerapatan')
+        left_axis.set_title(f"{plot_label} | R and Q Histograms", fontsize=10.5, pad=10)
+        left_axis.set_xlabel(f"Value ({unit_label})")
+        left_axis.set_ylabel('Probability Density')
         left_axis.grid(True, alpha=0.22, linestyle='--')
         if rq_plotted:
             left_axis.legend(loc='best', fontsize=8)
@@ -4316,14 +4328,14 @@ def build_probabilistic_limit_state_histogram_figure(
             right_axis,
             g_summary,
             color=spec['color'],
-            label='g(x)',
+            label='g(x) Histogram',
             alpha_fill=0.24
         )
         g_plotted |= plot_histogram_theoretical_pdf_on_axis(
             right_axis,
             g_summary,
             color='#111827',
-            label='PDF normal g(x)',
+            label='Normal PDF of g(x)',
             distribution='normal',
             linestyle='-',
             linewidth=1.8
@@ -4334,7 +4346,7 @@ def build_probabilistic_limit_state_histogram_figure(
             linestyle='--',
             linewidth=1.1,
             alpha=0.9,
-            label='g = 0'
+            label='Failure Boundary g = 0'
         )
         g_mean = coerce_finite_float(g_summary.get('sample_mean'))
         if g_mean is not None:
@@ -4343,11 +4355,12 @@ def build_probabilistic_limit_state_histogram_figure(
                 color=spec['color'],
                 linestyle=':',
                 linewidth=1.2,
-                alpha=0.95
+                alpha=0.95,
+                label='Mean g(x)'
             )
-        right_axis.set_title(f"{spec['label']} | Histogram g(x)", fontsize=10.5, pad=10)
+        right_axis.set_title(f"{plot_label} | g(x) Histogram", fontsize=10.5, pad=10)
         right_axis.set_xlabel(f"g(x) ({unit_label})")
-        right_axis.set_ylabel('Kerapatan')
+        right_axis.set_ylabel('Probability Density')
         right_axis.grid(True, alpha=0.22, linestyle='--')
         if g_plotted:
             right_axis.legend(
@@ -4360,8 +4373,8 @@ def build_probabilistic_limit_state_histogram_figure(
             0.98,
             0.96,
             (
-                f"N valid = {int(record.get('sample_count', 0))}\n"
-                f"Gagal = {int(record.get('failure_count', 0))}\n"
+                f"Valid N = {int(record.get('sample_count', 0))}\n"
+                f"Failures = {int(record.get('failure_count', 0))}\n"
                 f"Pf = {float(record.get('Pf_from_g', 0.0)):.4f}"
             ),
             transform=right_axis.transAxes,
@@ -4382,7 +4395,7 @@ def build_probabilistic_limit_state_histogram_figure(
         return None
 
     fig.suptitle(
-        f"Histogram Respons Limit State per Elemen | E{int(elem_id)}",
+        f"Limit State Response Histograms | Element E{int(elem_id)}",
         fontsize=13,
         y=0.995
     )
@@ -4401,6 +4414,7 @@ def build_probabilistic_limit_state_g_frequency_figure(
     plotted_any = False
 
     for axis, spec in zip(axes_list, state_specs):
+        plot_label = str(spec.get('plot_label', spec['label']))
         record = histogram_data.get(
             build_limit_state_histogram_record_name(spec['key'], int(elem_id))
         )
@@ -4410,8 +4424,8 @@ def build_probabilistic_limit_state_g_frequency_figure(
                 0.5,
                 0.5,
                 (
-                    f"Data {spec['label']} untuk E{int(elem_id)}\n"
-                    "tidak tersedia atau tidak berlaku."
+                    f"Data for {plot_label} in E{int(elem_id)}\n"
+                    "is unavailable or not applicable."
                 ),
                 ha='center',
                 va='center',
@@ -4423,7 +4437,7 @@ def build_probabilistic_limit_state_g_frequency_figure(
                     edgecolor='#cbd5e1'
                 )
             )
-            axis.set_title(f"{spec['label']} | Histogram g(x) vs Frekuensi", fontsize=10.5, pad=10)
+            axis.set_title(f"{plot_label} | g(x) Frequency Histogram", fontsize=10.5, pad=10)
             continue
 
         g_summary = record.get('g', {}) or {}
@@ -4432,7 +4446,7 @@ def build_probabilistic_limit_state_g_frequency_figure(
             axis,
             g_summary,
             color=spec['color'],
-            label='Frekuensi g(x)',
+            label='g(x) Frequency',
             alpha_fill=0.26
         )
         axis.axvline(
@@ -4441,7 +4455,7 @@ def build_probabilistic_limit_state_g_frequency_figure(
             linestyle='--',
             linewidth=1.1,
             alpha=0.9,
-            label='g = 0'
+            label='Failure Boundary g = 0'
         )
         g_mean = coerce_finite_float(g_summary.get('sample_mean'))
         if g_mean is not None:
@@ -4454,9 +4468,9 @@ def build_probabilistic_limit_state_g_frequency_figure(
                 label='Mean g(x)'
             )
 
-        axis.set_title(f"{spec['label']} | Histogram g(x) vs Frekuensi", fontsize=10.5, pad=10)
+        axis.set_title(f"{plot_label} | g(x) Frequency Histogram", fontsize=10.5, pad=10)
         axis.set_xlabel(f"g(x) ({unit_label})")
-        axis.set_ylabel('Frekuensi')
+        axis.set_ylabel('Frequency')
         axis.grid(True, alpha=0.22, linestyle='--')
         if g_plotted:
             axis.legend(loc='best', fontsize=8)
@@ -4465,8 +4479,8 @@ def build_probabilistic_limit_state_g_frequency_figure(
             0.98,
             0.96,
             (
-                f"N valid = {int(record.get('sample_count', 0))}\n"
-                f"Gagal = {int(record.get('failure_count', 0))}\n"
+                f"Valid N = {int(record.get('sample_count', 0))}\n"
+                f"Failures = {int(record.get('failure_count', 0))}\n"
                 f"Pf = {float(record.get('Pf_from_g', 0.0)):.4f}"
             ),
             transform=axis.transAxes,
@@ -4487,7 +4501,7 @@ def build_probabilistic_limit_state_g_frequency_figure(
         return None
 
     fig.suptitle(
-        f"Histogram g(x) terhadap Frekuensi per Elemen | E{int(elem_id)}",
+        f"g(x) Frequency Histograms | Element E{int(elem_id)}",
         fontsize=13,
         y=0.99
     )
@@ -4679,24 +4693,28 @@ def get_probabilistic_mc_convergence_state_specs() -> List[Dict[str, str]]:
         {
             'key': 'moment',
             'label': 'Lentur',
+            'plot_label': 'Flexure',
             'unit': 'kN.m',
             'color': '#f59e0b'
         },
         {
             'key': 'shear',
             'label': 'Geser',
+            'plot_label': 'Shear',
             'unit': 'kN',
             'color': '#16a34a'
         },
         {
             'key': 'axial',
             'label': 'Aksial',
+            'plot_label': 'Axial',
             'unit': 'kN',
             'color': '#2563eb'
         },
         {
             'key': 'axial_moment',
             'label': 'Aksial+Lentur',
+            'plot_label': 'Axial-Flexure Interaction',
             'unit': '(-)',
             'color': '#7c3aed'
         }
@@ -4740,16 +4758,18 @@ def build_probabilistic_mc_system_convergence_figure(
         {
             'axis': axes_list[0],
             'values': pf_values,
-            'title': 'Konvergensi Pf Sistem',
-            'ylabel': 'Pf system (-)',
-            'ylim': (-0.02, 1.02)
+            'title': 'Cumulative System Pf Convergence',
+            'ylabel': 'System Pf (-)',
+            'ylim': (-0.02, 1.02),
+            'legend_label': 'System Pf'
         },
         {
             'axis': axes_list[1],
             'values': beta_values,
-            'title': 'Konvergensi Beta Sistem',
-            'ylabel': 'Beta system (-)',
-            'ylim': None
+            'title': 'Cumulative System Beta Convergence',
+            'ylabel': 'System Beta (-)',
+            'ylim': None,
+            'legend_label': 'System Beta'
         }
     ]
 
@@ -4760,7 +4780,7 @@ def build_probabilistic_mc_system_convergence_figure(
             axis.text(
                 0.5,
                 0.5,
-                'Data tidak tersedia untuk panel ini.',
+                'Data is unavailable for this panel.',
                 ha='center',
                 va='center',
                 transform=axis.transAxes,
@@ -4780,22 +4800,25 @@ def build_probabilistic_mc_system_convergence_figure(
                 color=system_color,
                 linewidth=2.2,
                 marker=marker_style,
-                markersize=3.4 if marker_style else 0.0
+                markersize=3.4 if marker_style else 0.0,
+                label=panel_spec['legend_label']
             )
         axis.set_title(panel_spec['title'], fontsize=11, pad=10)
         axis.set_ylabel(panel_spec['ylabel'])
         axis.grid(True, alpha=0.24, linestyle='--')
         if panel_spec['ylim'] is not None:
             axis.set_ylim(*panel_spec['ylim'])
+        if values.size != 0 and not np.all(np.isnan(values)):
+            axis.legend(loc='best', fontsize=8)
 
-    axes_list[-1].set_xlabel('Jumlah simulasi, N (-)')
+    axes_list[-1].set_xlabel('Number of Simulations, N (-)')
     axes_list[0].text(
         0.98,
         0.08,
         (
-            f"Jumlah gagal = {int(system_record.get('final_failures', 0))}\n"
-            f"Pf akhir = {format_metric(system_record.get('pf_final'), 6)}\n"
-            f"Beta akhir = {format_metric(system_record.get('beta_final'), 4)}"
+            f"Failure Count = {int(system_record.get('final_failures', 0))}\n"
+            f"Final Pf = {format_metric(system_record.get('pf_final'), 6)}\n"
+            f"Final Beta = {format_metric(system_record.get('beta_final'), 4)}"
         ),
         transform=axes_list[0].transAxes,
         ha='right',
@@ -4809,7 +4832,7 @@ def build_probabilistic_mc_system_convergence_figure(
         )
     )
     fig.suptitle(
-        "Konvergensi Simulasi Monte Carlo | Sistem Portal",
+        "Monte Carlo Simulation Convergence | Structural System",
         fontsize=13,
         y=0.985
     )
@@ -4869,17 +4892,17 @@ def build_probabilistic_mc_convergence_figure(convergence_data: Dict,
     series_specs = [
         {
             'series_key': 'g_running_mean',
-            'title': 'Konvergensi g Rata-rata Kumulatif',
-            'ylabel': 'g mean kumulatif'
+            'title': 'Cumulative Mean g(x) Convergence',
+            'ylabel': 'Cumulative Mean g(x)'
         },
         {
             'series_key': 'pf',
-            'title': 'Konvergensi Pf Kumulatif',
+            'title': 'Cumulative Pf Convergence',
             'ylabel': 'Pf (-)'
         },
         {
             'series_key': 'beta',
-            'title': 'Konvergensi Beta Kumulatif',
+            'title': 'Cumulative Beta Convergence',
             'ylabel': 'Beta (-)'
         }
     ]
@@ -4911,7 +4934,7 @@ def build_probabilistic_mc_convergence_figure(convergence_data: Dict,
                 linewidth=2.0,
                 marker=marker_style,
                 markersize=3.2 if marker_style else 0.0,
-                label=state_record.get('label', state_spec['label'])
+                label=state_spec.get('plot_label', state_spec['label'])
             )
             plotted_any = True
 
@@ -4927,7 +4950,7 @@ def build_probabilistic_mc_convergence_figure(convergence_data: Dict,
             axis.text(
                 0.5,
                 0.5,
-                'Data tidak tersedia untuk panel ini.',
+                'Data is unavailable for this panel.',
                 ha='center',
                 va='center',
                 transform=axis.transAxes,
@@ -4940,14 +4963,18 @@ def build_probabilistic_mc_convergence_figure(convergence_data: Dict,
                 )
             )
 
-    axes_list[-1].set_xlabel('Jumlah simulasi, N (-)')
+    axes_list[-1].set_xlabel('Number of Simulations, N (-)')
 
     element_code = str(
         element_record.get('code') or get_element_code_from_input(input_data, int(elem_id))
     ).strip().upper()
     element_type = get_element_type_label(element_code)
+    element_type_plot = {
+        'Balok': 'Beam',
+        'Kolom': 'Column'
+    }.get(element_type, element_type)
     fig.suptitle(
-        f"Konvergensi Simulasi Monte Carlo | E{int(elem_id)} | {element_type}",
+        f"Monte Carlo Simulation Convergence | E{int(elem_id)} | {element_type_plot}",
         fontsize=13,
         y=0.98
     )
