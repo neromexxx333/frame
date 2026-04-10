@@ -51,6 +51,8 @@ BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
     1e-9
 )
 ZOOMABLE_PLOT_VIEWER_HEIGHT = 540
+PLOT_DOWNLOAD_IMAGE_DPI = 320
+PLOT_DOWNLOAD_JPEG_QUALITY = 95
 MOMENT_EQUILIBRIUM_TOLERANCE_KNM = 1e-6
 DETERMINISTIC_RISK_WEIGHT_SEVERITY = 0.60
 DETERMINISTIC_RISK_WEIGHT_SENSITIVITY = 0.40
@@ -3642,7 +3644,8 @@ def render_risk_map_output_section(results_bundle: Dict,
             interactive=True,
             viewer_key="probabilistic-risk-map",
             alt_text="Risk map probabilistik elemen portal",
-            viewer_height=620
+            viewer_height=620,
+            download_basename="risk-map-probabilistik"
         )
 
         st.markdown(f"{heading_level} Tabel Risk Map Probabilistik")
@@ -3745,7 +3748,8 @@ def render_risk_map_output_section(results_bundle: Dict,
         interactive=True,
         viewer_key="deterministic-risk-map",
         alt_text="Risk priority map deterministik elemen portal",
-        viewer_height=620
+        viewer_height=620,
+        download_basename="risk-map-deterministik"
     )
 
     st.markdown(f"{heading_level} Tabel Risk Priority Map Deterministik")
@@ -4583,7 +4587,8 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
             interactive=True,
             viewer_key=f"probabilistic-histogram-random-e{int(selected_element_id)}",
             alt_text=f"Histogram variabel acak probabilistik elemen {int(selected_element_id)}",
-            viewer_height=760
+            viewer_height=760,
+            download_basename=f"histogram-variabel-acak-e{int(selected_element_id)}"
         )
     else:
         st.info("Histogram untuk elemen yang dipilih belum dapat dibentuk.")
@@ -4642,7 +4647,8 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
             interactive=True,
             viewer_key=f"probabilistic-histogram-limit-state-e{int(selected_element_id)}",
             alt_text=f"Histogram limit state probabilistik elemen {int(selected_element_id)}",
-            viewer_height=980
+            viewer_height=980,
+            download_basename=f"histogram-limit-state-e{int(selected_element_id)}"
         )
     else:
         st.info("Histogram respons limit state untuk elemen yang dipilih belum dapat dibentuk.")
@@ -4661,7 +4667,8 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
             interactive=True,
             viewer_key=f"probabilistic-histogram-limit-state-frequency-e{int(selected_element_id)}",
             alt_text=f"Histogram g(x) terhadap frekuensi elemen {int(selected_element_id)}",
-            viewer_height=780
+            viewer_height=780,
+            download_basename=f"histogram-frekuensi-gx-e{int(selected_element_id)}"
         )
     else:
         st.info("Histogram frekuensi g(x) untuk elemen yang dipilih belum dapat dibentuk.")
@@ -5068,7 +5075,8 @@ def render_probabilistic_mc_convergence_output_section(results_bundle: Dict,
             interactive=True,
             viewer_key="probabilistic-mc-convergence-system",
             alt_text="Konvergensi Monte Carlo sistem portal",
-            viewer_height=640
+            viewer_height=640,
+            download_basename="simulasi-mc-sistem-portal"
         )
     else:
         st.info("Grafik konvergensi sistem portal belum tersedia.")
@@ -5106,7 +5114,8 @@ def render_probabilistic_mc_convergence_output_section(results_bundle: Dict,
                         interactive=True,
                         viewer_key=f"probabilistic-mc-convergence-e{int(elem_id)}",
                         alt_text=f"Konvergensi Monte Carlo elemen {int(elem_id)}",
-                        viewer_height=760
+                        viewer_height=760,
+                        download_basename=f"simulasi-mc-e{int(elem_id)}"
                     )
                 else:
                     st.info("Grafik konvergensi belum bisa dibentuk untuk elemen ini.")
@@ -5452,7 +5461,8 @@ def render_sensitivity_output_section(results_bundle: Dict,
         render_plot(
             tornado_fig,
             interactive=False,
-            alt_text="Diagram Analisis Sensitivitas kuantitatif kontribusi terhadap beta"
+            alt_text="Diagram Analisis Sensitivitas kuantitatif kontribusi terhadap beta",
+            download_basename="output-sensitivitas-probabilistik"
         )
     else:
         st.info(
@@ -5998,7 +6008,8 @@ def render_deterministic_sensitivity_output_section(results_bundle: Dict,
         render_plot(
             tornado_fig,
             interactive=False,
-            alt_text="Diagram sensitivitas deterministik dengan perturbasi sigma"
+            alt_text="Diagram sensitivitas deterministik dengan perturbasi sigma",
+            download_basename="output-sensitivitas-deterministik"
         )
     else:
         st.info("Diagram sensitivitas deterministik berbasis COV belum dapat dibentuk.")
@@ -6126,21 +6137,74 @@ def sanitize_dom_id(value: str) -> str:
     return sanitized or "zoomable-plot"
 
 
+def sanitize_download_filename(value: str) -> str:
+    """Ubah nama file unduhan menjadi aman untuk berbagai OS/browser."""
+    sanitized = re.sub(r'[^a-zA-Z0-9._-]+', '-', str(value).strip())
+    sanitized = sanitized.strip('-.')
+    return sanitized or "plot"
+
+
+def save_figure_to_image_bytes(fig,
+                               image_format: str = 'png',
+                               image_dpi: int = 220,
+                               tight_bbox: bool = True,
+                               jpeg_quality: int = PLOT_DOWNLOAD_JPEG_QUALITY) -> bytes:
+    """Simpan figure matplotlib ke bytes gambar untuk preview dan unduhan."""
+    normalized_format = str(image_format or 'png').strip().lower()
+    if normalized_format == 'jpg':
+        normalized_format = 'jpeg'
+
+    base_save_kwargs = {
+        'format': normalized_format,
+        'dpi': int(image_dpi),
+        'facecolor': 'white',
+        'edgecolor': 'white'
+    }
+    if tight_bbox:
+        base_save_kwargs['bbox_inches'] = 'tight'
+
+    def save_with_kwargs(save_kwargs: Dict[str, Any]) -> bytes:
+        image_buffer = io.BytesIO()
+        fig.savefig(image_buffer, **save_kwargs)
+        image_buffer.seek(0)
+        return image_buffer.getvalue()
+
+    if normalized_format == 'jpeg':
+        pil_kwargs = {
+            'quality': int(max(1, min(int(jpeg_quality), 100))),
+            'optimize': True,
+            'subsampling': 0
+        }
+        try:
+            return save_with_kwargs({
+                **base_save_kwargs,
+                'pil_kwargs': pil_kwargs
+            })
+        except TypeError:
+            try:
+                return save_with_kwargs({
+                    **base_save_kwargs,
+                    'pil_kwargs': {
+                        'quality': pil_kwargs['quality'],
+                        'optimize': pil_kwargs['optimize']
+                    }
+                })
+            except TypeError:
+                return save_with_kwargs(base_save_kwargs)
+
+    return save_with_kwargs(base_save_kwargs)
+
+
 def figure_to_png_data_uri(fig,
                            image_dpi: int = 220,
                            tight_bbox: bool = True) -> str:
     """Konversi figure matplotlib menjadi PNG data URI resolusi tinggi."""
-    image_buffer = io.BytesIO()
-    save_kwargs = {
-        'format': 'png',
-        'dpi': image_dpi,
-        'facecolor': 'white'
-    }
-    if tight_bbox:
-        save_kwargs['bbox_inches'] = 'tight'
-    fig.savefig(image_buffer, **save_kwargs)
-    image_buffer.seek(0)
-    image_bytes = image_buffer.getvalue()
+    image_bytes = save_figure_to_image_bytes(
+        fig,
+        image_format='png',
+        image_dpi=image_dpi,
+        tight_bbox=tight_bbox
+    )
     return "data:image/png;base64," + base64.b64encode(image_bytes).decode('ascii')
 
 
@@ -6523,8 +6587,34 @@ def render_plot(fig,
                 viewer_key: Optional[str] = None,
                 alt_text: str = "Plot simulasi terakhir",
                 viewer_height: int = ZOOMABLE_PLOT_VIEWER_HEIGHT,
-                tight_bbox: bool = True) -> None:
+                tight_bbox: bool = True,
+                download_basename: Optional[str] = None,
+                download_dpi: int = PLOT_DOWNLOAD_IMAGE_DPI) -> None:
     """Tampilkan plot matplotlib dan tutup figure setelah dirender."""
+    download_bytes = None
+    download_file_name = None
+    download_error = None
+    download_key = None
+
+    if download_basename:
+        try:
+            download_bytes = save_figure_to_image_bytes(
+                fig,
+                image_format='jpeg',
+                image_dpi=download_dpi,
+                tight_bbox=tight_bbox,
+                jpeg_quality=PLOT_DOWNLOAD_JPEG_QUALITY
+            )
+            download_file_name = (
+                f"{sanitize_download_filename(download_basename)}.jpg"
+            )
+            download_key = (
+                f"{sanitize_dom_id(viewer_key or download_basename or f'plot-{id(fig)}')}"
+                "-download-jpg"
+            )
+        except Exception as exc:
+            download_error = format_error_message(exc)
+
     if interactive:
         render_zoomable_plot(
             fig,
@@ -6535,6 +6625,18 @@ def render_plot(fig,
         )
     else:
         st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+    if download_bytes is not None and download_file_name and download_key:
+        st.download_button(
+            label=f"Unduh JPG HD ({int(download_dpi)} DPI)",
+            data=download_bytes,
+            file_name=download_file_name,
+            mime='image/jpeg',
+            key=download_key
+        )
+    elif download_error:
+        st.caption(f"File JPG belum dapat disiapkan: {download_error}")
+
     plt.close(fig)
 
 
@@ -7798,7 +7900,10 @@ if active_dashboard_tab == "Input Data":
         nodal_loads=input_data['nodal_loads'],
         title="Preview Input Struktur"
     )
-    render_plot(geometry_fig)
+    render_plot(
+        geometry_fig,
+        download_basename="input-data-preview-geometri-dan-pembebanan"
+    )
 
     if results_bundle and not input_preview_differs_from_results:
         sample_expander_title = (
@@ -8284,7 +8389,8 @@ elif active_dashboard_tab == "Plot Simulasi Terakhir":
                 deformed_fig,
                 interactive=True,
                 viewer_key="last-simulation-deformation",
-                alt_text="Plot deformasi simulasi terakhir"
+                alt_text="Plot deformasi simulasi terakhir",
+                download_basename="plot-simulasi-terakhir-deformasi"
             )
 
         with top_right:
@@ -8299,7 +8405,8 @@ elif active_dashboard_tab == "Plot Simulasi Terakhir":
                 axial_fig,
                 interactive=True,
                 viewer_key="last-simulation-axial",
-                alt_text="Diagram axial simulasi terakhir"
+                alt_text="Diagram axial simulasi terakhir",
+                download_basename="plot-simulasi-terakhir-axial"
             )
 
         with bottom_left:
@@ -8314,7 +8421,8 @@ elif active_dashboard_tab == "Plot Simulasi Terakhir":
                 shear_fig,
                 interactive=True,
                 viewer_key="last-simulation-shear",
-                alt_text="Diagram shear simulasi terakhir"
+                alt_text="Diagram shear simulasi terakhir",
+                download_basename="plot-simulasi-terakhir-shear"
             )
 
         with bottom_right:
@@ -8330,7 +8438,8 @@ elif active_dashboard_tab == "Plot Simulasi Terakhir":
                 moment_fig,
                 interactive=True,
                 viewer_key="last-simulation-moment",
-                alt_text="Diagram momen simulasi terakhir"
+                alt_text="Diagram momen simulasi terakhir",
+                download_basename="plot-simulasi-terakhir-momen"
             )
 
 elif active_dashboard_tab == "Kurva Interasi P-M":
@@ -8450,7 +8559,8 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
                     viewer_key=f"interaction-curve-e{int(selected_interaction_elem)}",
                     alt_text=f"Kurva interaksi elemen {int(selected_interaction_elem)}",
                     viewer_height=620,
-                    tight_bbox=False
+                    tight_bbox=False,
+                    download_basename=f"kurva-interaksi-pm-e{int(selected_interaction_elem)}"
                 )
             except Exception as exc:
                 st.error(
