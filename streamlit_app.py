@@ -37,6 +37,7 @@ from modules.stiffness_matrix import Portal2D
 
 
 DEFAULT_INPUT_FILE = "input_template.xlsx"
+ULM_LOGO_PATH = Path(__file__).with_name("Logo_ULM.png")
 DETERMINISTIC_MODE_LABEL = "Deterministik (SNI 2847:2019)"
 PROBABILISTIC_MODE_LABEL = "Probabilistik"
 BASE_ESTIMATE_ELEMENTS = 9.0
@@ -99,6 +100,27 @@ RISK_LEVEL_STYLES = {
         'font-weight: 700; '
         'color: #475569;'
     )
+}
+
+RISK_LEVEL_ENGLISH_LABELS = {
+    'Rendah': 'Low',
+    'Sedang': 'Moderate',
+    'Tinggi': 'High',
+    'Kritis': 'Critical',
+    'Tidak Ada Data': 'No Data'
+}
+
+RISK_LEVEL_CANONICAL_LOOKUP = {
+    'rendah': 'Rendah',
+    'low': 'Rendah',
+    'sedang': 'Sedang',
+    'moderate': 'Sedang',
+    'tinggi': 'Tinggi',
+    'high': 'Tinggi',
+    'kritis': 'Kritis',
+    'critical': 'Kritis',
+    'tidak ada data': 'Tidak Ada Data',
+    'no data': 'Tidak Ada Data'
 }
 
 HEADER_GROUP_PALETTES = {
@@ -2281,7 +2303,30 @@ def normalize_nonnegative_mapping(raw_values: Dict[int, float]) -> Dict[int, flo
 
 def get_risk_level_rank(level: str) -> int:
     """Urutan level risiko untuk sorting."""
-    return int(RISK_LEVEL_ORDER.get(str(level or '').strip(), -1))
+    canonical_level = normalize_risk_level(level)
+    return int(RISK_LEVEL_ORDER.get(canonical_level, -1))
+
+
+def normalize_risk_level(level: Any) -> str:
+    """Normalisasi label level risiko ke bentuk kanonik internal."""
+    level_text = str(level or '').strip()
+    if not level_text:
+        return ''
+    return RISK_LEVEL_CANONICAL_LOOKUP.get(level_text.lower(), level_text)
+
+
+def get_risk_level_display_label(level: Any,
+                                 language: str = 'id') -> str:
+    """Ambil label level risiko untuk kebutuhan tampilan."""
+    canonical_level = normalize_risk_level(level)
+    if str(language or '').strip().lower() == 'en':
+        return RISK_LEVEL_ENGLISH_LABELS.get(canonical_level, canonical_level or 'No Data')
+    return canonical_level or str(level or '').strip() or '-'
+
+
+def get_risk_level_style(level: Any) -> str:
+    """Ambil style tabel berdasarkan level risiko tampilan maupun internal."""
+    return RISK_LEVEL_STYLES.get(normalize_risk_level(level), '')
 
 
 def describe_deterministic_priority_level(risk_score: Optional[float],
@@ -2355,7 +2400,11 @@ def build_element_risk_map_figure(nodes: np.ndarray,
                                   boundary_conditions: Optional[Dict[int, Dict[str, Any]]],
                                   element_levels: Dict[int, str],
                                   title: str,
-                                  subtitle: Optional[str] = None) -> plt.Figure:
+                                  subtitle: Optional[str] = None,
+                                  x_label: str = 'X (mm)',
+                                  y_label: str = 'Y (mm)',
+                                  legend_title: str = 'Level',
+                                  level_display_language: str = 'id') -> plt.Figure:
     """Bangun peta warna elemen berdasarkan level risiko/prioritas."""
     fig, ax = plt.subplots(1, 1, figsize=(12, 8), dpi=180)
     boundary_conditions = boundary_conditions or {}
@@ -2383,7 +2432,7 @@ def build_element_risk_map_figure(nodes: np.ndarray,
     present_levels = []
     for element in elements:
         elem_id = int(element.elem_id)
-        level = str(element_levels.get(elem_id, 'Tidak Ada Data'))
+        level = normalize_risk_level(element_levels.get(elem_id, 'Tidak Ada Data'))
         color = RISK_LEVEL_COLORS.get(level, RISK_LEVEL_COLORS['Tidak Ada Data'])
         line_width = line_widths.get(level, line_widths['Tidak Ada Data'])
         start = np.asarray(element.coord_start, dtype=float)
@@ -2489,22 +2538,22 @@ def build_element_risk_map_figure(nodes: np.ndarray,
             facecolor=RISK_LEVEL_COLORS[level],
             edgecolor='#1e3a8a',
             linewidth=1.4,
-            label=level
+            label=get_risk_level_display_label(level, language=level_display_language)
         )
         for level in legend_levels
     ]
     if legend_handles:
         ax.legend(
             handles=legend_handles,
-            title='Level',
+            title=legend_title,
             loc='center left',
             bbox_to_anchor=(1.01, 0.5),
             borderaxespad=0.0,
             framealpha=0.96
         )
 
-    ax.set_xlabel('X (mm)')
-    ax.set_ylabel('Y (mm)')
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.set_title(title)
     ax.grid(True, alpha=0.28)
     ax.axis('equal')
@@ -2791,7 +2840,7 @@ def style_risk_level_dataframe(df: pd.DataFrame,
     def highlight_level(dataframe: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame('', index=dataframe.index, columns=dataframe.columns)
         mapped_styles = dataframe[level_column].astype(str).map(
-            lambda value: RISK_LEVEL_STYLES.get(value, '')
+            lambda value: get_risk_level_style(value)
         )
         styles.loc[:, level_column] = mapped_styles
         return styles
@@ -2878,33 +2927,34 @@ def build_probabilistic_risk_level_threshold_df() -> pd.DataFrame:
     """Panduan batas level untuk risk map probabilistik."""
     return pd.DataFrame([
         {
-            'Level': 'Kritis',
-            'Batas Pf': 'Pf >= 1e-1',
-            'Batas Beta': 'Beta < 1.5'
+            'Risk Level': 'Critical',
+            'Pf Threshold': 'Pf >= 1e-1',
+            'Beta Threshold': 'Beta < 1.5'
         },
         {
-            'Level': 'Tinggi',
-            'Batas Pf': '1e-2 <= Pf < 1e-1',
-            'Batas Beta': '1.5 <= Beta < 2.5'
+            'Risk Level': 'High',
+            'Pf Threshold': '1e-2 <= Pf < 1e-1',
+            'Beta Threshold': '1.5 <= Beta < 2.5'
         },
         {
-            'Level': 'Sedang',
-            'Batas Pf': '1e-3 <= Pf < 1e-2',
-            'Batas Beta': '2.5 <= Beta < 3.0'
+            'Risk Level': 'Moderate',
+            'Pf Threshold': '1e-3 <= Pf < 1e-2',
+            'Beta Threshold': '2.5 <= Beta < 3.0'
         },
         {
-            'Level': 'Rendah',
-            'Batas Pf': 'Pf < 1e-3',
-            'Batas Beta': 'Beta >= 3.0'
+            'Risk Level': 'Low',
+            'Pf Threshold': 'Pf < 1e-3',
+            'Beta Threshold': 'Beta >= 3.0'
         }
     ])
 
 
-def style_risk_threshold_df(df: pd.DataFrame):
+def style_risk_threshold_df(df: pd.DataFrame,
+                            level_column: str = 'Level'):
     """Styling sederhana untuk tabel batas level risk map."""
     return style_risk_level_dataframe(
         df,
-        level_column='Level',
+        level_column=level_column,
         grouped_columns={
             'risk': list(df.columns)
         }
@@ -3613,15 +3663,17 @@ def render_risk_map_output_section(results_bundle: Dict,
             "`Tinggi` bila `Pf >= 1e-2` atau `Beta < 2.5`, `Sedang` bila "
             "`Pf >= 1e-3` atau `Beta < 3.0`, dan `Rendah` untuk kondisi di bawahnya."
         )
-        with st.expander("Batas Level Risk Map", expanded=False):
+        with st.expander("Risk Level Thresholds", expanded=False):
             st.caption(
-                "Level akhir mengikuti kondisi yang lebih kritis antara ambang `Pf` "
-                "dan ambang `Beta`."
+                "The final risk level follows the more critical condition between the "
+                "`Pf` threshold and the `Beta` threshold."
             )
+            probabilistic_risk_threshold_df = build_probabilistic_risk_level_threshold_df()
             render_input_table(
-                build_probabilistic_risk_level_threshold_df(),
+                probabilistic_risk_threshold_df,
                 styler=style_risk_threshold_df(
-                    build_probabilistic_risk_level_threshold_df()
+                    probabilistic_risk_threshold_df,
+                    level_column='Risk Level'
                 )
             )
 
@@ -3636,8 +3688,12 @@ def render_risk_map_output_section(results_bundle: Dict,
             elements,
             boundary_conditions=input_data.get('boundary', {}),
             element_levels=element_level_map,
-            title="Risk Map Probabilistik Elemen Portal",
-            subtitle="Basis warna: level risiko elemen dari Pf/Beta keseluruhan."
+            title="Probabilistic Risk Map of Portal Frame Members",
+            subtitle="Color coding is based on the member risk level derived from the overall Pf and Beta values.",
+            x_label="Global X Coordinate (mm)",
+            y_label="Global Y Coordinate (mm)",
+            legend_title="Risk Level",
+            level_display_language='en'
         )
         render_plot(
             risk_fig,
@@ -6208,6 +6264,15 @@ def figure_to_png_data_uri(fig,
     return "data:image/png;base64," + base64.b64encode(image_bytes).decode('ascii')
 
 
+def image_file_to_data_uri(image_path: Path,
+                           mime_type: str = "image/png") -> str:
+    """Konversi file gambar lokal menjadi data URI untuk dirender via HTML."""
+    return (
+        f"data:{mime_type};base64,"
+        + base64.b64encode(image_path.read_bytes()).decode('ascii')
+    )
+
+
 def render_zoomable_plot(fig,
                          viewer_key: str,
                          alt_text: str = "Plot simulasi terakhir",
@@ -7605,18 +7670,37 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Analisis Keandalan Struktur Portal 2D")
-st.markdown(
-    """
-    <p style="font-size: 2rem; font-weight: 600; margin-bottom: 0.1rem;">
-        Pengembang: Ir. Darmansyah Tjitradi, M.T., IPU
-    </p>
-    <p style="font-size: 2rem; margin-top: 0;">
-        Fakultas Teknik Universitas Lambung Mangkurat
-    </p>
-    """,
-    unsafe_allow_html=True,
-)
+header_logo_col, header_text_col = st.columns([1.1, 8.9], gap="medium")
+
+with header_logo_col:
+    if ULM_LOGO_PATH.exists():
+        ulm_logo_data_uri = image_file_to_data_uri(ULM_LOGO_PATH)
+        st.markdown(
+            f"""
+            <div style="padding-top: 1cm; padding-left: 1cm;">
+                <img
+                    src="{ulm_logo_data_uri}"
+                    alt="Logo Universitas Lambung Mangkurat"
+                    style="width: 115px; display: block;"
+                />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+with header_text_col:
+    st.title("Analisis Keandalan Struktur Portal 2D")
+    st.markdown(
+        """
+        <p style="font-size: 2rem; font-weight: 600; margin-bottom: 0.1rem;">
+            Pengembang: Ir. Darmansyah Tjitradi, M.T., IPU
+        </p>
+        <p style="font-size: 2rem; margin-top: 0;">
+            Fakultas Teknik Universitas Lambung Mangkurat
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
 st.caption("Menampilkan input, output simulasi terakhir, Pf, Beta, deformasi, dan gaya dalam.")
 
 preview_input_data = None
