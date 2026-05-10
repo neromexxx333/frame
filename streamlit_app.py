@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from scipy import stats
 
@@ -54,6 +55,20 @@ BASE_MONTE_CARLO_SECONDS_PER_SAMPLE = max(
 ZOOMABLE_PLOT_VIEWER_HEIGHT = 540
 PLOT_DOWNLOAD_IMAGE_DPI = 320
 PLOT_DOWNLOAD_JPEG_QUALITY = 95
+SAFE_CLOUD_COLOR = '#0000ff'
+PHYSICAL_NONLINEAR_CONTOUR_COLOR = '#c026d3'
+FAILURE_CLOUD_MAX_STORED_POINTS = 12000
+FAILURE_CLOUD_MAX_FAILED_POINTS = 4000
+LIMIT_STATE_PHYSICAL_CLOUD_MAX_POINTS = 1200
+LIMIT_STATE_PHYSICAL_CLOUD_MAX_FAILED_POINTS = 420
+PHYSICAL_G_CONTOUR_GRID_SIZE = 120
+PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE = 36
+AXIAL_MOMENT_PM_CLOUD_MAX_POINTS = 1400
+AXIAL_MOMENT_PM_CLOUD_MAX_FAILED_POINTS = 420
+FAILURE_SURFACE_MAX_CLASS_POINTS = 2200
+FAILURE_SURFACE_GRID_SIZE = 160
+FAILURE_SURFACE_MAX_SCATTER_POINTS_PER_CLASS = 1800
+FAILURE_SURFACE_3D_GRID_SIZE = 34
 MOMENT_EQUILIBRIUM_TOLERANCE_KNM = 1e-6
 DETERMINISTIC_RISK_WEIGHT_SEVERITY = 0.60
 DETERMINISTIC_RISK_WEIGHT_SENSITIVITY = 0.40
@@ -4750,6 +4765,5927 @@ def render_probabilistic_histogram_output_section(results_bundle: Dict,
         )
 
 
+def build_probabilistic_limit_state_physical_cloud_data(
+    analysis: Optional[PortalReliabilityAnalysis],
+    max_points_per_state: int = LIMIT_STATE_PHYSICAL_CLOUD_MAX_POINTS,
+    max_failed_points: int = LIMIT_STATE_PHYSICAL_CLOUD_MAX_FAILED_POINTS
+) -> Dict[str, Any]:
+    """Ringkas respons R/Q/g Monte Carlo untuk failure cloud di ruang fisik."""
+    if analysis is None or not analysis.is_probabilistic or not analysis.mc_results:
+        return {}
+
+    analysis_history = list(analysis.mc_results.get('max_forces_history', []) or [])
+    if not analysis_history:
+        return {}
+
+    state_specs = {
+        str(spec['key']): spec
+        for spec in get_probabilistic_limit_state_histogram_specs()
+    }
+    applicable_by_state = analysis._get_applicable_element_ids_by_limit_state()
+    elements: Dict[str, Dict[str, Any]] = {}
+
+    for limit_state, elem_ids in applicable_by_state.items():
+        spec = state_specs.get(str(limit_state))
+        if spec is None:
+            continue
+
+        for elem_id in sorted(int(value) for value in elem_ids):
+            responses = []
+            for analysis_result in analysis_history:
+                response = analysis._extract_limit_state_histogram_response(
+                    analysis_result,
+                    int(elem_id),
+                    str(limit_state)
+                )
+                if response:
+                    responses.append(response)
+
+            if not responses:
+                continue
+
+            r_values = np.asarray([float(item['R']) for item in responses], dtype=float)
+            q_values = np.asarray([float(item['Q']) for item in responses], dtype=float)
+            g_values = np.asarray([float(item['g']) for item in responses], dtype=float)
+            failure_mask = np.asarray(g_values < 0.0, dtype=bool)
+            sample_indices = np.arange(g_values.size, dtype=int)
+
+            selected_failed = downsample_index_array(
+                sample_indices[failure_mask],
+                min(int(max_failed_points), int(max_points_per_state))
+            )
+            remaining_capacity = max(int(max_points_per_state) - int(selected_failed.size), 0)
+            selected_safe = downsample_index_array(
+                sample_indices[~failure_mask],
+                remaining_capacity
+            )
+            selected_indices = np.sort(
+                np.concatenate([selected_failed, selected_safe]).astype(int)
+            )
+            if selected_indices.size == 0:
+                continue
+
+            element_code = get_element_code_from_input(analysis.data, int(elem_id))
+            element_entry = elements.setdefault(
+                str(int(elem_id)),
+                {
+                    'element_id': int(elem_id),
+                    'element_code': str(element_code),
+                    'element_type': get_element_type_label(element_code),
+                    'states': {}
+                }
+            )
+            element_entry['states'][str(limit_state)] = {
+                'limit_state': str(limit_state),
+                'limit_state_label': str(spec['label']),
+                'plot_label': str(spec.get('plot_label', spec['label'])),
+                'unit': str(spec.get('unit', '-')),
+                'color': str(spec.get('color', '#2563eb')),
+                'sample_count': int(g_values.size),
+                'failure_count': int(np.sum(failure_mask)),
+                'safe_count': int(np.sum(~failure_mask)),
+                'Pf_from_g': float(np.mean(failure_mask)),
+                'used_downsampling': bool(selected_indices.size < g_values.size),
+                'failed_points_truncated': bool(
+                    selected_failed.size < sample_indices[failure_mask].size
+                ),
+                'R': r_values[selected_indices].astype(float).tolist(),
+                'Q': q_values[selected_indices].astype(float).tolist(),
+                'g': g_values[selected_indices].astype(float).tolist(),
+                'failure_mask': failure_mask[selected_indices].astype(bool).tolist()
+            }
+
+    element_ids = sorted(
+        int(elem_id)
+        for elem_id, record in elements.items()
+        if (record or {}).get('states')
+    )
+    if not element_ids:
+        return {}
+
+    return {
+        'num_simulations': int(
+            analysis.mc_results.get('num_simulations', len(analysis_history))
+            or len(analysis_history)
+        ),
+        'analysis_failures': int(analysis.mc_results.get('analysis_failures', 0) or 0),
+        'element_ids': element_ids,
+        'elements': elements
+    }
+
+
+def resolve_axial_moment_plot_demand_axial(force_data: Optional[Dict[str, Any]],
+                                           controlling_state: Any) -> float:
+    """Tentukan aksial demand bertanda untuk plot `P-M`."""
+    axial_demands = get_axial_demands_from_force_data(force_data or {})
+    controlling_state_text = str(controlling_state or '').strip().lower()
+
+    if (
+        controlling_state_text == 'tension'
+        and axial_demands['tension'] > AXIAL_DEMAND_TOLERANCE_KN
+    ):
+        return -float(axial_demands['tension'])
+    if controlling_state_text == 'pure-bending':
+        return 0.0
+    if axial_demands['compression'] > AXIAL_DEMAND_TOLERANCE_KN:
+        return float(axial_demands['compression'])
+    if axial_demands['tension'] > AXIAL_DEMAND_TOLERANCE_KN:
+        return -float(axial_demands['tension'])
+    return 0.0
+
+
+def build_probabilistic_axial_moment_pm_cloud_data(
+    analysis: Optional[PortalReliabilityAnalysis],
+    max_points: int = AXIAL_MOMENT_PM_CLOUD_MAX_POINTS,
+    max_failed_points: int = AXIAL_MOMENT_PM_CLOUD_MAX_FAILED_POINTS
+) -> Dict[str, Any]:
+    """Bangun dataset Monte Carlo aksial-lentur pada ruang fisik `P-M`."""
+    if analysis is None or not analysis.is_probabilistic or not analysis.mc_results:
+        return {}
+
+    analysis_history = list(analysis.mc_results.get('max_forces_history', []) or [])
+    if not analysis_history:
+        return {}
+
+    applicable_element_ids = sorted(
+        int(elem_id)
+        for elem_id in (
+            analysis._get_applicable_element_ids_by_limit_state().get('axial_moment', [])
+            or []
+        )
+    )
+    if not applicable_element_ids:
+        return {}
+
+    elements: Dict[str, Dict[str, Any]] = {}
+    for elem_id in applicable_element_ids:
+        demand_moment_values = []
+        demand_axial_values = []
+        boundary_moment_values = []
+        boundary_axial_values = []
+        g_values = []
+        lambda_values = []
+
+        for analysis_result in analysis_history:
+            if not analysis_result:
+                continue
+
+            max_forces_entry = (
+                get_by_element_value(analysis_result.get('max_forces', {}), int(elem_id), {})
+                or {}
+            )
+            meta = (
+                get_by_element_value(
+                    analysis_result.get('performance_axial_moment_metadata', {}),
+                    int(elem_id),
+                    {}
+                ) or {}
+            )
+            g_value = get_by_element_value(
+                analysis_result.get('performance_axial_moment', {}),
+                int(elem_id),
+                None
+            )
+            demand_moment = coerce_finite_float(max_forces_entry.get('max_moment'))
+            boundary_moment = coerce_finite_float(meta.get('phi_Mn'))
+            boundary_axial = coerce_finite_float(meta.get('phi_Pn'))
+            lambda_value = coerce_finite_float(meta.get('lambda'))
+            g_numeric = coerce_finite_float(g_value)
+            if (
+                demand_moment is None
+                or boundary_moment is None
+                or boundary_axial is None
+                or lambda_value is None
+                or g_numeric is None
+            ):
+                continue
+
+            force_data = max_forces_entry.get('forces', {}) or {}
+            demand_axial = resolve_axial_moment_plot_demand_axial(
+                force_data,
+                meta.get('controlling_state')
+            )
+
+            demand_moment_values.append(abs(float(demand_moment)))
+            demand_axial_values.append(float(demand_axial))
+            boundary_moment_values.append(float(boundary_moment))
+            boundary_axial_values.append(float(boundary_axial))
+            g_values.append(float(g_numeric))
+            lambda_values.append(float(lambda_value))
+
+        if not g_values:
+            continue
+
+        demand_moment_array = np.asarray(demand_moment_values, dtype=float)
+        demand_axial_array = np.asarray(demand_axial_values, dtype=float)
+        boundary_moment_array = np.asarray(boundary_moment_values, dtype=float)
+        boundary_axial_array = np.asarray(boundary_axial_values, dtype=float)
+        g_array = np.asarray(g_values, dtype=float)
+        lambda_array = np.asarray(lambda_values, dtype=float)
+        failure_mask = np.asarray(g_array < 0.0, dtype=bool)
+        sample_indices = np.arange(g_array.size, dtype=int)
+
+        selected_failed = downsample_index_array(
+            sample_indices[failure_mask],
+            min(int(max_failed_points), int(max_points))
+        )
+        remaining_capacity = max(int(max_points) - int(selected_failed.size), 0)
+        selected_safe = downsample_index_array(
+            sample_indices[~failure_mask],
+            remaining_capacity
+        )
+        selected_indices = np.sort(
+            np.concatenate([selected_failed, selected_safe]).astype(int)
+        )
+        if selected_indices.size == 0:
+            continue
+
+        mean_curve_moment = []
+        mean_curve_axial = []
+        try:
+            section_inputs = get_section_capacity_inputs_from_input(analysis.data, int(elem_id))
+            mean_material = get_element_material_snapshot(
+                analysis.data,
+                latest_simulation=None,
+                is_probabilistic=True,
+                elem_id=int(elem_id)
+            )
+            mean_curve = PerformanceFunction._get_column_interaction_curve(
+                mean_material['fc'],
+                mean_material['fy_tarik'],
+                section_inputs['section_geometry'],
+                section_inputs['steel_area'],
+                fy_tekan=mean_material['fy_tekan'],
+                use_code_phi=False
+            )
+            mean_curve_moment = [
+                float(point['phi_Mn'])
+                for point in (mean_curve or [])
+                if coerce_finite_float(point.get('phi_Mn')) is not None
+                and coerce_finite_float(point.get('phi_Pn')) is not None
+            ]
+            mean_curve_axial = [
+                float(point['phi_Pn'])
+                for point in (mean_curve or [])
+                if coerce_finite_float(point.get('phi_Mn')) is not None
+                and coerce_finite_float(point.get('phi_Pn')) is not None
+            ]
+        except Exception:
+            mean_curve_moment = []
+            mean_curve_axial = []
+
+        elements[str(int(elem_id))] = {
+            'element_id': int(elem_id),
+            'sample_count': int(g_array.size),
+            'failure_count': int(np.sum(failure_mask)),
+            'safe_count': int(np.sum(~failure_mask)),
+            'Pf_from_g': float(np.mean(failure_mask)),
+            'used_downsampling': bool(selected_indices.size < g_array.size),
+            'failed_points_truncated': bool(
+                selected_failed.size < sample_indices[failure_mask].size
+            ),
+            'demand_moment': demand_moment_array[selected_indices].astype(float).tolist(),
+            'demand_axial': demand_axial_array[selected_indices].astype(float).tolist(),
+            'boundary_moment': boundary_moment_array[selected_indices].astype(float).tolist(),
+            'boundary_axial': boundary_axial_array[selected_indices].astype(float).tolist(),
+            'g': g_array[selected_indices].astype(float).tolist(),
+            'lambda': lambda_array[selected_indices].astype(float).tolist(),
+            'failure_mask': failure_mask[selected_indices].astype(bool).tolist(),
+            'mean_curve_moment': list(mean_curve_moment),
+            'mean_curve_axial': list(mean_curve_axial)
+        }
+
+    if not elements:
+        return {}
+
+    return {
+        'num_simulations': int(
+            analysis.mc_results.get('num_simulations', len(analysis_history))
+            or len(analysis_history)
+        ),
+        'analysis_failures': int(analysis.mc_results.get('analysis_failures', 0) or 0),
+        'element_ids': sorted(int(elem_id) for elem_id in elements.keys()),
+        'elements': elements
+    }
+
+
+def get_probabilistic_limit_state_physical_cloud_record(
+    physical_cloud_data: Dict[str, Any],
+    elem_id: int,
+    limit_state: str
+) -> Dict[str, Any]:
+    """Ambil record failure cloud ruang fisik per elemen-limit-state."""
+    element_record = (
+        (physical_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        or {}
+    )
+    return (
+        (element_record.get('states', {}) or {}).get(str(limit_state))
+        or {}
+    )
+
+
+def build_probabilistic_limit_state_physical_cloud_figure(
+    physical_cloud_data: Dict[str, Any],
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    elem_id: int
+) -> Optional[plt.Figure]:
+    """Bangun panel failure cloud di ruang fisik untuk empat limit state."""
+    state_specs = get_probabilistic_limit_state_histogram_specs()
+    fig, axes = plt.subplots(2, 2, figsize=(15.5, 10.9), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    plotted_any = False
+    element_reliability = element_reliability or {}
+
+    def build_nice_g_step(max_abs_value: float) -> float:
+        """Pilih langkah kontur `g` yang cukup bersih untuk dibaca."""
+        try:
+            numeric_value = abs(float(max_abs_value))
+        except (TypeError, ValueError):
+            numeric_value = 0.0
+        if not np.isfinite(numeric_value) or numeric_value <= 1e-12:
+            return 1.0
+
+        raw_step = numeric_value / 3.0
+        exponent = np.floor(np.log10(raw_step))
+        scale = 10.0 ** exponent
+        normalized = raw_step / scale
+        if normalized <= 1.0:
+            factor = 1.0
+        elif normalized <= 2.0:
+            factor = 2.0
+        elif normalized <= 5.0:
+            factor = 5.0
+        else:
+            factor = 10.0
+        return float(factor * scale)
+
+    def add_qr_g_contours(axis,
+                          x_limits: Tuple[float, float],
+                          y_limits: Tuple[float, float],
+                          g_samples: np.ndarray):
+        """Tambahkan latar kontur `g = R - Q` pada bidang `Q-R`."""
+        x_min, x_max = x_limits
+        y_min, y_max = y_limits
+        finite_g = np.asarray(g_samples, dtype=float)
+        finite_g = finite_g[np.isfinite(finite_g)]
+
+        max_abs_from_axes = max(
+            abs(float(y_min - x_max)),
+            abs(float(y_max - x_min)),
+            1e-9
+        )
+        max_abs_from_samples = float(np.max(np.abs(finite_g))) if finite_g.size else 0.0
+        max_abs_g = max(max_abs_from_axes, max_abs_from_samples, 1e-6)
+
+        grid_x = np.linspace(x_min, x_max, PHYSICAL_G_CONTOUR_GRID_SIZE)
+        grid_y = np.linspace(y_min, y_max, PHYSICAL_G_CONTOUR_GRID_SIZE)
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+        mesh_g = mesh_y - mesh_x
+
+        fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+        contour_fill = axis.contourf(
+            mesh_x,
+            mesh_y,
+            mesh_g,
+            levels=fill_levels,
+            cmap='RdYlBu',
+            alpha=0.10,
+            antialiased=True,
+            zorder=0
+        )
+
+        contour_step = build_nice_g_step(max_abs_g)
+        line_levels = contour_step * np.arange(-3, 4, dtype=float)
+        nonzero_levels = np.asarray(
+            [
+                value for value in line_levels
+                if (
+                    not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                    and abs(float(value)) <= max_abs_g * 1.02
+                )
+            ],
+            dtype=float
+        )
+        if nonzero_levels.size > 0:
+            contours = axis.contour(
+                mesh_x,
+                mesh_y,
+                mesh_g,
+                levels=np.sort(nonzero_levels),
+                colors='#64748b',
+                linewidths=0.65,
+                alpha=0.62,
+                linestyles='dashed',
+                zorder=1
+            )
+            axis.clabel(
+                contours,
+                inline=True,
+                fontsize=6.7,
+                fmt=lambda value: f"g={format_metric(value, 1)}"
+            )
+
+        axis.text(
+            0.02,
+            0.98,
+            "g = R - Q",
+            transform=axis.transAxes,
+            ha='left',
+            va='top',
+            fontsize=8.0,
+            color='#334155',
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='white',
+                alpha=0.82,
+                edgecolor='#cbd5e1'
+            )
+        )
+        return contour_fill
+
+    def add_lambda_g_contours(axis,
+                              x_limits: Tuple[float, float],
+                              y_limits: Tuple[float, float],
+                              g_samples: np.ndarray):
+        """Tambahkan latar kontur `g` pada bidang `lambda-g`."""
+        x_min, x_max = x_limits
+        y_min, y_max = y_limits
+        finite_g = np.asarray(g_samples, dtype=float)
+        finite_g = finite_g[np.isfinite(finite_g)]
+
+        max_abs_from_axes = max(abs(float(y_min)), abs(float(y_max)), 1e-9)
+        max_abs_from_samples = float(np.max(np.abs(finite_g))) if finite_g.size else 0.0
+        max_abs_g = max(max_abs_from_axes, max_abs_from_samples, 1e-6)
+
+        grid_x = np.linspace(x_min, x_max, PHYSICAL_G_CONTOUR_GRID_SIZE)
+        grid_y = np.linspace(y_min, y_max, PHYSICAL_G_CONTOUR_GRID_SIZE)
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+        mesh_g = mesh_y
+
+        fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+        contour_fill = axis.contourf(
+            mesh_x,
+            mesh_y,
+            mesh_g,
+            levels=fill_levels,
+            cmap='RdYlBu',
+            alpha=0.10,
+            antialiased=True,
+            zorder=0
+        )
+
+        contour_step = build_nice_g_step(max_abs_g)
+        line_levels = contour_step * np.arange(-3, 4, dtype=float)
+        nonzero_levels = np.asarray(
+            [
+                value for value in line_levels
+                if (
+                    not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                    and abs(float(value)) <= max_abs_g * 1.02
+                )
+            ],
+            dtype=float
+        )
+        if nonzero_levels.size > 0:
+            contours = axis.contour(
+                mesh_x,
+                mesh_y,
+                mesh_g,
+                levels=np.sort(nonzero_levels),
+                colors='#64748b',
+                linewidths=0.65,
+                alpha=0.62,
+                linestyles='dashed',
+                zorder=1
+            )
+            axis.clabel(
+                contours,
+                inline=True,
+                fontsize=6.7,
+                fmt=lambda value: f"g={format_metric(value, 1)}"
+            )
+
+        axis.text(
+            0.02,
+            0.98,
+            "g shown on Y-axis",
+            transform=axis.transAxes,
+            ha='left',
+            va='top',
+            fontsize=8.0,
+            color='#334155',
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='white',
+                alpha=0.82,
+                edgecolor='#cbd5e1'
+            )
+        )
+        return contour_fill
+
+    def add_g_colorbar(axis, contour_fill, unit_label: str) -> None:
+        """Tambahkan colorbar `g(x)` untuk subplot aktif."""
+        if contour_fill is None:
+            return
+        colorbar = fig.colorbar(
+            contour_fill,
+            ax=axis,
+            fraction=0.046,
+            pad=0.04
+        )
+        colorbar.ax.tick_params(labelsize=7)
+        colorbar.set_label(f"g(x) ({unit_label})", fontsize=8)
+
+    for axis, spec in zip(axes_list, state_specs):
+        record = get_probabilistic_limit_state_physical_cloud_record(
+            physical_cloud_data,
+            int(elem_id),
+            str(spec['key'])
+        )
+        plot_label = str(spec.get('plot_label', spec['label']))
+        if not record:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                (
+                    f"Data for {plot_label} in E{int(elem_id)}\n"
+                    "is unavailable or not applicable."
+                ),
+                ha='center',
+                va='center',
+                fontsize=10,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#f8fafc',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            axis.set_title(f"{plot_label} | Physical Failure Cloud", fontsize=10.5, pad=10)
+            continue
+
+        r_values = np.asarray(record.get('R', []), dtype=float)
+        q_values = np.asarray(record.get('Q', []), dtype=float)
+        g_values = np.asarray(record.get('g', []), dtype=float)
+        failure_mask = np.asarray(record.get('failure_mask', []), dtype=bool)
+        common_size = min(
+            int(r_values.size),
+            int(q_values.size),
+            int(g_values.size),
+            int(failure_mask.size)
+        )
+        if common_size <= 0:
+            axis.axis('off')
+            axis.set_title(f"{plot_label} | Physical Failure Cloud", fontsize=10.5, pad=10)
+            continue
+
+        r_values = r_values[:common_size]
+        q_values = q_values[:common_size]
+        g_values = g_values[:common_size]
+        failure_mask = failure_mask[:common_size]
+        safe_mask = ~failure_mask
+        axis.set_facecolor('#f8fafc')
+
+        if str(spec['key']) == 'axial_moment':
+            x_values = r_values
+            y_values = g_values
+            valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+            x_values = x_values[valid_mask]
+            y_values = y_values[valid_mask]
+            failure_values = failure_mask[valid_mask]
+            safe_values = ~failure_values
+
+            if np.any(safe_values):
+                axis.scatter(
+                    x_values[safe_values],
+                    y_values[safe_values],
+                    s=18,
+                    color=SAFE_CLOUD_COLOR,
+                    alpha=0.34,
+                    edgecolors='none',
+                    label=f"Safe ({int(np.sum(safe_values)):,})"
+                )
+            if np.any(failure_values):
+                axis.scatter(
+                    x_values[failure_values],
+                    y_values[failure_values],
+                    s=28,
+                    color='#dc2626',
+                    alpha=0.80,
+                    edgecolors='#ffffff',
+                    linewidths=0.25,
+                    label=f"Failed ({int(np.sum(failure_values)):,})"
+                )
+
+            x_limits = get_failure_cloud_axis_limits(x_values)
+            y_limits = get_failure_cloud_axis_limits(y_values)
+            line_x = np.linspace(x_limits[0], x_limits[1], 160)
+            axis.plot(
+                line_x,
+                line_x - 1.0,
+                color='#111827',
+                linestyle='-.',
+                linewidth=1.2,
+                alpha=0.9,
+                label='g(x) = lambda - 1'
+            )
+            axis.axvline(
+                1.0,
+                color='#111827',
+                linestyle='--',
+                linewidth=1.1,
+                alpha=0.9,
+                label='Failure Boundary lambda = 1'
+            )
+            axis.axhline(
+                0.0,
+                color='#475569',
+                linestyle=':',
+                linewidth=1.1,
+                alpha=0.95,
+                label='Failure Boundary g = 0'
+            )
+            x_mean = float(np.mean(x_values)) if x_values.size else None
+            y_mean = float(np.mean(y_values)) if y_values.size else None
+            x_label = 'Capacity Ratio, lambda (-)'
+            y_label = 'g(x) = lambda - 1 (-)'
+            axis.set_xlim(*x_limits)
+            axis.set_ylim(*y_limits)
+            contour_fill = add_lambda_g_contours(
+                axis,
+                x_limits=x_limits,
+                y_limits=y_limits,
+                g_samples=y_values
+            )
+            add_g_colorbar(
+                axis,
+                contour_fill,
+                unit_label='(-)'
+            )
+        else:
+            x_values = q_values
+            y_values = r_values
+            valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+            x_values = x_values[valid_mask]
+            y_values = y_values[valid_mask]
+            failure_values = failure_mask[valid_mask]
+            safe_values = ~failure_values
+
+            if np.any(safe_values):
+                axis.scatter(
+                    x_values[safe_values],
+                    y_values[safe_values],
+                    s=18,
+                    color=SAFE_CLOUD_COLOR,
+                    alpha=0.34,
+                    edgecolors='none',
+                    label=f"Safe ({int(np.sum(safe_values)):,})"
+                )
+            if np.any(failure_values):
+                axis.scatter(
+                    x_values[failure_values],
+                    y_values[failure_values],
+                    s=28,
+                    color='#dc2626',
+                    alpha=0.82,
+                    edgecolors='#ffffff',
+                    linewidths=0.25,
+                    label=f"Failed ({int(np.sum(failure_values)):,})"
+                )
+
+            axis_values = np.concatenate([x_values, y_values]) if x_values.size else np.asarray([], dtype=float)
+            axis_limits = get_failure_cloud_axis_limits(axis_values)
+            boundary_values = np.linspace(axis_limits[0], axis_limits[1], 160)
+            axis.plot(
+                boundary_values,
+                boundary_values,
+                color='#111827',
+                linestyle='--',
+                linewidth=1.15,
+                alpha=0.92,
+                label='Failure Boundary R = Q'
+            )
+            x_mean = float(np.mean(x_values)) if x_values.size else None
+            y_mean = float(np.mean(y_values)) if y_values.size else None
+            x_label = f"Demand Q ({record.get('unit', spec['unit'])})"
+            y_label = f"Capacity R ({record.get('unit', spec['unit'])})"
+            axis.set_xlim(*axis_limits)
+            axis.set_ylim(*axis_limits)
+            contour_fill = add_qr_g_contours(
+                axis,
+                x_limits=axis_limits,
+                y_limits=axis_limits,
+                g_samples=g_values[valid_mask]
+            )
+            add_g_colorbar(
+                axis,
+                contour_fill,
+                unit_label=str(record.get('unit', spec['unit']))
+            )
+
+        if x_mean is not None and y_mean is not None:
+            axis.scatter(
+                [x_mean],
+                [y_mean],
+                marker='x',
+                s=70,
+                color='#0f172a',
+                linewidths=1.5,
+                label='Sample Mean'
+            )
+
+        reliability_record = get_by_element_value(
+            element_reliability.get(str(spec['key']), {}),
+            int(elem_id),
+            {}
+        ) or {}
+        pf_value = coerce_finite_float(reliability_record.get('Pf'))
+        beta_value = reliability_record.get('Beta')
+        beta_text = format_metric(beta_value, 4)
+        pf_text = format_metric(pf_value, 6) if pf_value is not None else '-'
+
+        axis.set_title(f"{plot_label} | Physical Failure Cloud", fontsize=10.5, pad=10)
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.grid(True, alpha=0.22, linestyle='--')
+        axis.legend(loc='best', fontsize=7.8)
+        axis.text(
+            0.98,
+            0.96,
+            (
+                f"Valid N = {int(record.get('sample_count', 0))}\n"
+                f"Failures = {int(record.get('failure_count', 0))}\n"
+                f"Pf(valid) = {float(record.get('Pf_from_g', 0.0)):.4f}\n"
+                f"Beta(table) = {beta_text}\n"
+                f"Pf(table) = {pf_text}"
+            ),
+            transform=axis.transAxes,
+            ha='right',
+            va='top',
+            fontsize=8.2,
+            bbox=dict(
+                boxstyle='round,pad=0.25',
+                facecolor='white',
+                alpha=0.90,
+                edgecolor='#cbd5e1'
+            )
+        )
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Failure Cloud di Ruang Fisik | Element E{int(elem_id)}",
+        fontsize=13,
+        y=0.99
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.975])
+    return fig
+
+
+def build_probabilistic_limit_state_physical_cloud_summary_df(
+    physical_cloud_data: Dict[str, Any],
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    elem_id: int
+) -> pd.DataFrame:
+    """Ringkas statistik failure cloud fisik dan kaitannya dengan Beta tabel."""
+    rows = []
+    element_reliability = element_reliability or {}
+
+    for spec in get_probabilistic_limit_state_histogram_specs():
+        record = get_probabilistic_limit_state_physical_cloud_record(
+            physical_cloud_data,
+            int(elem_id),
+            str(spec['key'])
+        )
+        if not record:
+            continue
+
+        r_values = np.asarray(record.get('R', []), dtype=float)
+        q_values = np.asarray(record.get('Q', []), dtype=float)
+        g_values = np.asarray(record.get('g', []), dtype=float)
+        reliability_record = get_by_element_value(
+            element_reliability.get(str(spec['key']), {}),
+            int(elem_id),
+            {}
+        ) or {}
+
+        rows.append({
+            'Limit State': record.get('limit_state_label', spec['label']),
+            'Bidang Fisik': (
+                'lambda vs g(x)'
+                if str(spec['key']) == 'axial_moment' else
+                'Q vs R'
+            ),
+            'Satuan': record.get('unit', spec['unit']),
+            'Jumlah Sampel Valid (-)': record.get('sample_count'),
+            'Jumlah Gagal Valid (-)': record.get('failure_count'),
+            'Pf dari Cloud Valid (-)': record.get('Pf_from_g'),
+            'Pf Tabel Reliability (-)': reliability_record.get('Pf'),
+            'Beta Tabel Reliability (-)': reliability_record.get('Beta'),
+            'Mean R': float(np.mean(r_values)) if r_values.size else None,
+            'Mean Q': float(np.mean(q_values)) if q_values.size else None,
+            'Mean g(x)': float(np.mean(g_values)) if g_values.size else None
+        })
+
+    return pd.DataFrame(rows)
+
+
+def render_probabilistic_limit_state_physical_failure_cloud_section(
+    physical_cloud_data: Dict[str, Any],
+    axial_moment_pm_cloud_data: Dict[str, Any],
+    results_bundle: Dict[str, Any],
+    input_data: Optional[Dict],
+    heading_level: str = "####"
+) -> None:
+    """Tampilkan failure cloud Monte Carlo di ruang fisik per limit-state."""
+    available_element_ids = list((physical_cloud_data or {}).get('element_ids', []) or [])
+    if not available_element_ids:
+        st.info(
+            "Failure cloud ruang fisik belum tersedia. Jalankan analisis probabilistik "
+            "agar respons `R/Q/g(x)` per limit state dapat diproyeksikan."
+        )
+        return
+
+    st.markdown(f"{heading_level} Failure Cloud di Ruang Fisik")
+    st.caption(
+        "Bagian ini menggambarkan sebaran sampel Monte Carlo langsung di ruang fisik respons."
+    )
+    st.caption(
+        "Untuk lentur, geser, dan aksial, panel memakai pasangan `Q-R` dengan batas gagal "
+        "`R = Q`, sehingga `g(x) = R - Q` terbaca langsung dari posisi titik terhadap diagonal. "
+        "Kontur `iso-g` ringan dan `colorbar g(x)` juga ditampilkan pada bidang ini."
+    )
+    st.caption(
+        "Untuk aksial-lentur, panel memakai `lambda` vs `g(x)` karena pada tabel reliability "
+        "cek ini dinormalisasi sebagai `g(x) = lambda - 1` dengan `Q = 1`, sehingga `g` "
+        "sudah tampil langsung pada sumbu vertikal dan diperkuat dengan `colorbar g(x)`."
+    )
+    st.caption(
+        "Nilai `Beta` ditampilkan sebagai anotasi hasil Monte Carlo pada tabel reliability. "
+        "Secara geometrik, `Beta` adalah jarak di ruang normal baku, bukan jarak di bidang fisik ini."
+    )
+
+    selected_element_id = st.selectbox(
+        "Pilih elemen untuk failure cloud ruang fisik",
+        options=available_element_ids,
+        format_func=lambda elem_id: (
+            f"E{int(elem_id)} | "
+            f"{get_element_type_label(get_element_code_from_input(input_data, int(elem_id)))}"
+        ),
+        key="physical_failure_cloud_element_selector"
+    )
+
+    element_record = (
+        (physical_cloud_data or {}).get('elements', {}).get(str(int(selected_element_id)))
+        or {}
+    )
+    state_records = list((element_record.get('states', {}) or {}).values())
+    downsampled_labels = [
+        str(record.get('limit_state_label', '-'))
+        for record in state_records
+        if bool(record.get('used_downsampling'))
+    ]
+    truncated_failed_labels = [
+        str(record.get('limit_state_label', '-'))
+        for record in state_records
+        if bool(record.get('failed_points_truncated'))
+    ]
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Elemen Terpilih", f"E{int(selected_element_id)}")
+    metric_cols[1].metric("Limit State Tersedia", str(len(state_records)))
+    metric_cols[2].metric(
+        "Jumlah Simulasi",
+        format_metric_comma((physical_cloud_data or {}).get('num_simulations'), 0)
+    )
+    metric_cols[3].metric(
+        "Analisis Gagal",
+        format_metric_comma((physical_cloud_data or {}).get('analysis_failures'), 0)
+    )
+
+    if downsampled_labels:
+        st.caption(
+            "State berikut memakai subset titik agar dashboard tetap ringan: "
+            + ", ".join(f"`{label}`" for label in downsampled_labels)
+        )
+    if truncated_failed_labels:
+        st.caption(
+            "Jumlah titik gagal yang dipadatkan secara khusus terjadi pada: "
+            + ", ".join(f"`{label}`" for label in truncated_failed_labels)
+        )
+
+    physical_cloud_fig = build_probabilistic_limit_state_physical_cloud_figure(
+        physical_cloud_data,
+        (results_bundle or {}).get('element_reliability', {}),
+        int(selected_element_id)
+    )
+    if physical_cloud_fig is not None:
+        render_plot(
+            physical_cloud_fig,
+            interactive=True,
+            viewer_key=f"physical-failure-cloud-e{int(selected_element_id)}",
+            alt_text=f"Failure cloud ruang fisik elemen {int(selected_element_id)}",
+            viewer_height=900,
+            download_basename=f"failure-cloud-ruang-fisik-e{int(selected_element_id)}"
+        )
+    else:
+        st.info("Failure cloud ruang fisik untuk elemen terpilih belum dapat dibentuk.")
+
+    render_physical_limit_state_function_map_section(
+        physical_cloud_data=physical_cloud_data,
+        results_bundle=results_bundle,
+        input_data=input_data,
+        elem_id=int(selected_element_id),
+        heading_level=heading_level
+    )
+
+    render_probabilistic_axial_moment_pm_cloud_section(
+        axial_moment_pm_cloud_data=axial_moment_pm_cloud_data or {},
+        element_reliability=(results_bundle or {}).get('element_reliability', {}),
+        input_data=input_data,
+        elem_id=int(selected_element_id),
+        heading_level=heading_level
+    )
+
+    summary_df = build_probabilistic_limit_state_physical_cloud_summary_df(
+        physical_cloud_data,
+        (results_bundle or {}).get('element_reliability', {}),
+        int(selected_element_id)
+    )
+    st.markdown(f"{heading_level} Ringkasan Failure Cloud Fisik")
+    st.caption(
+        "Tabel ini merangkum ukuran cloud fisik dan mempertemukannya dengan `Pf/Beta` "
+        "yang muncul pada menu `Output Reliability`."
+    )
+    if summary_df.empty:
+        st.info("Ringkasan failure cloud fisik untuk elemen terpilih belum tersedia.")
+    else:
+        render_input_table(
+            summary_df,
+            styler=style_input_dataframe(
+                summary_df,
+                table_min_width_px=1500
+            )
+        )
+
+
+def fit_physical_signed_margin_quadratic_surface(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    g_values: np.ndarray,
+    boundary_x: Optional[np.ndarray] = None,
+    boundary_y: Optional[np.ndarray] = None,
+    max_training_points: int = FAILURE_SURFACE_MAX_CLASS_POINTS,
+    boundary_weight: float = 3.0
+) -> Optional[Dict[str, Any]]:
+    """Fit surrogate kuadratik `g_hat(x)` pada ruang fisik dua dimensi."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    g_array = np.asarray(g_values, dtype=float).reshape(-1)
+    common_size = min(int(x_array.size), int(y_array.size), int(g_array.size))
+    if common_size < 6:
+        return None
+
+    x_array = x_array[:common_size]
+    y_array = y_array[:common_size]
+    g_array = g_array[:common_size]
+    valid_mask = np.isfinite(x_array) & np.isfinite(y_array) & np.isfinite(g_array)
+    if int(np.sum(valid_mask)) < 6:
+        return None
+
+    x_array = x_array[valid_mask]
+    y_array = y_array[valid_mask]
+    g_array = g_array[valid_mask]
+    sample_indices = downsample_index_array(
+        np.arange(x_array.size, dtype=int),
+        int(max_training_points)
+    )
+    x_train = x_array[sample_indices]
+    y_train = y_array[sample_indices]
+    g_train = g_array[sample_indices]
+
+    boundary_train_x = np.asarray([], dtype=float)
+    boundary_train_y = np.asarray([], dtype=float)
+    if boundary_x is not None and boundary_y is not None:
+        boundary_x_array = np.asarray(boundary_x, dtype=float).reshape(-1)
+        boundary_y_array = np.asarray(boundary_y, dtype=float).reshape(-1)
+        boundary_size = min(int(boundary_x_array.size), int(boundary_y_array.size))
+        if boundary_size > 0:
+            boundary_x_array = boundary_x_array[:boundary_size]
+            boundary_y_array = boundary_y_array[:boundary_size]
+            boundary_valid = np.isfinite(boundary_x_array) & np.isfinite(boundary_y_array)
+            boundary_x_array = boundary_x_array[boundary_valid]
+            boundary_y_array = boundary_y_array[boundary_valid]
+            if boundary_x_array.size > 0:
+                boundary_indices = downsample_index_array(
+                    np.arange(boundary_x_array.size, dtype=int),
+                    int(max_training_points)
+                )
+                boundary_train_x = boundary_x_array[boundary_indices]
+                boundary_train_y = boundary_y_array[boundary_indices]
+
+    combined_x = np.concatenate([x_train, boundary_train_x])
+    combined_y = np.concatenate([y_train, boundary_train_y])
+    if combined_x.size < 6 or combined_y.size < 6:
+        return None
+
+    x_center = float(np.mean(combined_x))
+    y_center = float(np.mean(combined_y))
+    x_scale = max(float(np.std(combined_x)), float(np.ptp(combined_x)) / 2.0, 1e-6)
+    y_scale = max(float(np.std(combined_y)), float(np.ptp(combined_y)) / 2.0, 1e-6)
+
+    x_train_scaled = (x_train - x_center) / x_scale
+    y_train_scaled = (y_train - y_center) / y_scale
+    demand_features = build_failure_surface_polynomial_features(
+        x_train_scaled,
+        y_train_scaled
+    )
+    targets = g_train.astype(float)
+    weights = np.ones_like(targets, dtype=float)
+
+    if boundary_train_x.size > 0:
+        boundary_x_scaled = (boundary_train_x - x_center) / x_scale
+        boundary_y_scaled = (boundary_train_y - y_center) / y_scale
+        boundary_features = build_failure_surface_polynomial_features(
+            boundary_x_scaled,
+            boundary_y_scaled
+        )
+        demand_features = np.vstack([demand_features, boundary_features])
+        targets = np.concatenate([
+            targets,
+            np.zeros(boundary_features.shape[0], dtype=float)
+        ])
+        weights = np.concatenate([
+            weights,
+            np.full(boundary_features.shape[0], float(boundary_weight), dtype=float)
+        ])
+
+    sqrt_weights = np.sqrt(np.asarray(weights, dtype=float))
+    weighted_features = demand_features * sqrt_weights[:, np.newaxis]
+    weighted_targets = targets * sqrt_weights
+    ridge_lambda = 1e-3
+
+    try:
+        lhs = (
+            weighted_features.T @ weighted_features
+            + ridge_lambda * np.eye(weighted_features.shape[1], dtype=float)
+        )
+        rhs = weighted_features.T @ weighted_targets
+        coefficients = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        try:
+            coefficients = np.linalg.lstsq(
+                weighted_features,
+                weighted_targets,
+                rcond=None
+            )[0]
+        except Exception:
+            return None
+
+    fitted_values = np.asarray(
+        build_failure_surface_polynomial_features(
+            x_train_scaled,
+            y_train_scaled
+        ) @ coefficients,
+        dtype=float
+    )
+    if not np.any(np.isfinite(fitted_values)):
+        return None
+
+    return {
+        'coefficients': np.asarray(coefficients, dtype=float),
+        'x_center': float(x_center),
+        'y_center': float(y_center),
+        'x_scale': float(x_scale),
+        'y_scale': float(y_scale),
+        'fitted_min': float(np.nanmin(fitted_values)),
+        'fitted_max': float(np.nanmax(fitted_values)),
+        'method': 'quadratic-ridge'
+    }
+
+
+def evaluate_physical_signed_margin_surface_grid(
+    model: Optional[Dict[str, Any]],
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    grid_size: int = PHYSICAL_G_CONTOUR_GRID_SIZE
+) -> Optional[Dict[str, Any]]:
+    """Evaluasi surrogate `g_hat(x)` pada grid ruang fisik 2D."""
+    if not model:
+        return None
+
+    coefficients = np.asarray(model.get('coefficients', []), dtype=float).reshape(-1)
+    if coefficients.size != 6 or not np.all(np.isfinite(coefficients)):
+        return None
+
+    x_center = coerce_finite_float(model.get('x_center'))
+    y_center = coerce_finite_float(model.get('y_center'))
+    x_scale = coerce_finite_float(model.get('x_scale'))
+    y_scale = coerce_finite_float(model.get('y_scale'))
+    if None in {x_center, y_center, x_scale, y_scale}:
+        return None
+
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(float(x_limits[0]), float(x_limits[1]), int(grid_size)),
+        np.linspace(float(y_limits[0]), float(y_limits[1]), int(grid_size))
+    )
+    grid_x_scaled = (grid_x - float(x_center)) / max(float(x_scale), 1e-6)
+    grid_y_scaled = (grid_y - float(y_center)) / max(float(y_scale), 1e-6)
+    grid_features = build_failure_surface_polynomial_features(
+        np.asarray(grid_x_scaled, dtype=float).ravel(),
+        np.asarray(grid_y_scaled, dtype=float).ravel()
+    )
+    grid_g = np.asarray(grid_features @ coefficients, dtype=float).reshape(grid_x.shape)
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+
+    return {
+        'grid_x': np.asarray(grid_x, dtype=float),
+        'grid_y': np.asarray(grid_y, dtype=float),
+        'grid_g': np.asarray(grid_g, dtype=float),
+        'g_min': float(np.min(finite_g)),
+        'g_max': float(np.max(finite_g)),
+        'method': str(model.get('method', 'quadratic-ridge') or 'quadratic-ridge')
+    }
+
+
+def add_physical_signed_margin_contours(
+    axis,
+    surface_grid: Optional[Dict[str, Any]],
+    max_abs_g: Optional[float] = None
+):
+    """Tambahkan latar kontur `g_hat(x)` dan garis nol pada axis fisik."""
+    if not surface_grid:
+        return None
+
+    grid_x = np.asarray(surface_grid.get('grid_x', []), dtype=float)
+    grid_y = np.asarray(surface_grid.get('grid_y', []), dtype=float)
+    grid_g = np.asarray(surface_grid.get('grid_g', []), dtype=float)
+    if grid_x.size == 0 or grid_y.size == 0 or grid_g.size == 0:
+        return None
+
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+
+    max_abs_value = (
+        float(max_abs_g)
+        if max_abs_g is not None and np.isfinite(float(max_abs_g))
+        else float(np.max(np.abs(finite_g)))
+    )
+    max_abs_value = max(max_abs_value, 1e-6)
+
+    fill_levels = np.linspace(-max_abs_value, max_abs_value, 19)
+    contour_fill = axis.contourf(
+        grid_x,
+        grid_y,
+        grid_g,
+        levels=fill_levels,
+        cmap='RdYlBu',
+        alpha=0.14,
+        antialiased=True,
+        zorder=0
+    )
+    contour_step = build_nice_contour_step(max_abs_value)
+    nonzero_levels = np.asarray(
+        [
+            value for value in (
+                contour_step * np.arange(-4, 5, dtype=float)
+            )
+            if (
+                not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                and abs(float(value)) <= max_abs_value * 1.02
+            )
+        ],
+        dtype=float
+    )
+    if nonzero_levels.size > 0:
+        axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=np.sort(nonzero_levels),
+            colors='#64748b',
+            linewidths=0.60,
+            alpha=0.42,
+            linestyles='dashed',
+            zorder=1
+        )
+    if float(np.min(finite_g)) <= 0.0 <= float(np.max(finite_g)):
+        axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=[0.0],
+            colors=[PHYSICAL_NONLINEAR_CONTOUR_COLOR],
+            linewidths=2.2,
+            zorder=2
+        )
+    return contour_fill
+
+
+def get_physical_limit_state_function_map_specs() -> List[Dict[str, str]]:
+    """Spesifikasi subplot peta fungsi limit-state pada ruang variabel fisik."""
+    return [
+        {
+            'key': 'moment',
+            'label': 'Flexure',
+            'x_var': 'fc',
+            'y_var': 'fy_tarik',
+            'x_label': "Concrete strength fc' (MPa)",
+            'y_label': "Tensile steel strength fy (MPa)",
+            'demand_label': 'Moment demand Md',
+            'unit': 'kN.m'
+        },
+        {
+            'key': 'shear',
+            'label': 'Shear',
+            'x_var': 'fc',
+            'y_var': 'fy_geser',
+            'x_label': "Concrete strength fc' (MPa)",
+            'y_label': "Shear steel strength fy (MPa)",
+            'demand_label': 'Shear demand Vd',
+            'unit': 'kN'
+        },
+        {
+            'key': 'axial',
+            'label': 'Axial',
+            'x_var': 'fc',
+            'y_var': 'fy_tarik',
+            'x_label': "Concrete strength fc' (MPa)",
+            'y_label': "Steel strength fy (MPa)",
+            'demand_label': 'Axial demand Pd',
+            'unit': 'kN'
+        }
+    ]
+
+
+def get_physical_limit_state_demand_material_map_specs() -> List[Dict[str, str]]:
+    """Spesifikasi subplot peta fungsi limit-state pada ruang demand-material."""
+    return [
+        {
+            'key': 'moment',
+            'label': 'Flexure',
+            'material_var': 'fc',
+            'x_label': 'Moment demand Md (kN.m)',
+            'y_label': "Concrete strength fc' (MPa)",
+            'unit': 'kN.m'
+        },
+        {
+            'key': 'shear',
+            'label': 'Shear',
+            'material_var': 'fc',
+            'x_label': 'Shear demand Vd (kN)',
+            'y_label': "Concrete strength fc' (MPa)",
+            'unit': 'kN'
+        },
+        {
+            'key': 'axial',
+            'label': 'Axial',
+            'material_var': 'fc',
+            'x_label': 'Axial demand Pd (kN)',
+            'y_label': "Concrete strength fc' (MPa)",
+            'unit': 'kN'
+        }
+    ]
+
+
+def get_physical_limit_state_material_stat(input_data: Dict,
+                                           elem_id: int,
+                                           variable_key: str) -> Optional[Dict[str, Any]]:
+    """Ambil statistik mean/stddev variabel fisik per elemen dari input."""
+    elem_id = int(elem_id)
+    if variable_key == 'fc':
+        concrete_props = get_by_element_value(
+            input_data.get('concrete', {}).get('by_element', {}),
+            elem_id,
+            {}
+        ) or {}
+        mean_value = read_positive_number(concrete_props.get('mean'))
+        stddev_value = read_positive_number(concrete_props.get('stddev'))
+        if mean_value <= 0.0:
+            return None
+        return {
+            'key': 'fc',
+            'mean': float(mean_value),
+            'stddev': float(stddev_value),
+            'unit': 'MPa'
+        }
+
+    steel_props = get_by_element_value(
+        input_data.get('steel', {}).get('by_element', {}),
+        elem_id,
+        {}
+    ) or {}
+    if variable_key == 'fy_tarik':
+        mean_value = read_positive_number(steel_props.get('tarik_mean'))
+        stddev_value = read_positive_number(steel_props.get('tarik_stddev'))
+    elif variable_key == 'fy_tekan':
+        mean_value = read_positive_number(steel_props.get('tekan_mean'))
+        stddev_value = read_positive_number(steel_props.get('tekan_stddev'))
+    elif variable_key == 'fy_geser':
+        mean_value = read_positive_number(
+            steel_props.get('geser_mean', steel_props.get('tarik_mean'))
+        )
+        stddev_value = read_positive_number(
+            steel_props.get('geser_stddev', steel_props.get('tarik_stddev'))
+        )
+    else:
+        return None
+
+    if mean_value <= 0.0:
+        return None
+    return {
+        'key': str(variable_key),
+        'mean': float(mean_value),
+        'stddev': float(stddev_value),
+        'unit': 'MPa'
+    }
+
+
+def build_physical_limit_state_variable_limits(stat: Optional[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
+    """Bangun rentang sumbu untuk variabel fisik dari mean/stddev input."""
+    if not stat:
+        return None
+    mean_value = coerce_finite_float(stat.get('mean'))
+    stddev_value = coerce_finite_float(stat.get('stddev'))
+    if mean_value is None or mean_value <= 0.0:
+        return None
+
+    effective_std = (
+        float(stddev_value)
+        if stddev_value is not None and stddev_value > 0.0 else
+        max(0.08 * float(mean_value), 1e-6)
+    )
+    lower_limit = max(float(mean_value) - 3.0 * effective_std, 0.15 * float(mean_value), 1e-6)
+    upper_limit = max(
+        float(mean_value) + 3.0 * effective_std,
+        lower_limit + max(0.25 * float(mean_value), effective_std, 1e-6)
+    )
+    return float(lower_limit), float(upper_limit)
+
+
+def get_mean_limit_state_demand_from_record(record: Dict[str, Any]) -> Optional[float]:
+    """Ambil demand rata-rata dari record failure cloud fisik per limit-state."""
+    q_values = np.asarray((record or {}).get('Q', []), dtype=float)
+    q_values = q_values[np.isfinite(q_values)]
+    if q_values.size == 0:
+        return None
+    return float(np.mean(q_values))
+
+
+def get_physical_limit_state_response_stat(record: Dict[str, Any],
+                                           response_key: str) -> Optional[Dict[str, Any]]:
+    """Ambil statistik respons valid `R`/`Q` dari record failure cloud fisik."""
+    response_values = np.asarray((record or {}).get(str(response_key), []), dtype=float)
+    response_values = response_values[np.isfinite(response_values)]
+    if response_values.size == 0:
+        return None
+    return {
+        'mean': float(np.mean(response_values)),
+        'stddev': float(np.std(response_values)),
+        'min': float(np.min(response_values)),
+        'max': float(np.max(response_values))
+    }
+
+
+def get_physical_limit_state_demand_stat(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Ambil statistik demand valid dari record failure cloud fisik."""
+    return get_physical_limit_state_response_stat(record, 'Q')
+
+
+def get_physical_limit_state_capacity_stat(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Ambil statistik kapasitas valid dari record failure cloud fisik."""
+    return get_physical_limit_state_response_stat(record, 'R')
+
+
+def build_physical_limit_state_response_limits(response_stat: Optional[Dict[str, Any]]
+                                               ) -> Optional[Tuple[float, float]]:
+    """Bangun rentang sumbu respons `R`/`Q` dari cloud fisik valid."""
+    if not response_stat:
+        return None
+    response_mean = coerce_finite_float(response_stat.get('mean'))
+    response_std = coerce_finite_float(response_stat.get('stddev'))
+    response_min = coerce_finite_float(response_stat.get('min'))
+    response_max = coerce_finite_float(response_stat.get('max'))
+    if None in {response_mean, response_min, response_max}:
+        return None
+
+    if response_std is None or response_std <= 0.0:
+        response_std = max(0.08 * max(float(response_mean), 1.0), 1e-6)
+    lower_limit = max(
+        min(float(response_min), float(response_mean) - 3.0 * float(response_std)),
+        0.0
+    )
+    upper_limit = max(
+        max(float(response_max), float(response_mean) + 3.0 * float(response_std)),
+        lower_limit + max(0.20 * max(float(response_mean), 1.0), float(response_std), 1e-6)
+    )
+    if np.isclose(lower_limit, upper_limit, atol=1e-12, rtol=1e-9):
+        upper_limit = lower_limit + max(0.20 * max(float(response_mean), 1.0), 1e-6)
+    return float(lower_limit), float(upper_limit)
+
+
+def build_physical_limit_state_demand_limits(demand_stat: Optional[Dict[str, Any]]
+                                             ) -> Optional[Tuple[float, float]]:
+    """Bangun rentang sumbu demand dari cloud fisik valid."""
+    return build_physical_limit_state_response_limits(demand_stat)
+
+
+def get_physical_limit_state_custom_axis_specs(limit_state: str) -> List[Dict[str, str]]:
+    """Daftar sumbu yang bisa dipilih untuk peta custom per limit-state."""
+    limit_state_key = str(limit_state).strip().lower()
+    if limit_state_key == 'moment':
+        return [
+            {
+                'key': 'Q',
+                'label': 'Q: Moment demand Md',
+                'short_label': 'Q = Md',
+                'axis_label': 'Q: Moment demand Md (kN.m)',
+                'kind': 'demand',
+                'unit': 'kN.m'
+            },
+            {
+                'key': 'R',
+                'label': 'R: Flexural capacity',
+                'short_label': 'R',
+                'axis_label': 'R: Flexural capacity (kN.m)',
+                'kind': 'capacity',
+                'unit': 'kN.m'
+            },
+            {
+                'key': 'fc',
+                'label': "Concrete strength fc'",
+                'short_label': "fc'",
+                'axis_label': "Concrete strength fc' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tarik',
+                'label': 'Tensile steel strength fy',
+                'short_label': 'fy',
+                'axis_label': 'Tensile steel strength fy (MPa)',
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tekan',
+                'label': "Compressive steel strength fy'",
+                'short_label': "fy'",
+                'axis_label': "Compressive steel strength fy' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            }
+        ]
+    if limit_state_key == 'shear':
+        return [
+            {
+                'key': 'Q',
+                'label': 'Q: Shear demand Vd',
+                'short_label': 'Q = Vd',
+                'axis_label': 'Q: Shear demand Vd (kN)',
+                'kind': 'demand',
+                'unit': 'kN'
+            },
+            {
+                'key': 'R',
+                'label': 'R: Shear capacity',
+                'short_label': 'R',
+                'axis_label': 'R: Shear capacity (kN)',
+                'kind': 'capacity',
+                'unit': 'kN'
+            },
+            {
+                'key': 'fc',
+                'label': "Concrete strength fc'",
+                'short_label': "fc'",
+                'axis_label': "Concrete strength fc' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_geser',
+                'label': 'Shear steel strength fy',
+                'short_label': 'fy_shear',
+                'axis_label': 'Shear steel strength fy (MPa)',
+                'kind': 'material',
+                'unit': 'MPa'
+            }
+        ]
+    if limit_state_key == 'axial':
+        return [
+            {
+                'key': 'Q',
+                'label': 'Q: Axial demand Pd',
+                'short_label': 'Q = Pd',
+                'axis_label': 'Q: Axial demand Pd (kN)',
+                'kind': 'demand',
+                'unit': 'kN'
+            },
+            {
+                'key': 'R',
+                'label': 'R: Axial capacity',
+                'short_label': 'R',
+                'axis_label': 'R: Axial capacity (kN)',
+                'kind': 'capacity',
+                'unit': 'kN'
+            },
+            {
+                'key': 'fc',
+                'label': "Concrete strength fc'",
+                'short_label': "fc'",
+                'axis_label': "Concrete strength fc' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tarik',
+                'label': 'Tensile steel strength fy',
+                'short_label': 'fy',
+                'axis_label': 'Tensile steel strength fy (MPa)',
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tekan',
+                'label': "Compressive steel strength fy'",
+                'short_label': "fy'",
+                'axis_label': "Compressive steel strength fy' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            }
+        ]
+    return []
+
+
+def evaluate_physical_limit_state_capacity_value(limit_state: str,
+                                                 section_inputs: Dict[str, Dict],
+                                                 fc_value: float,
+                                                 fy_tarik_value: float,
+                                                 fy_tekan_value: float,
+                                                 fy_geser_value: float,
+                                                 axial_branch: str = 'compression'
+                                                 ) -> Optional[float]:
+    """Hitung kapasitas exact `R` untuk satu limit-state pada snapshot fisik tertentu."""
+    try:
+        if limit_state == 'moment':
+            return float(
+                PerformanceFunction._get_moment_capacity(
+                    fc_value,
+                    fy_tarik_value,
+                    section_inputs['section_geometry'],
+                    section_inputs['steel_area'],
+                    fy_tekan=fy_tekan_value,
+                    use_code_phi=False
+                )
+            )
+        if limit_state == 'shear':
+            response = PerformanceFunction._get_shear_capacity_check_result(
+                0.0,
+                fc_value,
+                fy_geser_value,
+                section_inputs['section_geometry'],
+                section_inputs['steel_area'].get('As_shear', 0.0),
+                shear_spacing=section_inputs['steel_area'].get('shear_spacing', 0.0),
+                use_code_phi=False
+            )
+            return coerce_finite_float(response.get('phi_Vn'))
+        if limit_state == 'axial':
+            phi_pn_tekan, phi_pn_tarik = PerformanceFunction._get_axial_capacities(
+                fc_value,
+                fy_tarik_value,
+                section_inputs['section_geometry'],
+                section_inputs['steel_area'],
+                fy_tekan=fy_tekan_value,
+                use_code_phi=False
+            )
+            if str(axial_branch).strip().lower() == 'tension':
+                return float(phi_pn_tarik)
+            return float(phi_pn_tekan)
+    except Exception:
+        return None
+    return None
+
+
+def build_physical_limit_state_custom_axis_note(limit_state: str,
+                                                axis_specs: List[Dict[str, str]],
+                                                selected_axis_keys: Tuple[str, str],
+                                                reference_values: Dict[str, float],
+                                                axial_branch: str = 'compression') -> str:
+    """Catatan singkat tentang variabel yang ditahan pada nilai mean referensi."""
+    selected_keys = {str(value) for value in selected_axis_keys}
+    note_parts = []
+
+    if 'Q' not in selected_keys:
+        q_value = coerce_finite_float(reference_values.get('Q'))
+        q_spec = next((spec for spec in axis_specs if str(spec['key']) == 'Q'), None)
+        if q_value is not None and q_spec is not None:
+            note_parts.append(
+                f"{q_spec['short_label']} = {q_value:.2f} {q_spec['unit']}"
+            )
+
+    for spec in axis_specs:
+        spec_key = str(spec['key'])
+        if spec_key in selected_keys or str(spec.get('kind')) != 'material':
+            continue
+        reference_value = coerce_finite_float(reference_values.get(spec_key))
+        if reference_value is None:
+            continue
+        note_parts.append(
+            f"{spec['short_label']} = {reference_value:.1f} {spec['unit']}"
+        )
+
+    if limit_state == 'axial':
+        note_parts.append(
+            f"Branch: {str(axial_branch).replace('-', ' ').title()}"
+        )
+
+    if not note_parts:
+        return "All remaining variables use the reference mean values."
+
+    midpoint = max(int(np.ceil(len(note_parts) / 2.0)), 1)
+    first_line = "Fixed at mean: " + " | ".join(note_parts[:midpoint])
+    second_line = " | ".join(note_parts[midpoint:])
+    if second_line:
+        return f"{first_line}\n{second_line}"
+    return first_line
+
+
+def get_latest_axial_limit_state_branch(latest_result: Optional[Dict[str, Any]],
+                                        elem_id: int) -> str:
+    """Cabang aksial terbaru: compression/tension/absolute-axial."""
+    metadata = get_by_element_value(
+        (latest_result or {}).get('performance_axial_metadata', {}),
+        int(elem_id),
+        {}
+    ) or {}
+    branch = str(metadata.get('controlling_state', 'compression') or 'compression').strip().lower()
+    if branch not in {'compression', 'tension', 'absolute-axial'}:
+        return 'compression'
+    return branch
+
+
+def evaluate_physical_limit_state_function_grid(input_data: Dict,
+                                                elem_id: int,
+                                                limit_state: str,
+                                                demand_value: float,
+                                                x_var: str,
+                                                y_var: str,
+                                                axial_branch: str = 'compression',
+                                                grid_size: int = PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE
+                                                ) -> Optional[Dict[str, Any]]:
+    """Evaluasi peta `g(x)` exact pada ruang variabel fisik dua dimensi."""
+    elem_id = int(elem_id)
+    demand_numeric = coerce_finite_float(demand_value)
+    if demand_numeric is None:
+        return None
+
+    x_stat = get_physical_limit_state_material_stat(input_data, elem_id, x_var)
+    y_stat = get_physical_limit_state_material_stat(input_data, elem_id, y_var)
+    x_limits = build_physical_limit_state_variable_limits(x_stat)
+    y_limits = build_physical_limit_state_variable_limits(y_stat)
+    if x_stat is None or y_stat is None or x_limits is None or y_limits is None:
+        return None
+
+    section_inputs = get_section_capacity_inputs_from_input(input_data, elem_id)
+    material_snapshot = get_element_material_snapshot(
+        input_data,
+        latest_simulation=None,
+        is_probabilistic=True,
+        elem_id=elem_id
+    )
+    steel_props = get_by_element_value(
+        input_data.get('steel', {}).get('by_element', {}),
+        elem_id,
+        {}
+    ) or {}
+    fy_geser_mean = read_positive_number(
+        steel_props.get('geser_mean', steel_props.get('tarik_mean'))
+    )
+    if fy_geser_mean <= 0.0:
+        fy_geser_mean = material_snapshot['fy_tarik']
+
+    grid_x_values = np.linspace(float(x_limits[0]), float(x_limits[1]), int(grid_size))
+    grid_y_values = np.linspace(float(y_limits[0]), float(y_limits[1]), int(grid_size))
+    grid_x, grid_y = np.meshgrid(grid_x_values, grid_y_values)
+    grid_g = np.full_like(grid_x, np.nan, dtype=float)
+
+    for row_index in range(grid_y_values.size):
+        for col_index in range(grid_x_values.size):
+            fc_value = float(material_snapshot['fc'])
+            fy_tarik_value = float(material_snapshot['fy_tarik'])
+            fy_tekan_value = float(material_snapshot['fy_tekan'])
+            fy_geser_value = float(fy_geser_mean)
+
+            for variable_key, variable_value in (
+                (str(x_var), float(grid_x[row_index, col_index])),
+                (str(y_var), float(grid_y[row_index, col_index]))
+            ):
+                if variable_key == 'fc':
+                    fc_value = float(variable_value)
+                elif variable_key == 'fy_tarik':
+                    fy_tarik_value = float(variable_value)
+                elif variable_key == 'fy_tekan':
+                    fy_tekan_value = float(variable_value)
+                elif variable_key == 'fy_geser':
+                    fy_geser_value = float(variable_value)
+
+            try:
+                if limit_state == 'moment':
+                    g_value = PerformanceFunction.moment_capacity_demand(
+                        float(demand_numeric),
+                        fc_value,
+                        fy_tarik_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'],
+                        fy_tekan=fy_tekan_value,
+                        use_code_phi=False
+                    )
+                elif limit_state == 'shear':
+                    g_value = PerformanceFunction.shear_capacity_demand(
+                        float(demand_numeric),
+                        fc_value,
+                        fy_geser_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'].get('As_shear', 0.0),
+                        shear_spacing=section_inputs['steel_area'].get('shear_spacing', 0.0),
+                        use_code_phi=False
+                    )
+                elif limit_state == 'axial':
+                    compression_demand = 0.0
+                    tension_demand = 0.0
+                    if str(axial_branch).strip().lower() == 'tension':
+                        tension_demand = float(demand_numeric)
+                    else:
+                        compression_demand = float(demand_numeric)
+                    g_value = PerformanceFunction.axial_capacity_demand(
+                        compression_demand,
+                        tension_demand,
+                        fc_value,
+                        fy_tarik_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'],
+                        fy_tekan=fy_tekan_value,
+                        use_code_phi=False
+                    )
+                else:
+                    continue
+            except Exception:
+                continue
+
+            if np.isfinite(float(g_value)):
+                grid_g[row_index, col_index] = float(g_value)
+
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+
+    return {
+        'grid_x': np.asarray(grid_x, dtype=float),
+        'grid_y': np.asarray(grid_y, dtype=float),
+        'grid_g': np.asarray(grid_g, dtype=float),
+        'x_stat': x_stat,
+        'y_stat': y_stat,
+        'g_min': float(np.min(finite_g)),
+        'g_max': float(np.max(finite_g))
+    }
+
+
+def evaluate_physical_limit_state_demand_material_grid(input_data: Dict,
+                                                       elem_id: int,
+                                                       limit_state: str,
+                                                       material_var: str,
+                                                       demand_limits: Tuple[float, float],
+                                                       material_limits: Tuple[float, float],
+                                                       axial_branch: str = 'compression',
+                                                       grid_size: int = PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE
+                                                       ) -> Optional[Dict[str, Any]]:
+    """Evaluasi peta `g(x)` pada ruang demand-material fisik."""
+    elem_id = int(elem_id)
+    section_inputs = get_section_capacity_inputs_from_input(input_data, elem_id)
+    material_snapshot = get_element_material_snapshot(
+        input_data,
+        latest_simulation=None,
+        is_probabilistic=True,
+        elem_id=elem_id
+    )
+    steel_props = get_by_element_value(
+        input_data.get('steel', {}).get('by_element', {}),
+        elem_id,
+        {}
+    ) or {}
+    fy_geser_mean = read_positive_number(
+        steel_props.get('geser_mean', steel_props.get('tarik_mean'))
+    )
+    if fy_geser_mean <= 0.0:
+        fy_geser_mean = material_snapshot['fy_tarik']
+
+    x_values = np.linspace(float(demand_limits[0]), float(demand_limits[1]), int(grid_size))
+    y_values = np.linspace(float(material_limits[0]), float(material_limits[1]), int(grid_size))
+    grid_x, grid_y = np.meshgrid(x_values, y_values)
+    grid_g = np.full_like(grid_x, np.nan, dtype=float)
+
+    for row_index in range(y_values.size):
+        for col_index in range(x_values.size):
+            demand_value = float(grid_x[row_index, col_index])
+            material_value = float(grid_y[row_index, col_index])
+            fc_value = float(material_snapshot['fc'])
+            fy_tarik_value = float(material_snapshot['fy_tarik'])
+            fy_tekan_value = float(material_snapshot['fy_tekan'])
+            fy_geser_value = float(fy_geser_mean)
+
+            if str(material_var) == 'fc':
+                fc_value = material_value
+            elif str(material_var) == 'fy_tarik':
+                fy_tarik_value = material_value
+            elif str(material_var) == 'fy_tekan':
+                fy_tekan_value = material_value
+            elif str(material_var) == 'fy_geser':
+                fy_geser_value = material_value
+
+            try:
+                if limit_state == 'moment':
+                    g_value = PerformanceFunction.moment_capacity_demand(
+                        demand_value,
+                        fc_value,
+                        fy_tarik_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'],
+                        fy_tekan=fy_tekan_value,
+                        use_code_phi=False
+                    )
+                elif limit_state == 'shear':
+                    g_value = PerformanceFunction.shear_capacity_demand(
+                        demand_value,
+                        fc_value,
+                        fy_geser_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'].get('As_shear', 0.0),
+                        shear_spacing=section_inputs['steel_area'].get('shear_spacing', 0.0),
+                        use_code_phi=False
+                    )
+                elif limit_state == 'axial':
+                    compression_demand = 0.0
+                    tension_demand = 0.0
+                    if str(axial_branch).strip().lower() == 'tension':
+                        tension_demand = demand_value
+                    else:
+                        compression_demand = demand_value
+                    g_value = PerformanceFunction.axial_capacity_demand(
+                        compression_demand,
+                        tension_demand,
+                        fc_value,
+                        fy_tarik_value,
+                        section_inputs['section_geometry'],
+                        section_inputs['steel_area'],
+                        fy_tekan=fy_tekan_value,
+                        use_code_phi=False
+                    )
+                else:
+                    continue
+            except Exception:
+                continue
+
+            if np.isfinite(float(g_value)):
+                grid_g[row_index, col_index] = float(g_value)
+
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+    return {
+        'grid_x': np.asarray(grid_x, dtype=float),
+        'grid_y': np.asarray(grid_y, dtype=float),
+        'grid_g': np.asarray(grid_g, dtype=float),
+        'g_min': float(np.min(finite_g)),
+        'g_max': float(np.max(finite_g))
+    }
+
+
+def build_limit_state_function_physical_space_figure(physical_cloud_data: Dict[str, Any],
+                                                     input_data: Dict,
+                                                     latest_result: Optional[Dict],
+                                                     elem_id: int) -> Optional[plt.Figure]:
+    """Bangun peta fungsi limit-state nonlinier di ruang variabel fisik asli."""
+    state_specs = get_physical_limit_state_function_map_specs()
+    fig, axes = plt.subplots(1, 3, figsize=(18.0, 5.9), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    contour_fill_reference = None
+    plotted_any = False
+
+    for axis, spec in zip(axes_list, state_specs):
+        axis.set_facecolor('#f8fafc')
+        record = get_probabilistic_limit_state_physical_cloud_record(
+            physical_cloud_data,
+            int(elem_id),
+            str(spec['key'])
+        )
+        mean_demand = get_mean_limit_state_demand_from_record(record)
+        if mean_demand is None:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                f"No valid {spec['label'].lower()} cloud data\nfor element E{int(elem_id)}.",
+                ha='center',
+                va='center',
+                fontsize=9.5,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#ffffff',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            continue
+
+        axial_branch = (
+            get_latest_axial_limit_state_branch(latest_result, int(elem_id))
+            if str(spec['key']) == 'axial' else
+            'compression'
+        )
+        surface_grid = evaluate_physical_limit_state_function_grid(
+            input_data=input_data,
+            elem_id=int(elem_id),
+            limit_state=str(spec['key']),
+            demand_value=float(mean_demand),
+            x_var=str(spec['x_var']),
+            y_var=str(spec['y_var']),
+            axial_branch=axial_branch
+        )
+        if surface_grid is None:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                f"The nonlinear {spec['label'].lower()} map\ncould not be built.",
+                ha='center',
+                va='center',
+                fontsize=9.5,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#ffffff',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            continue
+
+        grid_x = np.asarray(surface_grid['grid_x'], dtype=float)
+        grid_y = np.asarray(surface_grid['grid_y'], dtype=float)
+        grid_g = np.asarray(surface_grid['grid_g'], dtype=float)
+        finite_g = grid_g[np.isfinite(grid_g)]
+        max_abs_g = max(float(np.max(np.abs(finite_g))), 1e-6)
+        fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+        contour_fill = axis.contourf(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=fill_levels,
+            cmap='RdYlBu',
+            alpha=0.92,
+            antialiased=True
+        )
+        contour_step = build_nice_contour_step(max_abs_g)
+        line_levels = contour_step * np.arange(-4, 5, dtype=float)
+        nonzero_levels = np.asarray(
+            [
+                value for value in line_levels
+                if (
+                    not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                    and abs(float(value)) <= max_abs_g * 1.02
+                )
+            ],
+            dtype=float
+        )
+        if nonzero_levels.size > 0:
+            iso_contours = axis.contour(
+                grid_x,
+                grid_y,
+                grid_g,
+                levels=np.sort(nonzero_levels),
+                colors='#ffffff',
+                linewidths=0.8,
+                alpha=0.72
+            )
+            axis.clabel(
+                iso_contours,
+                fmt=lambda value: f"{float(value):.0f}",
+                inline=True,
+                fontsize=7
+            )
+
+        has_zero_crossing = bool(
+            float(surface_grid['g_min']) <= 0.0 <= float(surface_grid['g_max'])
+        )
+        if has_zero_crossing:
+            zero_contour = axis.contour(
+                grid_x,
+                grid_y,
+                grid_g,
+                levels=[0.0],
+                colors=[PHYSICAL_NONLINEAR_CONTOUR_COLOR],
+                linewidths=2.4
+            )
+            axis.clabel(
+                zero_contour,
+                fmt={0.0: 'g = 0'},
+                inline=True,
+                fontsize=8
+            )
+
+        x_stat = surface_grid['x_stat']
+        y_stat = surface_grid['y_stat']
+        axis.scatter(
+            [float(x_stat['mean'])],
+            [float(y_stat['mean'])],
+            marker='x',
+            s=70,
+            color='#111827',
+            linewidths=1.6,
+            label='Mean material point'
+        )
+        if has_zero_crossing:
+            axis.plot(
+                [],
+                [],
+                color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+                linewidth=2.4,
+                label='Nonlinear limit-state contour'
+            )
+        else:
+            axis.text(
+                0.02,
+                0.03,
+                "No g = 0 contour in the current range",
+                transform=axis.transAxes,
+                ha='left',
+                va='bottom',
+                fontsize=7.3,
+                color='#7c2d12',
+                bbox=dict(
+                    boxstyle='round,pad=0.18',
+                    facecolor='#fff7ed',
+                    edgecolor='#fdba74',
+                    alpha=0.92
+                )
+            )
+        axis.set_xlabel(str(spec['x_label']))
+        axis.set_ylabel(str(spec['y_label']))
+        branch_note = ''
+        if str(spec['key']) == 'axial':
+            branch_note = f" | Branch: {str(axial_branch).replace('-', ' ').title()}"
+        axis.set_title(
+            (
+                f"{spec['label']} | {spec['demand_label']} = {float(mean_demand):.2f} {spec['unit']}"
+                f"{branch_note}"
+            ),
+            fontsize=10.2,
+            pad=9
+        )
+        axis.grid(True, alpha=0.16, linestyle='--')
+        axis.legend(loc='best', fontsize=7.4, frameon=True)
+        contour_fill_reference = contour_fill
+        plotted_any = True
+
+    if not plotted_any or contour_fill_reference is None:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Nonlinear Limit-State Function Maps in Physical Variable Space | Element E{int(elem_id)}",
+        fontsize=13,
+        y=0.99
+    )
+    fig.tight_layout(rect=[0, 0, 0.94, 0.965])
+    colorbar_axis = fig.add_axes([0.948, 0.16, 0.014, 0.68])
+    fig.colorbar(
+        contour_fill_reference,
+        cax=colorbar_axis,
+        label='Limit-state function g(x)'
+    )
+    return fig
+
+
+def build_limit_state_function_demand_material_space_figure(physical_cloud_data: Dict[str, Any],
+                                                            input_data: Dict,
+                                                            latest_result: Optional[Dict],
+                                                            elem_id: int) -> Optional[plt.Figure]:
+    """Bangun peta fungsi limit-state nonlinier pada ruang demand-material."""
+    state_specs = get_physical_limit_state_demand_material_map_specs()
+    fig, axes = plt.subplots(1, 3, figsize=(18.0, 5.9), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    contour_fill_reference = None
+    plotted_any = False
+
+    for axis, spec in zip(axes_list, state_specs):
+        axis.set_facecolor('#f8fafc')
+        record = get_probabilistic_limit_state_physical_cloud_record(
+            physical_cloud_data,
+            int(elem_id),
+            str(spec['key'])
+        )
+        demand_stat = get_physical_limit_state_demand_stat(record)
+        material_stat = get_physical_limit_state_material_stat(
+            input_data,
+            int(elem_id),
+            str(spec['material_var'])
+        )
+        demand_limits = build_physical_limit_state_demand_limits(demand_stat)
+        material_limits = build_physical_limit_state_variable_limits(material_stat)
+        if demand_stat is None or material_stat is None or demand_limits is None or material_limits is None:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                f"No valid {spec['label'].lower()} data\nfor element E{int(elem_id)}.",
+                ha='center',
+                va='center',
+                fontsize=9.5,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#ffffff',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            continue
+
+        axial_branch = (
+            get_latest_axial_limit_state_branch(latest_result, int(elem_id))
+            if str(spec['key']) == 'axial' else
+            'compression'
+        )
+        surface_grid = evaluate_physical_limit_state_demand_material_grid(
+            input_data=input_data,
+            elem_id=int(elem_id),
+            limit_state=str(spec['key']),
+            material_var=str(spec['material_var']),
+            demand_limits=demand_limits,
+            material_limits=material_limits,
+            axial_branch=axial_branch
+        )
+        if surface_grid is None:
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                f"The nonlinear {spec['label'].lower()} demand-material map\ncould not be built.",
+                ha='center',
+                va='center',
+                fontsize=9.5,
+                color='#475569',
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='#ffffff',
+                    edgecolor='#cbd5e1'
+                )
+            )
+            continue
+
+        grid_x = np.asarray(surface_grid['grid_x'], dtype=float)
+        grid_y = np.asarray(surface_grid['grid_y'], dtype=float)
+        grid_g = np.asarray(surface_grid['grid_g'], dtype=float)
+        finite_g = grid_g[np.isfinite(grid_g)]
+        max_abs_g = max(float(np.max(np.abs(finite_g))), 1e-6)
+        fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+        contour_fill = axis.contourf(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=fill_levels,
+            cmap='RdYlBu',
+            alpha=0.92,
+            antialiased=True
+        )
+        contour_step = build_nice_contour_step(max_abs_g)
+        line_levels = contour_step * np.arange(-4, 5, dtype=float)
+        nonzero_levels = np.asarray(
+            [
+                value for value in line_levels
+                if (
+                    not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                    and abs(float(value)) <= max_abs_g * 1.02
+                )
+            ],
+            dtype=float
+        )
+        if nonzero_levels.size > 0:
+            iso_contours = axis.contour(
+                grid_x,
+                grid_y,
+                grid_g,
+                levels=np.sort(nonzero_levels),
+                colors='#ffffff',
+                linewidths=0.8,
+                alpha=0.72
+            )
+            axis.clabel(
+                iso_contours,
+                fmt=lambda value: f"{float(value):.0f}",
+                inline=True,
+                fontsize=7
+            )
+
+        has_zero_crossing = bool(
+            float(surface_grid['g_min']) <= 0.0 <= float(surface_grid['g_max'])
+        )
+        if has_zero_crossing:
+            zero_contour = axis.contour(
+                grid_x,
+                grid_y,
+                grid_g,
+                levels=[0.0],
+                colors=[PHYSICAL_NONLINEAR_CONTOUR_COLOR],
+                linewidths=2.4
+            )
+            axis.clabel(
+                zero_contour,
+                fmt={0.0: 'g = 0'},
+                inline=True,
+                fontsize=8
+            )
+
+        axis.scatter(
+            [float(demand_stat['mean'])],
+            [float(material_stat['mean'])],
+            marker='x',
+            s=70,
+            color='#111827',
+            linewidths=1.6,
+            label='Mean operating point'
+        )
+        if has_zero_crossing:
+            axis.plot(
+                [],
+                [],
+                color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+                linewidth=2.4,
+                label='Nonlinear limit-state contour'
+            )
+        else:
+            axis.text(
+                0.02,
+                0.03,
+                "No g = 0 contour in the current range",
+                transform=axis.transAxes,
+                ha='left',
+                va='bottom',
+                fontsize=7.3,
+                color='#7c2d12',
+                bbox=dict(
+                    boxstyle='round,pad=0.18',
+                    facecolor='#fff7ed',
+                    edgecolor='#fdba74',
+                    alpha=0.92
+                )
+            )
+
+        fy_note = ''
+        if str(spec['key']) == 'moment':
+            fy_note = " | fy fixed at mean"
+        elif str(spec['key']) == 'shear':
+            fy_note = " | fy_shear fixed at mean"
+        elif str(spec['key']) == 'axial':
+            branch_note = str(axial_branch).replace('-', ' ').title()
+            fy_note = f" | fy fixed at mean | Branch: {branch_note}"
+
+        axis.set_xlabel(str(spec['x_label']))
+        axis.set_ylabel(str(spec['y_label']))
+        axis.set_title(
+            f"{spec['label']} | g(demand, material){fy_note}",
+            fontsize=10.2,
+            pad=9
+        )
+        axis.grid(True, alpha=0.16, linestyle='--')
+        axis.legend(loc='best', fontsize=7.4, frameon=True)
+        contour_fill_reference = contour_fill
+        plotted_any = True
+
+    if not plotted_any or contour_fill_reference is None:
+        plt.close(fig)
+        return None
+
+    fig.suptitle(
+        f"Nonlinear Limit-State Function Maps in Demand-Material Space | Element E{int(elem_id)}",
+        fontsize=13,
+        y=0.99
+    )
+    fig.tight_layout(rect=[0, 0, 0.94, 0.965])
+    colorbar_axis = fig.add_axes([0.948, 0.16, 0.014, 0.68])
+    fig.colorbar(
+        contour_fill_reference,
+        cax=colorbar_axis,
+        label='Limit-state function g(x)'
+    )
+    return fig
+
+
+def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str, Any],
+                                                  input_data: Dict,
+                                                  latest_result: Optional[Dict],
+                                                  elem_id: int,
+                                                  limit_state: str,
+                                                  x_axis_key: str,
+                                                  y_axis_key: str) -> Optional[plt.Figure]:
+    """Bangun peta fungsi limit-state custom dengan kedua sumbu dapat dipilih."""
+    limit_state_key = str(limit_state).strip().lower()
+    axis_specs = get_physical_limit_state_custom_axis_specs(limit_state_key)
+    axis_lookup = {
+        str(spec['key']): spec
+        for spec in axis_specs
+    }
+    x_spec = axis_lookup.get(str(x_axis_key))
+    y_spec = axis_lookup.get(str(y_axis_key))
+    if x_spec is None or y_spec is None or str(x_spec['key']) == str(y_spec['key']):
+        return None
+
+    record = get_probabilistic_limit_state_physical_cloud_record(
+        physical_cloud_data,
+        int(elem_id),
+        limit_state_key
+    )
+    demand_stat = get_physical_limit_state_demand_stat(record)
+    capacity_stat = get_physical_limit_state_capacity_stat(record)
+    if demand_stat is None:
+        return None
+
+    section_inputs = get_section_capacity_inputs_from_input(input_data, int(elem_id))
+    material_snapshot = get_element_material_snapshot(
+        input_data,
+        latest_simulation=None,
+        is_probabilistic=True,
+        elem_id=int(elem_id)
+    )
+    steel_props = get_by_element_value(
+        input_data.get('steel', {}).get('by_element', {}),
+        int(elem_id),
+        {}
+    ) or {}
+    fy_geser_mean = read_positive_number(
+        steel_props.get('geser_mean', steel_props.get('tarik_mean'))
+    )
+    if fy_geser_mean <= 0.0:
+        fy_geser_mean = material_snapshot['fy_tarik']
+
+    axial_branch = (
+        get_latest_axial_limit_state_branch(latest_result, int(elem_id))
+        if limit_state_key == 'axial' else
+        'compression'
+    )
+    selected_axis_keys = {str(x_spec['key']), str(y_spec['key'])}
+    reference_values = {
+        'Q': float(demand_stat['mean']),
+        'fc': float(material_snapshot['fc']),
+        'fy_tarik': float(material_snapshot['fy_tarik']),
+        'fy_tekan': float(material_snapshot['fy_tekan']),
+        'fy_geser': float(fy_geser_mean)
+    }
+    exact_reference_capacity = evaluate_physical_limit_state_capacity_value(
+        limit_state_key,
+        section_inputs,
+        float(reference_values['fc']),
+        float(reference_values['fy_tarik']),
+        float(reference_values['fy_tekan']),
+        float(reference_values['fy_geser']),
+        axial_branch=axial_branch
+    )
+    mean_capacity = coerce_finite_float(
+        (capacity_stat or {}).get('mean')
+    )
+    if mean_capacity is None:
+        mean_capacity = exact_reference_capacity
+    if mean_capacity is None:
+        return None
+    reference_values['R'] = float(mean_capacity)
+
+    def resolve_axis_limits(axis_spec: Dict[str, str]) -> Optional[Tuple[float, float]]:
+        axis_kind = str(axis_spec.get('kind'))
+        axis_key = str(axis_spec['key'])
+        if axis_kind == 'material':
+            material_stat = get_physical_limit_state_material_stat(
+                input_data,
+                int(elem_id),
+                axis_key
+            )
+            return build_physical_limit_state_variable_limits(material_stat)
+        if axis_kind == 'demand':
+            return build_physical_limit_state_response_limits(demand_stat)
+        if axis_kind == 'capacity':
+            return build_physical_limit_state_response_limits(capacity_stat)
+        return None
+
+    x_limits = resolve_axis_limits(x_spec)
+    y_limits = resolve_axis_limits(y_spec)
+    if x_limits is None or y_limits is None:
+        return None
+
+    grid_x_values = np.linspace(float(x_limits[0]), float(x_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
+    grid_y_values = np.linspace(float(y_limits[0]), float(y_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
+    grid_x, grid_y = np.meshgrid(grid_x_values, grid_y_values)
+    grid_g = np.full_like(grid_x, np.nan, dtype=float)
+
+    for row_index in range(grid_y_values.size):
+        for col_index in range(grid_x_values.size):
+            current_values = dict(reference_values)
+            current_values[str(x_spec['key'])] = float(grid_x[row_index, col_index])
+            current_values[str(y_spec['key'])] = float(grid_y[row_index, col_index])
+
+            demand_value = coerce_finite_float(current_values.get('Q'))
+            if demand_value is None:
+                continue
+
+            if 'R' in selected_axis_keys:
+                capacity_value = coerce_finite_float(current_values.get('R'))
+            else:
+                capacity_value = evaluate_physical_limit_state_capacity_value(
+                    limit_state_key,
+                    section_inputs,
+                    float(current_values['fc']),
+                    float(current_values['fy_tarik']),
+                    float(current_values['fy_tekan']),
+                    float(current_values['fy_geser']),
+                    axial_branch=axial_branch
+                )
+            if capacity_value is None:
+                continue
+
+            if 'Q' not in selected_axis_keys:
+                demand_value = float(reference_values['Q'])
+
+            g_value = float(capacity_value) - float(demand_value)
+            if np.isfinite(g_value):
+                grid_g[row_index, col_index] = g_value
+
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+
+    fig, axis = plt.subplots(figsize=(9.0, 6.2), dpi=180)
+    axis.set_facecolor('#f8fafc')
+
+    max_abs_g = max(float(np.max(np.abs(finite_g))), 1e-6)
+    fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+    contour_fill = axis.contourf(
+        grid_x,
+        grid_y,
+        grid_g,
+        levels=fill_levels,
+        cmap='RdYlBu',
+        alpha=0.92,
+        antialiased=True
+    )
+
+    contour_step = build_nice_contour_step(max_abs_g)
+    line_levels = contour_step * np.arange(-4, 5, dtype=float)
+    nonzero_levels = np.asarray(
+        [
+            value for value in line_levels
+            if (
+                not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                and abs(float(value)) <= max_abs_g * 1.02
+            )
+        ],
+        dtype=float
+    )
+    if nonzero_levels.size > 0:
+        iso_contours = axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=np.sort(nonzero_levels),
+            colors='#ffffff',
+            linewidths=0.8,
+            alpha=0.72
+        )
+        axis.clabel(
+            iso_contours,
+            fmt=lambda value: f"{float(value):.0f}",
+            inline=True,
+            fontsize=7
+        )
+
+    g_min = float(np.min(finite_g))
+    g_max = float(np.max(finite_g))
+    has_zero_crossing = bool(g_min <= 0.0 <= g_max)
+    if has_zero_crossing:
+        zero_contour = axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=[0.0],
+            colors=[PHYSICAL_NONLINEAR_CONTOUR_COLOR],
+            linewidths=2.4
+        )
+        axis.clabel(
+            zero_contour,
+            fmt={0.0: 'g = 0'},
+            inline=True,
+            fontsize=8
+        )
+
+    reference_x = coerce_finite_float(reference_values.get(str(x_spec['key'])))
+    reference_y = coerce_finite_float(reference_values.get(str(y_spec['key'])))
+    if reference_x is not None and reference_y is not None:
+        axis.scatter(
+            [float(reference_x)],
+            [float(reference_y)],
+            marker='x',
+            s=70,
+            color='#111827',
+            linewidths=1.6,
+            label='Mean reference point'
+        )
+
+    if has_zero_crossing:
+        axis.plot(
+            [],
+            [],
+            color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+            linewidth=2.4,
+            label='Limit-state contour g = 0'
+        )
+    else:
+        axis.text(
+            0.02,
+            0.03,
+            "No g = 0 contour in the current range",
+            transform=axis.transAxes,
+            ha='left',
+            va='bottom',
+            fontsize=7.3,
+            color='#7c2d12',
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='#fff7ed',
+                edgecolor='#fdba74',
+                alpha=0.92
+            )
+        )
+
+    if 'R' in selected_axis_keys:
+        axis.text(
+            0.98,
+            0.98,
+            "Direct R axis: g = R - Q",
+            transform=axis.transAxes,
+            ha='right',
+            va='top',
+            fontsize=7.3,
+            color='#334155',
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='#ffffff',
+                edgecolor='#cbd5e1',
+                alpha=0.92
+            )
+        )
+
+    reference_note = build_physical_limit_state_custom_axis_note(
+        limit_state_key,
+        axis_specs,
+        (str(x_spec['key']), str(y_spec['key'])),
+        reference_values,
+        axial_branch=axial_branch
+    )
+    axis.text(
+        0.02,
+        0.98,
+        reference_note,
+        transform=axis.transAxes,
+        ha='left',
+        va='top',
+        fontsize=7.2,
+        color='#334155',
+        bbox=dict(
+            boxstyle='round,pad=0.20',
+            facecolor='#ffffff',
+            edgecolor='#cbd5e1',
+            alpha=0.92
+        )
+    )
+
+    state_display_spec = next(
+        (
+            spec for spec in get_probabilistic_limit_state_histogram_specs()
+            if str(spec['key']) == limit_state_key
+        ),
+        {
+            'plot_label': str(limit_state_key).replace('_', ' ').title()
+        }
+    )
+    axis.set_xlabel(str(x_spec['axis_label']))
+    axis.set_ylabel(str(y_spec['axis_label']))
+    axis.set_title(
+        (
+            f"{state_display_spec.get('plot_label', str(limit_state_key).title())} | "
+            f"Custom Physical g(x) Map: {x_spec['short_label']} vs {y_spec['short_label']}"
+        ),
+        fontsize=10.8,
+        pad=10
+    )
+    axis.grid(True, alpha=0.16, linestyle='--')
+    axis.legend(loc='best', fontsize=7.5, frameon=True)
+
+    fig.suptitle(
+        f"Custom Nonlinear Limit-State Map | Element E{int(elem_id)}",
+        fontsize=13,
+        y=0.985
+    )
+    fig.tight_layout(rect=[0, 0, 0.93, 0.96])
+    colorbar_axis = fig.add_axes([0.94, 0.16, 0.015, 0.68])
+    fig.colorbar(
+        contour_fill,
+        cax=colorbar_axis,
+        label='Limit-state function g(x)'
+    )
+    return fig
+
+
+def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[str, Any],
+                                                     results_bundle: Dict[str, Any],
+                                                     input_data: Dict,
+                                                     elem_id: int,
+                                                     heading_level: str = "####") -> None:
+    """Render peta fungsi limit-state nonlinier pada ruang variabel fisik."""
+    latest_result = (
+        ((results_bundle or {}).get('latest_simulation', {}) or {}).get('analysis_result')
+    )
+    st.markdown(f"{heading_level} Nonlinear Limit-State Maps in Physical Space")
+    st.caption(
+        "Untuk lentur, geser, dan aksial, bidang `Q-R` memang cenderung linear karena "
+        "`g = R - Q`. Agar fungsi limit nonlinier benar-benar terlihat, peta berikut "
+        "digambar pada ruang variabel fisik asli penampang."
+    )
+    st.caption(
+        "Anda sekarang juga bisa memilih pasangan sumbu custom, termasuk `R` dan `Q`, "
+        "atau tetap memakai tampilan preset seperti `Demand-Material Space` dan "
+        "`Material-Variable Space`."
+    )
+    map_view_mode = st.radio(
+        "Map view",
+        options=[
+            "Custom Axis Map",
+            "Demand-Material Space",
+            "Material-Variable Space"
+        ],
+        index=0,
+        horizontal=True,
+        key=f"physical_limit_state_map_view_mode_e{int(elem_id)}"
+    )
+    if map_view_mode == "Custom Axis Map":
+        st.caption(
+            "Pada mode ini, kedua sumbu dapat dipilih bebas. Jika `R` dipilih di salah "
+            "satu sumbu, peta akan mengikuti hubungan langsung `g = R - Q`; sedangkan "
+            "variabel yang tidak dipilih ditahan pada nilai mean referensinya."
+        )
+        limit_state_specs = [
+            spec for spec in get_probabilistic_limit_state_histogram_specs()
+            if str(spec['key']) in {'moment', 'shear', 'axial'}
+        ]
+        limit_state_lookup = {
+            str(spec['key']): str(spec.get('plot_label', spec['label']))
+            for spec in limit_state_specs
+        }
+        control_columns = st.columns(3)
+        with control_columns[0]:
+            selected_limit_state = st.selectbox(
+                "Limit state",
+                options=list(limit_state_lookup.keys()),
+                index=0,
+                format_func=lambda value: limit_state_lookup.get(str(value), str(value)),
+                key=f"physical_limit_state_custom_state_e{int(elem_id)}"
+            )
+        axis_specs = get_physical_limit_state_custom_axis_specs(selected_limit_state)
+        axis_lookup = {
+            str(spec['key']): spec
+            for spec in axis_specs
+        }
+        axis_keys = list(axis_lookup.keys())
+        default_x_index = axis_keys.index('Q') if 'Q' in axis_keys else 0
+        with control_columns[1]:
+            selected_x_axis = st.selectbox(
+                "X-axis",
+                options=axis_keys,
+                index=default_x_index,
+                format_func=lambda value: str(axis_lookup[str(value)]['label']),
+                key=f"physical_limit_state_custom_x_axis_e{int(elem_id)}_{selected_limit_state}"
+            )
+        y_axis_options = [
+            axis_key for axis_key in axis_keys
+            if axis_key != str(selected_x_axis)
+        ]
+        default_y_axis = (
+            'fc'
+            if 'fc' in y_axis_options else
+            y_axis_options[0]
+        )
+        with control_columns[2]:
+            selected_y_axis = st.selectbox(
+                "Y-axis",
+                options=y_axis_options,
+                index=y_axis_options.index(default_y_axis),
+                format_func=lambda value: str(axis_lookup[str(value)]['label']),
+                key=(
+                    f"physical_limit_state_custom_y_axis_e{int(elem_id)}_"
+                    f"{selected_limit_state}_{selected_x_axis}"
+                )
+            )
+        if 'R' in {str(selected_x_axis), str(selected_y_axis)}:
+            st.caption(
+                "Catatan: saat `R` dipilih sebagai sumbu, contour mengikuti relasi langsung "
+                "`g = R - Q`, sehingga bentuknya dapat menjadi lebih linear dibanding "
+                "peta yang hanya memakai variabel material dan demand."
+            )
+        figure = build_limit_state_function_custom_axis_figure(
+            physical_cloud_data=physical_cloud_data,
+            input_data=input_data,
+            latest_result=latest_result,
+            elem_id=int(elem_id),
+            limit_state=str(selected_limit_state),
+            x_axis_key=str(selected_x_axis),
+            y_axis_key=str(selected_y_axis)
+        )
+        viewer_key = (
+            f"physical-limit-state-custom-map-e{int(elem_id)}-"
+            f"{selected_limit_state}-{selected_x_axis}-{selected_y_axis}"
+        )
+        download_basename = (
+            f"custom-nonlinear-limit-state-map-e{int(elem_id)}-"
+            f"{selected_limit_state}-{selected_x_axis}-{selected_y_axis}"
+        )
+        alt_text = (
+            f"Custom nonlinear limit-state map for element {int(elem_id)} "
+            f"in {selected_limit_state} with axes {selected_x_axis} and {selected_y_axis}"
+        )
+    elif map_view_mode == "Demand-Material Space":
+        st.caption(
+            "Pada mode ini, sumbu horizontal adalah demand fisik, sedangkan sumbu vertikal "
+            "adalah satu variabel material fisik. Ini lebih dekat ke contoh `g(Md, fc)`, "
+            "`g(Vd, fc)`, dan `g(Pd, fc)`."
+        )
+        figure = build_limit_state_function_demand_material_space_figure(
+            physical_cloud_data=physical_cloud_data,
+            input_data=input_data,
+            latest_result=latest_result,
+            elem_id=int(elem_id)
+        )
+        viewer_key = f"physical-limit-state-demand-material-maps-e{int(elem_id)}"
+        download_basename = f"nonlinear-limit-state-demand-material-space-e{int(elem_id)}"
+        alt_text = (
+            f"Nonlinear limit-state maps in demand-material space for element {int(elem_id)}"
+        )
+    else:
+        st.caption(
+            "Pada mode ini, demand dipatok pada nilai rata-rata cloud Monte Carlo valid, "
+            "lalu `g(x)` dievaluasi langsung terhadap pasangan variabel material fisik."
+        )
+        figure = build_limit_state_function_physical_space_figure(
+            physical_cloud_data=physical_cloud_data,
+            input_data=input_data,
+            latest_result=latest_result,
+            elem_id=int(elem_id)
+        )
+        viewer_key = f"physical-limit-state-material-variable-maps-e{int(elem_id)}"
+        download_basename = f"nonlinear-limit-state-material-variable-space-e{int(elem_id)}"
+        alt_text = (
+            f"Nonlinear limit-state maps in material-variable space for element {int(elem_id)}"
+        )
+    if figure is None:
+        st.info(
+            "Peta fungsi limit-state nonlinier untuk lentur, geser, dan aksial "
+            "belum dapat dibentuk pada elemen terpilih."
+        )
+        return
+
+    render_plot(
+        figure,
+        interactive=True,
+        viewer_key=viewer_key,
+        alt_text=alt_text,
+        viewer_height=680,
+        download_basename=download_basename
+    )
+
+
+def build_probabilistic_axial_moment_pm_cloud_figure(
+    axial_moment_pm_cloud_data: Dict[str, Any],
+    elem_id: int,
+    show_boundary_envelope: bool = True,
+    beta_value: Optional[float] = None,
+    show_nonlinear_contour: bool = True
+) -> Optional[plt.Figure]:
+    """Bangun figure contour nonlinier aksial-lentur pada ruang fisik `P-M`."""
+    record = (
+        (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        or {}
+    )
+    if not record:
+        return None
+
+    demand_moment = np.asarray(record.get('demand_moment', []), dtype=float)
+    demand_axial = np.asarray(record.get('demand_axial', []), dtype=float)
+    boundary_moment = np.asarray(record.get('boundary_moment', []), dtype=float)
+    boundary_axial = np.asarray(record.get('boundary_axial', []), dtype=float)
+    g_values = np.asarray(record.get('g', []), dtype=float)
+    failure_mask = np.asarray(record.get('failure_mask', []), dtype=bool)
+    common_size = min(
+        int(demand_moment.size),
+        int(demand_axial.size),
+        int(boundary_moment.size),
+        int(boundary_axial.size),
+        int(g_values.size),
+        int(failure_mask.size)
+    )
+    if common_size <= 0:
+        return None
+
+    demand_moment = demand_moment[:common_size]
+    demand_axial = demand_axial[:common_size]
+    boundary_moment = boundary_moment[:common_size]
+    boundary_axial = boundary_axial[:common_size]
+    g_values = g_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+    safe_mask = ~failure_mask
+
+    valid_mask = (
+        np.isfinite(demand_moment)
+        & np.isfinite(demand_axial)
+        & np.isfinite(boundary_moment)
+        & np.isfinite(boundary_axial)
+        & np.isfinite(g_values)
+    )
+    if not np.any(valid_mask):
+        return None
+
+    demand_moment = demand_moment[valid_mask]
+    demand_axial = demand_axial[valid_mask]
+    boundary_moment = boundary_moment[valid_mask]
+    boundary_axial = boundary_axial[valid_mask]
+    g_values = g_values[valid_mask]
+    failure_mask = failure_mask[valid_mask]
+    safe_mask = ~failure_mask
+
+    mean_curve_moment = np.asarray(record.get('mean_curve_moment', []), dtype=float)
+    mean_curve_axial = np.asarray(record.get('mean_curve_axial', []), dtype=float)
+    mean_curve_size = min(int(mean_curve_moment.size), int(mean_curve_axial.size))
+    mean_curve_moment = mean_curve_moment[:mean_curve_size]
+    mean_curve_axial = mean_curve_axial[:mean_curve_size]
+    mean_curve_valid = np.isfinite(mean_curve_moment) & np.isfinite(mean_curve_axial)
+    mean_curve_moment = mean_curve_moment[mean_curve_valid]
+    mean_curve_axial = mean_curve_axial[mean_curve_valid]
+
+    def build_boundary_envelope(moment_values: np.ndarray,
+                                axial_values: np.ndarray,
+                                max_bins: int = 18) -> Dict[str, np.ndarray]:
+        """Ringkas cloud boundary menjadi amplop persentil agar lebih komunikatif."""
+        x_values = np.asarray(moment_values, dtype=float)
+        y_values = np.asarray(axial_values, dtype=float)
+        valid_points = np.isfinite(x_values) & np.isfinite(y_values)
+        x_values = x_values[valid_points]
+        y_values = y_values[valid_points]
+        if x_values.size < 10:
+            return {}
+
+        num_bins = int(np.clip(np.sqrt(x_values.size), 8, max_bins))
+        x_min = float(np.min(x_values))
+        x_max = float(np.max(x_values))
+        if np.isclose(x_min, x_max, atol=1e-12, rtol=1e-9):
+            return {}
+
+        bin_edges = np.linspace(x_min, x_max, num_bins + 1)
+        centers = []
+        lowers = []
+        medians = []
+        uppers = []
+        counts = []
+
+        for index in range(num_bins):
+            left_edge = float(bin_edges[index])
+            right_edge = float(bin_edges[index + 1])
+            if index == num_bins - 1:
+                mask = (x_values >= left_edge) & (x_values <= right_edge)
+            else:
+                mask = (x_values >= left_edge) & (x_values < right_edge)
+            if int(np.sum(mask)) < 4:
+                continue
+
+            x_bin = x_values[mask]
+            y_bin = y_values[mask]
+            centers.append(float(np.median(x_bin)))
+            lowers.append(float(np.quantile(y_bin, 0.10)))
+            medians.append(float(np.quantile(y_bin, 0.50)))
+            uppers.append(float(np.quantile(y_bin, 0.90)))
+            counts.append(int(x_bin.size))
+
+        if len(centers) < 3:
+            return {}
+
+        return {
+            'x': np.asarray(centers, dtype=float),
+            'y_lower': np.asarray(lowers, dtype=float),
+            'y_median': np.asarray(medians, dtype=float),
+            'y_upper': np.asarray(uppers, dtype=float),
+            'count': np.asarray(counts, dtype=int)
+        }
+
+    boundary_envelope = build_boundary_envelope(boundary_moment, boundary_axial)
+    full_x_values = np.concatenate(
+        [
+            demand_moment,
+            boundary_moment,
+            mean_curve_moment if mean_curve_moment.size else np.asarray([], dtype=float)
+        ]
+    )
+    full_y_values = np.concatenate(
+        [
+            demand_axial,
+            boundary_axial,
+            mean_curve_axial if mean_curve_axial.size else np.asarray([], dtype=float)
+        ]
+    )
+    full_x_limits = get_failure_cloud_axis_limits(full_x_values)
+    full_y_limits = get_failure_cloud_axis_limits(full_y_values)
+
+    zoom_x_values = np.concatenate([demand_moment, boundary_moment])
+    zoom_y_values = np.concatenate([demand_axial, boundary_axial])
+    zoom_x_limits = get_failure_cloud_axis_limits(zoom_x_values)
+    zoom_y_limits = get_failure_cloud_axis_limits(zoom_y_values)
+
+    surface_model = None
+    surface_full = None
+    surface_zoom = None
+    surface_max_abs_g = None
+    surface_status_text = None
+    surface_has_zero_crossing = False
+    if show_nonlinear_contour:
+        surface_model = fit_physical_signed_margin_quadratic_surface(
+            demand_moment,
+            demand_axial,
+            g_values,
+            boundary_x=boundary_moment,
+            boundary_y=boundary_axial
+        )
+        if surface_model is not None:
+            surface_full = evaluate_physical_signed_margin_surface_grid(
+                surface_model,
+                x_limits=full_x_limits,
+                y_limits=full_y_limits
+            )
+            surface_zoom = evaluate_physical_signed_margin_surface_grid(
+                surface_model,
+                x_limits=zoom_x_limits,
+                y_limits=zoom_y_limits
+            )
+        if surface_full is not None or surface_zoom is not None:
+            surface_finite_values = []
+            for surface_record in (surface_full, surface_zoom):
+                if not surface_record:
+                    continue
+                candidate_values = np.asarray(surface_record.get('grid_g', []), dtype=float)
+                candidate_values = candidate_values[np.isfinite(candidate_values)]
+                if candidate_values.size > 0:
+                    surface_finite_values.append(float(np.max(np.abs(candidate_values))))
+            if surface_finite_values:
+                surface_max_abs_g = max(max(surface_finite_values), 1e-6)
+        surface_has_zero_crossing = any(
+            bool(
+                surface_record
+                and float(surface_record.get('g_min', 1.0)) <= 0.0
+                and float(surface_record.get('g_max', -1.0)) >= 0.0
+            )
+            for surface_record in (surface_full, surface_zoom)
+        )
+        if surface_max_abs_g is None:
+            surface_status_text = (
+                "The nonlinear contour `g_hat(M,P)=0` is not stable enough yet "
+                "to be built from the current sample cloud."
+            )
+        elif not surface_has_zero_crossing:
+            surface_status_text = (
+                "The surrogate `g_hat(M,P)` has been fitted, but within the current plot range "
+                "it does not cross `g=0`, so the zero contour is not shown."
+            )
+
+    fig, axes = plt.subplots(1, 2, figsize=(15.0, 6.9), dpi=180)
+    axes_list = list(np.asarray(axes).reshape(-1))
+    contour_fill_handles = []
+    panel_surface_grids = [surface_full, surface_zoom]
+
+    for axis, surface_grid in zip(axes_list, panel_surface_grids):
+        axis.set_facecolor('#f8fafc')
+        contour_fill = None
+        if show_nonlinear_contour and surface_grid is not None:
+            contour_fill = add_physical_signed_margin_contours(
+                axis,
+                surface_grid,
+                max_abs_g=surface_max_abs_g
+            )
+            if (
+                float(surface_grid.get('g_min', 1.0)) <= 0.0
+                and float(surface_grid.get('g_max', -1.0)) >= 0.0
+            ):
+                axis.plot(
+                    [],
+                    [],
+                    color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+                    linewidth=2.2,
+                    label='Nonlinear contour g_hat(M, P)=0'
+                )
+        contour_fill_handles.append(contour_fill)
+        if mean_curve_moment.size > 1:
+            axis.plot(
+                mean_curve_moment,
+                mean_curve_axial,
+                color='#0f4c81',
+                linewidth=2.2,
+                label='Reference interaction curve (mean)'
+            )
+        if show_boundary_envelope and boundary_envelope:
+            axis.fill_between(
+                boundary_envelope['x'],
+                boundary_envelope['y_lower'],
+                boundary_envelope['y_upper'],
+                color='#94a3b8',
+                alpha=0.22,
+                linewidth=0.0,
+                label='Sample boundary envelope (P10-P90)'
+            )
+            axis.plot(
+                boundary_envelope['x'],
+                boundary_envelope['y_median'],
+                color='#475569',
+                linestyle='--',
+                linewidth=1.2,
+                alpha=0.95,
+                label='Sample boundary median'
+            )
+        elif show_boundary_envelope:
+            axis.scatter(
+                boundary_moment,
+                boundary_axial,
+                s=10,
+                color='#64748b',
+                alpha=0.20,
+                edgecolors='none',
+                label='Sample boundary, g=0'
+            )
+        if np.any(safe_mask):
+            axis.scatter(
+                demand_moment[safe_mask],
+                demand_axial[safe_mask],
+                s=20,
+                color=SAFE_CLOUD_COLOR,
+                alpha=0.42,
+                edgecolors='none',
+                label=f"Safe demand ({int(np.sum(safe_mask)):,})"
+            )
+        if np.any(failure_mask):
+            axis.scatter(
+                demand_moment[failure_mask],
+                demand_axial[failure_mask],
+                s=30,
+                color='#dc2626',
+                alpha=0.84,
+                edgecolors='#ffffff',
+                linewidths=0.25,
+                label=f"Failed demand ({int(np.sum(failure_mask)):,})"
+            )
+
+        mean_demand_moment = float(np.mean(demand_moment)) if demand_moment.size else None
+        mean_demand_axial = float(np.mean(demand_axial)) if demand_axial.size else None
+        mean_boundary_moment = float(np.mean(boundary_moment)) if boundary_moment.size else None
+        mean_boundary_axial = float(np.mean(boundary_axial)) if boundary_axial.size else None
+        if mean_demand_moment is not None and mean_demand_axial is not None:
+            axis.scatter(
+                [mean_demand_moment],
+                [mean_demand_axial],
+                marker='x',
+                s=80,
+                color='#0f172a',
+                linewidths=1.6,
+                label='Mean demand'
+            )
+        if mean_boundary_moment is not None and mean_boundary_axial is not None:
+            axis.scatter(
+                [mean_boundary_moment],
+                [mean_boundary_axial],
+                marker='D',
+                s=42,
+                color='#2a9d8f',
+                alpha=0.95,
+                edgecolors='#ffffff',
+                linewidths=0.35,
+                label='Mean boundary'
+            )
+            if mean_demand_moment is not None and mean_demand_axial is not None:
+                axis.plot(
+                    [mean_demand_moment, mean_boundary_moment],
+                    [mean_demand_axial, mean_boundary_axial],
+                    color='#2a9d8f',
+                    linestyle=':',
+                    linewidth=1.0,
+                    alpha=0.9,
+                    label='Direction to mean boundary'
+                )
+
+        axis.set_xlabel('Moment M (kN.m)')
+        axis.set_ylabel('Axial P (kN)')
+        axis.grid(True, alpha=0.22, linestyle='--')
+
+    axes_list[0].set_xlim(*full_x_limits)
+    axes_list[0].set_ylim(*full_y_limits)
+    axes_list[0].set_title('Physical P-M Space | Full View', fontsize=11, pad=10)
+
+    axes_list[1].set_xlim(*zoom_x_limits)
+    axes_list[1].set_ylim(*zoom_y_limits)
+    axes_list[1].set_title(
+        'Physical P-M Space | Zoomed Demand, Boundary, and g=0 Contour',
+        fontsize=11,
+        pad=10
+    )
+    axes_list[1].text(
+        0.98,
+        0.96,
+        (
+            f"Valid N = {int(record.get('sample_count', 0))}\n"
+            f"Failures = {int(record.get('failure_count', 0))}\n"
+            f"Pf(valid) = {float(record.get('Pf_from_g', 0.0)):.4f}"
+        ),
+        transform=axes_list[1].transAxes,
+        ha='right',
+        va='top',
+        fontsize=8.2,
+        bbox=dict(
+            boxstyle='round,pad=0.25',
+            facecolor='white',
+            alpha=0.90,
+            edgecolor='#cbd5e1'
+        )
+    )
+    if surface_status_text is not None:
+        axes_list[0].text(
+            0.02,
+            0.02,
+            surface_status_text,
+            transform=axes_list[0].transAxes,
+            ha='left',
+            va='bottom',
+            fontsize=7.8,
+            color='#7c2d12',
+            bbox=dict(
+                boxstyle='round,pad=0.22',
+                facecolor='#fff7ed',
+                edgecolor='#fdba74',
+                alpha=0.92
+            )
+        )
+    contour_fill_source = next(
+        (handle for handle in contour_fill_handles if handle is not None),
+        None
+    )
+    legend_handles, legend_labels = axes_list[1].get_legend_handles_labels()
+    beta_text = format_metric(beta_value, 4) if beta_value is not None else '-'
+    legend_handles.append(
+        Line2D([], [], linestyle='None', marker='', color='none')
+    )
+    legend_labels.append(f"Beta (axial-flexure) = {beta_text}")
+    axes_list[1].legend(
+        legend_handles,
+        legend_labels,
+        loc='best',
+        fontsize=7.3
+    )
+
+    fig.suptitle(
+        f"Nonlinear Contour g(x)=0 | Column Element E{int(elem_id)} | Physical P-M Space",
+        fontsize=13,
+        y=0.99
+    )
+    layout_rect = [0, 0, 0.90, 0.97] if contour_fill_source is not None else [0, 0, 1, 0.97]
+    fig.tight_layout(rect=layout_rect)
+    if contour_fill_source is not None:
+        colorbar_axis = fig.add_axes([0.915, 0.16, 0.016, 0.68])
+        fig.colorbar(
+            contour_fill_source,
+            cax=colorbar_axis,
+            label='Estimated nonlinear signed margin g_hat(M, P) (-)'
+        )
+    return fig
+
+
+def render_probabilistic_axial_moment_pm_cloud_section(
+    axial_moment_pm_cloud_data: Dict[str, Any],
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    input_data: Optional[Dict],
+    elem_id: int,
+    heading_level: str = "####"
+) -> None:
+    """Render the axial-flexure figure in physical `P-M` space."""
+    fallback_elem_id = int(elem_id)
+    available_column_ids = sorted(
+        int(candidate_id)
+        for candidate_id in list((axial_moment_pm_cloud_data or {}).get('element_ids', []) or [])
+        if (
+            get_element_code_from_input(input_data, int(candidate_id)) == 'K'
+            and (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(int(candidate_id)))
+        )
+    )
+
+    st.markdown(f"{heading_level} Contour Nonlinier g(x)=0 in Physical Space")
+    st.caption(
+        "Panel ini menggambarkan `nonlinear contour g(x)=0` pada ruang fisik `P-M` "
+        "untuk elemen kolom, dibangun dari sampel probabilistik yang tersimpan."
+    )
+    st.caption(
+        "Dengan tampilan ini, batas gagal aksial-lentur terlihat langsung sebagai pola "
+        "nonlinier pada bidang fisik `M-P`, bukan hanya pada bentuk ternormalisasi `lambda`."
+    )
+    st.caption(
+        "Envelope abu-abu menunjukkan rentang boundary sampel `P10-P90`, garis abu-abu "
+        "putus-putus menunjukkan median boundary, dan latar warna menunjukkan "
+        "`signed margin g_hat(M,P)` hasil aproksimasi."
+    )
+
+    if not available_column_ids:
+        st.info(
+            "Contour nonlinier ruang fisik hanya tersedia untuk elemen kolom yang memiliki "
+            "dataset aksial-lentur probabilistik."
+        )
+        return
+
+    default_elem_id = (
+        fallback_elem_id
+        if fallback_elem_id in available_column_ids else
+        available_column_ids[0]
+    )
+    selected_pm_elem_id = st.selectbox(
+        "Pilih elemen kolom untuk contour nonlinier ruang fisik",
+        options=available_column_ids,
+        index=available_column_ids.index(int(default_elem_id)),
+        format_func=lambda candidate_id: f"E{int(candidate_id)} | Kolom",
+        key="physical_nonlinear_contour_column_selector"
+    )
+    selected_pm_elem_id = int(selected_pm_elem_id)
+    record = (
+        (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(selected_pm_elem_id))
+        or {}
+    )
+    if not record:
+        st.info(
+            "Dataset aksial-lentur probabilistik untuk kolom terpilih belum dapat dibaca."
+        )
+        return
+
+    show_boundary_envelope = st.checkbox(
+        "Tampilkan envelope boundary sampel (P10-P90)",
+        value=True,
+        key=f"axial_moment_pm_envelope_toggle_e{selected_pm_elem_id}"
+    )
+    show_nonlinear_contour = st.checkbox(
+        "Tampilkan contour nonlinier g(x)=0 dari sampel sSMC",
+        value=True,
+        key=f"axial_moment_pm_contour_toggle_e{selected_pm_elem_id}"
+    )
+    beta_value = (
+        get_by_element_value(
+            (element_reliability or {}).get('axial_moment', {}),
+            selected_pm_elem_id,
+            {}
+        ) or {}
+    ).get('Beta')
+
+    pm_fig = build_probabilistic_axial_moment_pm_cloud_figure(
+        axial_moment_pm_cloud_data,
+        selected_pm_elem_id,
+        show_boundary_envelope=bool(show_boundary_envelope),
+        beta_value=beta_value,
+        show_nonlinear_contour=bool(show_nonlinear_contour)
+    )
+    if pm_fig is not None:
+        render_plot(
+            pm_fig,
+            interactive=True,
+            viewer_key=f"axial-moment-pm-cloud-e{selected_pm_elem_id}",
+            alt_text=f"Contour nonlinier ruang fisik P-M elemen {selected_pm_elem_id}",
+            viewer_height=720,
+            download_basename=f"contour-nonlinier-ruang-fisik-pm-e{selected_pm_elem_id}"
+        )
+    else:
+        st.info("Contour nonlinier ruang fisik untuk kolom terpilih belum dapat dibentuk.")
+
+
+def build_output_reliability_beta_sketch_df(
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    elem_id: int
+) -> pd.DataFrame:
+    """Bangun tabel ringkas Pf/Beta per limit-state untuk satu elemen."""
+    rows = []
+    element_reliability = element_reliability or {}
+
+    for spec in get_probabilistic_limit_state_histogram_specs():
+        reliability_record = get_by_element_value(
+            element_reliability.get(str(spec['key']), {}),
+            int(elem_id),
+            {}
+        ) or {}
+        if not reliability_record:
+            continue
+
+        pf_value = reliability_record.get('Pf')
+        beta_value = reliability_record.get('Beta')
+        rows.append({
+            'Limit State': spec['label'],
+            'Pf (-)': pf_value,
+            'Beta (-)': beta_value,
+            'Jumlah Gagal (-)': reliability_record.get('failures'),
+            'Level Risiko': describe_probabilistic_risk_level(pf_value, beta_value)
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_output_reliability_beta_sketch_figure(
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    elem_id: int,
+    target_beta: float = 3.0
+) -> Optional[plt.Figure]:
+    """Sketsa batang nilai Beta tabel reliability untuk satu elemen."""
+    summary_df = build_output_reliability_beta_sketch_df(
+        element_reliability,
+        int(elem_id)
+    )
+    if summary_df.empty:
+        return None
+
+    labels = summary_df['Limit State'].astype(str).tolist()
+    pf_values = [
+        coerce_finite_float(value)
+        for value in summary_df['Pf (-)'].tolist()
+    ]
+    beta_raw_values = summary_df['Beta (-)'].tolist()
+    beta_numeric_values: List[Optional[float]] = []
+    finite_beta_values: List[float] = []
+    has_positive_infinity = False
+    has_negative_infinity = False
+
+    for raw_value in beta_raw_values:
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_value = None
+        if numeric_value is None or np.isnan(numeric_value):
+            beta_numeric_values.append(None)
+            continue
+        if np.isposinf(numeric_value):
+            has_positive_infinity = True
+        elif np.isneginf(numeric_value):
+            has_negative_infinity = True
+        elif np.isfinite(numeric_value):
+            finite_beta_values.append(float(numeric_value))
+        beta_numeric_values.append(float(numeric_value))
+
+    y_min = min([-0.4, target_beta - 3.4] + finite_beta_values) if finite_beta_values else -0.4
+    y_max = max([target_beta + 1.0] + finite_beta_values) if finite_beta_values else (target_beta + 1.0)
+    if has_negative_infinity:
+        y_min = min(y_min, -2.0)
+    if has_positive_infinity:
+        y_max = max(y_max, target_beta + 1.8)
+    if np.isclose(y_min, y_max, atol=1e-12, rtol=1e-9):
+        y_max = y_min + 1.0
+
+    y_padding = max((y_max - y_min) * 0.12, 0.45)
+    plot_min = y_min - y_padding * 0.35
+    plot_max = y_max + y_padding
+    plotted_beta_values = []
+    for numeric_value in beta_numeric_values:
+        if numeric_value is None:
+            plotted_beta_values.append(np.nan)
+        elif np.isposinf(numeric_value):
+            plotted_beta_values.append(plot_max - y_padding * 0.35)
+        elif np.isneginf(numeric_value):
+            plotted_beta_values.append(plot_min + y_padding * 0.35)
+        else:
+            plotted_beta_values.append(float(numeric_value))
+
+    bar_colors = [
+        RISK_LEVEL_COLORS.get(
+            describe_probabilistic_risk_level(pf_value, raw_beta),
+            RISK_LEVEL_COLORS['Tidak Ada Data']
+        )
+        for pf_value, raw_beta in zip(pf_values, beta_raw_values)
+    ]
+
+    fig, axis = plt.subplots(figsize=(10.4, 5.8), dpi=180)
+    positions = np.arange(len(labels), dtype=float)
+    bars = axis.bar(
+        positions,
+        plotted_beta_values,
+        color=bar_colors,
+        alpha=0.88,
+        edgecolor='#0f172a',
+        linewidth=0.65
+    )
+    axis.axhline(
+        float(target_beta),
+        color='#111827',
+        linestyle='--',
+        linewidth=1.25,
+        label=f'Target Beta = {target_beta:.1f}'
+    )
+    axis.axhline(
+        0.0,
+        color='#94a3b8',
+        linestyle=':',
+        linewidth=1.0,
+        alpha=0.95
+    )
+
+    for bar, beta_value, plotted_value, pf_value in zip(
+        bars,
+        beta_numeric_values,
+        plotted_beta_values,
+        pf_values
+    ):
+        if beta_value is None or not np.isfinite(float(plotted_value)):
+            continue
+        if np.isposinf(beta_value):
+            beta_text = 'Infinity'
+        elif np.isneginf(beta_value):
+            beta_text = '-Infinity'
+        else:
+            beta_text = f"{float(beta_value):.3f}"
+        pf_text = '-' if pf_value is None else f"Pf={pf_value:.2e}"
+        text_offset = y_padding * 0.08
+        if float(plotted_value) >= 0.0:
+            y_text = float(plotted_value) + text_offset
+            vertical_alignment = 'bottom'
+        else:
+            y_text = float(plotted_value) - text_offset
+            vertical_alignment = 'top'
+        axis.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            y_text,
+            f"{beta_text}\n{pf_text}",
+            ha='center',
+            va=vertical_alignment,
+            fontsize=8.2,
+            color='#0f172a'
+        )
+
+    axis.set_xticks(positions)
+    axis.set_xticklabels(labels)
+    axis.set_ylabel('Indeks Keandalan, Beta (-)')
+    axis.set_title(f"Sketsa Beta Reliability | Element E{int(elem_id)}", fontsize=12, pad=12)
+    axis.set_ylim(plot_min, plot_max)
+    axis.grid(True, axis='y', alpha=0.22, linestyle='--')
+    axis.legend(loc='upper right', fontsize=8.4)
+    fig.tight_layout()
+    return fig
+
+
+def render_output_reliability_beta_sketch_section(
+    results_bundle: Dict[str, Any],
+    input_data: Optional[Dict],
+    heading_level: str = "####"
+) -> None:
+    """Render sketsa visual nilai Beta yang tampil pada tabel reliability."""
+    element_reliability = (results_bundle or {}).get('element_reliability', {}) or {}
+    available_element_ids = sorted({
+        int(elem_id)
+        for state_name in ('moment', 'shear', 'axial', 'axial_moment')
+        for elem_id in (element_reliability.get(state_name, {}) or {}).keys()
+    })
+    if not available_element_ids:
+        st.info("Sketsa Beta belum tersedia karena data reliability per elemen belum ada.")
+        return
+
+    st.markdown(f"{heading_level} Sketsa Beta per Elemen")
+    st.caption(
+        "Grafik ini memvisualkan nilai `Beta` yang sama dengan tabel `Output Reliability`, "
+        "sehingga perbandingan antar limit state pada satu elemen lebih cepat terbaca."
+    )
+    st.caption(
+        "Garis putus-putus `beta = 3.0` dipakai sebagai acuan target ULS. "
+        "Warna batang mengikuti level risiko yang diturunkan dari kombinasi `Pf/Beta`."
+    )
+
+    selected_element_id = st.selectbox(
+        "Pilih elemen untuk sketsa Beta",
+        options=available_element_ids,
+        format_func=lambda elem_id: (
+            f"E{int(elem_id)} | "
+            f"{get_element_type_label(get_element_code_from_input(input_data, int(elem_id)))}"
+        ),
+        key="output_reliability_beta_selector"
+    )
+
+    beta_fig = build_output_reliability_beta_sketch_figure(
+        element_reliability,
+        int(selected_element_id)
+    )
+    if beta_fig is not None:
+        render_plot(
+            beta_fig,
+            interactive=True,
+            viewer_key=f"output-reliability-beta-e{int(selected_element_id)}",
+            alt_text=f"Sketsa beta reliability elemen {int(selected_element_id)}",
+            viewer_height=620,
+            download_basename=f"sketsa-beta-reliability-e{int(selected_element_id)}"
+        )
+    else:
+        st.info("Sketsa Beta untuk elemen terpilih belum dapat dibentuk.")
+
+    beta_summary_df = build_output_reliability_beta_sketch_df(
+        element_reliability,
+        int(selected_element_id)
+    )
+    if beta_summary_df.empty:
+        st.info("Ringkasan Beta untuk elemen terpilih belum tersedia.")
+    else:
+        render_input_table(
+            beta_summary_df,
+            styler=style_input_dataframe(
+                beta_summary_df,
+                table_min_width_px=1050
+            )
+        )
+
+
+def get_failure_cloud_variable_prefix_specs() -> Dict[str, Dict[str, str]]:
+    """Metadata label variabel acak untuk tab Failure Cloud."""
+    return {
+        'fb': {
+            'label': 'Faktor Bias Modulus E',
+            'unit': '(-)'
+        },
+        'E': {
+            'label': 'Modulus Elastisitas E',
+            'unit': 'MPa'
+        },
+        'fc': {
+            'label': 'Mutu Beton fc',
+            'unit': 'MPa'
+        },
+        'fy_tarik': {
+            'label': 'fy Tarik',
+            'unit': 'MPa'
+        },
+        'fy_tekan': {
+            'label': 'fy Tekan',
+            'unit': 'MPa'
+        },
+        'fy_geser': {
+            'label': 'fy Geser',
+            'unit': 'MPa'
+        },
+        'qDL': {
+            'label': 'Beban Mati qDL',
+            'unit': 'kN/m'
+        },
+        'qLL': {
+            'label': 'Beban Hidup qLL',
+            'unit': 'kN/m'
+        }
+    }
+
+
+def extract_variable_prefix_from_name(variable_name: str) -> str:
+    """Ambil prefix nama variabel acak flat seperti `fc` dari `fc_E7`."""
+    match = re.fullmatch(r'([A-Za-z_]+)_E\d+', str(variable_name or '').strip())
+    if match:
+        return str(match.group(1))
+    return str(variable_name or '').strip()
+
+
+def downsample_index_array(indices: np.ndarray, max_points: int) -> np.ndarray:
+    """Ambil subset indeks merata dengan urutan tetap."""
+    index_array = np.asarray(indices, dtype=int).reshape(-1)
+    if max_points <= 0 or index_array.size == 0:
+        return np.asarray([], dtype=int)
+    if index_array.size <= int(max_points):
+        return index_array.astype(int)
+
+    target_size = int(max_points)
+    step = index_array.size / float(target_size)
+    selected_positions = np.floor(np.arange(target_size, dtype=float) * step).astype(int)
+    selected_positions = np.clip(selected_positions, 0, index_array.size - 1)
+    return index_array[selected_positions].astype(int)
+
+
+def build_probabilistic_failure_cloud_data(mc_results: Optional[Dict[str, Any]],
+                                           random_variables: Optional[Dict[str, Dict[str, Any]]],
+                                           input_data: Optional[Dict],
+                                           max_points: int = FAILURE_CLOUD_MAX_STORED_POINTS,
+                                           max_failed_points: int = FAILURE_CLOUD_MAX_FAILED_POINTS) -> Dict[str, Any]:
+    """Bangun dataset ringkas untuk visualisasi failure cloud sistem."""
+    if not mc_results or not random_variables:
+        return {}
+
+    sample_history = list(mc_results.get('random_samples_history', []) or [])
+    if not sample_history:
+        return {}
+
+    num_samples = len(sample_history)
+    valid_failure_indices = sorted({
+        int(index)
+        for index in (mc_results.get('failure_indices', []) or [])
+        if 0 <= int(index) < num_samples
+    })
+    failure_set = set(valid_failure_indices)
+    failure_index_array = np.asarray(valid_failure_indices, dtype=int)
+    safe_index_array = np.asarray(
+        [index for index in range(num_samples) if index not in failure_set],
+        dtype=int
+    )
+
+    selected_failed = downsample_index_array(
+        failure_index_array,
+        min(int(max_failed_points), int(max_points))
+    )
+    remaining_capacity = max(int(max_points) - int(selected_failed.size), 0)
+    selected_safe = downsample_index_array(safe_index_array, remaining_capacity)
+
+    selected_indices = np.sort(
+        np.concatenate([selected_failed, selected_safe]).astype(int)
+    )
+    if selected_indices.size == 0:
+        return {}
+
+    prefix_specs = get_failure_cloud_variable_prefix_specs()
+    selected_failure_mask = np.asarray(
+        [int(index) in failure_set for index in selected_indices],
+        dtype=bool
+    )
+
+    variables: Dict[str, Dict[str, Any]] = {}
+    for variable_name, variable_info in random_variables.items():
+        prefix = extract_variable_prefix_from_name(variable_name)
+        elem_id = extract_element_id_from_variable_name(variable_name)
+        prefix_spec = prefix_specs.get(prefix, {})
+        element_code = (
+            get_element_code_from_input(input_data, int(elem_id))
+            if elem_id is not None else
+            '-'
+        )
+        element_type = (
+            get_element_type_label(element_code)
+            if elem_id is not None else
+            '-'
+        )
+        sampled_values_list = []
+        for index in selected_indices:
+            raw_value = sample_history[int(index)].get(variable_name)
+            numeric_value = coerce_finite_float(raw_value)
+            sampled_values_list.append(
+                np.nan if numeric_value is None else float(numeric_value)
+            )
+        sampled_values = np.asarray(sampled_values_list, dtype=float)
+
+        variables[str(variable_name)] = {
+            'variable_name': str(variable_name),
+            'prefix': str(prefix),
+            'element_id': None if elem_id is None else int(elem_id),
+            'element_code': str(element_code),
+            'element_type': str(element_type),
+            'label': str(prefix_spec.get('label', prefix or variable_name)),
+            'unit': str(prefix_spec.get('unit', '-')),
+            'distribution': str(variable_info.get('distribution', '-')),
+            'mean_input': coerce_finite_float(variable_info.get('mean')),
+            'stddev_input': coerce_finite_float(variable_info.get('stddev')),
+            'values': sampled_values.tolist()
+        }
+
+    return {
+        'num_simulations': int(mc_results.get('num_simulations', num_samples) or num_samples),
+        'failures': int(mc_results.get('failures', len(valid_failure_indices)) or 0),
+        'analysis_failures': int(mc_results.get('analysis_failures', 0) or 0),
+        'stored_sample_count': int(selected_indices.size),
+        'stored_failure_count': int(np.sum(selected_failure_mask)),
+        'stored_safe_count': int(selected_indices.size - np.sum(selected_failure_mask)),
+        'used_downsampling': bool(selected_indices.size < num_samples),
+        'failed_points_truncated': bool(selected_failed.size < failure_index_array.size),
+        'failure_mask': selected_failure_mask.tolist(),
+        'variables': variables
+    }
+
+
+def get_failure_cloud_variable_sort_order(failure_cloud_data: Dict[str, Any],
+                                          sensitivity_results: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
+    """Urutkan variabel berdasarkan ranking sensitivitas lalu alfabetis."""
+    variable_names = list((failure_cloud_data or {}).get('variables', {}).keys())
+    if not variable_names:
+        return []
+
+    sensitivity_lookup = {
+        str(var_name): index
+        for index, var_name in enumerate((sensitivity_results or {}).keys())
+    }
+    return sorted(
+        variable_names,
+        key=lambda var_name: (
+            sensitivity_lookup.get(str(var_name), len(sensitivity_lookup) + 1000),
+            str(var_name)
+        )
+    )
+
+
+def get_failure_cloud_default_variable_names(failure_cloud_data: Dict[str, Any],
+                                             sensitivity_results: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Pilih default sumbu `X/Y` dari variabel paling sensitif yang tersedia."""
+    ordered_names = get_failure_cloud_variable_sort_order(
+        failure_cloud_data,
+        sensitivity_results=sensitivity_results
+    )
+    if not ordered_names:
+        return None, None
+    if len(ordered_names) == 1:
+        return ordered_names[0], None
+    return ordered_names[0], ordered_names[1]
+
+
+def get_failure_cloud_default_three_variable_names(failure_cloud_data: Dict[str, Any],
+                                                   sensitivity_results: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Pilih default sumbu `X/Y/Z` dari variabel paling sensitif yang tersedia."""
+    ordered_names = get_failure_cloud_variable_sort_order(
+        failure_cloud_data,
+        sensitivity_results=sensitivity_results
+    )
+    if not ordered_names:
+        return None, None, None
+    if len(ordered_names) == 1:
+        return ordered_names[0], None, None
+    if len(ordered_names) == 2:
+        return ordered_names[0], ordered_names[1], None
+    return ordered_names[0], ordered_names[1], ordered_names[2]
+
+
+def get_first_distinct_failure_cloud_variable_name(variable_names: List[str],
+                                                   excluded_names: List[str]) -> Optional[str]:
+    """Ambil variabel pertama yang tidak termasuk daftar eksklusi."""
+    excluded = {str(name) for name in (excluded_names or [])}
+    for variable_name in (variable_names or []):
+        if str(variable_name) not in excluded:
+            return str(variable_name)
+    return None
+
+
+def format_failure_cloud_variable_label(record: Dict[str, Any],
+                                        short: bool = False) -> str:
+    """Format label ramah pengguna untuk pilihan variabel failure cloud."""
+    variable_name = str(record.get('variable_name', '-') or '-')
+    label = str(record.get('label', variable_name) or variable_name)
+    unit = str(record.get('unit', '-') or '-')
+    elem_id = record.get('element_id')
+    element_type = str(record.get('element_type', '-') or '-')
+
+    if short:
+        if elem_id is None:
+            return f"{label} [{unit}]"
+        return f"{label} | E{int(elem_id)} ({element_type}) [{unit}]"
+
+    if elem_id is None:
+        return f"{variable_name} | {label} [{unit}]"
+    return (
+        f"{variable_name} | E{int(elem_id)} ({element_type}) | "
+        f"{label} [{unit}]"
+    )
+
+
+def prepare_failure_cloud_plot_data(failure_cloud_data: Dict[str, Any],
+                                    x_variable_name: str,
+                                    y_variable_name: str) -> Optional[Dict[str, Any]]:
+    """Siapkan array `X/Y` dan mask failure untuk plotting failure cloud."""
+    variables = (failure_cloud_data or {}).get('variables', {}) or {}
+    x_record = variables.get(str(x_variable_name))
+    y_record = variables.get(str(y_variable_name))
+    if not x_record or not y_record:
+        return None
+
+    x_values = np.asarray(x_record.get('values', []), dtype=float)
+    y_values = np.asarray(y_record.get('values', []), dtype=float)
+    failure_mask = np.asarray(failure_cloud_data.get('failure_mask', []), dtype=bool)
+
+    common_size = min(int(x_values.size), int(y_values.size), int(failure_mask.size))
+    if common_size <= 0:
+        return None
+
+    x_values = x_values[:common_size]
+    y_values = y_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+    valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(valid_mask):
+        return None
+
+    x_valid = x_values[valid_mask]
+    y_valid = y_values[valid_mask]
+    failure_valid = failure_mask[valid_mask]
+    safe_valid = ~failure_valid
+
+    return {
+        'x_record': x_record,
+        'y_record': y_record,
+        'x': x_valid,
+        'y': y_valid,
+        'failure_mask': failure_valid,
+        'safe_mask': safe_valid,
+        'plot_count': int(x_valid.size),
+        'failure_count': int(np.sum(failure_valid)),
+        'safe_count': int(np.sum(safe_valid))
+    }
+
+
+def get_failure_cloud_axis_limits(values: np.ndarray) -> Tuple[float, float]:
+    """Tentukan batas sumbu dengan padding ringan agar cloud mudah dibaca."""
+    numeric_values = np.asarray(values, dtype=float)
+    if numeric_values.size == 0:
+        return -1.0, 1.0
+
+    data_min = float(np.min(numeric_values))
+    data_max = float(np.max(numeric_values))
+    if np.isclose(data_min, data_max, atol=1e-12, rtol=1e-9):
+        span = max(abs(data_min) * 0.05, 1e-6)
+        return data_min - span, data_max + span
+
+    span = data_max - data_min
+    padding = max(span * 0.06, 1e-6)
+    return data_min - padding, data_max + padding
+
+
+def build_failure_cloud_figure(failure_cloud_data: Dict[str, Any],
+                               x_variable_name: str,
+                               y_variable_name: str) -> Optional[plt.Figure]:
+    """Bangun scatter `safe` vs `failed` pada ruang dua variabel acak."""
+    plot_data = prepare_failure_cloud_plot_data(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name
+    )
+    if plot_data is None:
+        return None
+
+    x_values = np.asarray(plot_data['x'], dtype=float)
+    y_values = np.asarray(plot_data['y'], dtype=float)
+    safe_mask = np.asarray(plot_data['safe_mask'], dtype=bool)
+    failure_mask = np.asarray(plot_data['failure_mask'], dtype=bool)
+    x_record = plot_data['x_record']
+    y_record = plot_data['y_record']
+
+    fig, axis = plt.subplots(figsize=(10.8, 7.0), dpi=180)
+    axis.set_facecolor('#f8fafc')
+
+    if np.any(safe_mask):
+        axis.scatter(
+            x_values[safe_mask],
+            y_values[safe_mask],
+            s=16,
+            color=SAFE_CLOUD_COLOR,
+            alpha=0.30,
+            edgecolors='none',
+            label=f"Safe ({int(np.sum(safe_mask)):,})"
+        )
+
+    if np.any(failure_mask):
+        axis.scatter(
+            x_values[failure_mask],
+            y_values[failure_mask],
+            s=26,
+            color='#dc2626',
+            alpha=0.80,
+            edgecolors='#ffffff',
+            linewidths=0.25,
+            label=f"Failed ({int(np.sum(failure_mask)):,})"
+        )
+
+    x_input_mean = coerce_finite_float(x_record.get('mean_input'))
+    y_input_mean = coerce_finite_float(y_record.get('mean_input'))
+    if x_input_mean is not None:
+        axis.axvline(
+            x_input_mean,
+            color='#475569',
+            linestyle='--',
+            linewidth=1.0,
+            alpha=0.95
+        )
+    if y_input_mean is not None:
+        axis.axhline(
+            y_input_mean,
+            color='#475569',
+            linestyle='--',
+            linewidth=1.0,
+            alpha=0.95
+        )
+    if x_input_mean is not None and y_input_mean is not None:
+        axis.scatter(
+            [x_input_mean],
+            [y_input_mean],
+            marker='x',
+            s=74,
+            color='#0f172a',
+            linewidths=1.6,
+            label='Input Mean'
+        )
+
+    axis.set_xlim(*get_failure_cloud_axis_limits(x_values))
+    axis.set_ylim(*get_failure_cloud_axis_limits(y_values))
+    axis.set_xlabel(format_failure_cloud_variable_label(x_record, short=True))
+    axis.set_ylabel(format_failure_cloud_variable_label(y_record, short=True))
+    axis.set_title("Failure Cloud of Monte Carlo Samples", fontsize=12, pad=12)
+    axis.grid(True, alpha=0.24, linestyle='--')
+    axis.legend(loc='best', fontsize=8.5)
+
+    fig.suptitle(
+        "Failure Cloud | System Failure Classification",
+        fontsize=13,
+        y=0.98
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def build_failure_cloud_summary_df(failure_cloud_data: Dict[str, Any],
+                                   x_variable_name: str,
+                                   y_variable_name: str) -> pd.DataFrame:
+    """Ringkas statistik subset titik yang diplot pada failure cloud."""
+    plot_data = prepare_failure_cloud_plot_data(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name
+    )
+    if plot_data is None:
+        return pd.DataFrame()
+
+    x_values = np.asarray(plot_data['x'], dtype=float)
+    y_values = np.asarray(plot_data['y'], dtype=float)
+    failure_mask = np.asarray(plot_data['failure_mask'], dtype=bool)
+    safe_mask = np.asarray(plot_data['safe_mask'], dtype=bool)
+    total_points = max(int(plot_data.get('plot_count', 0)), 1)
+
+    x_record = plot_data['x_record']
+    y_record = plot_data['y_record']
+    x_unit = str(x_record.get('unit', '-') or '-')
+    y_unit = str(y_record.get('unit', '-') or '-')
+
+    rows = []
+    category_specs = [
+        ('Semua Titik Cloud', np.ones(total_points, dtype=bool)),
+        ('Safe', safe_mask),
+        ('Failed', failure_mask)
+    ]
+    for category_label, mask in category_specs:
+        if mask.size != total_points or not np.any(mask):
+            continue
+
+        x_subset = x_values[mask]
+        y_subset = y_values[mask]
+        rows.append({
+            'Kategori': category_label,
+            'Jumlah Titik (-)': int(x_subset.size),
+            'Proporsi Cloud (%)': float((x_subset.size / total_points) * 100.0),
+            f'X Mean ({x_unit})': float(np.mean(x_subset)),
+            f'X StdDev ({x_unit})': float(np.std(x_subset)),
+            f'Y Mean ({y_unit})': float(np.mean(y_subset)),
+            f'Y StdDev ({y_unit})': float(np.std(y_subset))
+        })
+
+    return pd.DataFrame(rows)
+
+
+def transform_failure_cloud_values_to_standard_normal_space(values: np.ndarray,
+                                                            record: Dict[str, Any]) -> np.ndarray:
+    """Transform nilai variabel acak ke ruang normal baku `U`."""
+    numeric_values = np.asarray(values, dtype=float)
+    distribution_name = str(record.get('distribution', 'normal') or 'normal').strip().lower()
+    mean_value = coerce_finite_float(record.get('mean_input'))
+    stddev_value = coerce_finite_float(record.get('stddev_input'))
+    if numeric_values.size == 0:
+        return np.asarray([], dtype=float)
+
+    if distribution_name == 'normal':
+        if mean_value is None:
+            mean_value = 0.0
+        if stddev_value is None or stddev_value <= 0.0:
+            return np.zeros_like(numeric_values, dtype=float)
+        return (numeric_values - float(mean_value)) / float(stddev_value)
+
+    if distribution_name == 'lognormal':
+        if mean_value is None or mean_value <= 0.0:
+            return np.full_like(numeric_values, np.nan, dtype=float)
+        if stddev_value is None or stddev_value <= 0.0:
+            return np.zeros_like(numeric_values, dtype=float)
+
+        variance_ratio = (float(stddev_value) / float(mean_value)) ** 2
+        sigma_ln = np.sqrt(np.log(1.0 + variance_ratio))
+        if not np.isfinite(sigma_ln) or sigma_ln <= 0.0:
+            return np.zeros_like(numeric_values, dtype=float)
+
+        mu_ln = np.log(float(mean_value)) - 0.5 * sigma_ln ** 2
+        clipped_values = np.clip(numeric_values, 1e-12, None)
+        return (np.log(clipped_values) - mu_ln) / sigma_ln
+
+    if mean_value is None:
+        mean_value = float(np.nanmean(numeric_values)) if numeric_values.size else 0.0
+    if stddev_value is None or stddev_value <= 0.0:
+        return np.zeros_like(numeric_values, dtype=float)
+    return (numeric_values - float(mean_value)) / float(stddev_value)
+
+
+def build_failure_surface_axis_label(record: Dict[str, Any]) -> str:
+    """Label sumbu ringkas untuk ruang normal baku `U`."""
+    variable_name = str(record.get('variable_name', '-') or '-')
+    return f"u({variable_name}) (-)"
+
+
+def prepare_failure_surface_plot_data(failure_cloud_data: Dict[str, Any],
+                                      x_variable_name: str,
+                                      y_variable_name: str) -> Optional[Dict[str, Any]]:
+    """Siapkan pasangan data `u1-u2` dan kelas safe/failed untuk failure surface."""
+    plot_data = prepare_failure_cloud_plot_data(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name
+    )
+    if plot_data is None:
+        return None
+
+    x_record = plot_data['x_record']
+    y_record = plot_data['y_record']
+    x_u = transform_failure_cloud_values_to_standard_normal_space(plot_data['x'], x_record)
+    y_u = transform_failure_cloud_values_to_standard_normal_space(plot_data['y'], y_record)
+    failure_mask = np.asarray(plot_data['failure_mask'], dtype=bool)
+
+    valid_mask = np.isfinite(x_u) & np.isfinite(y_u)
+    if not np.any(valid_mask):
+        return None
+
+    x_valid = np.asarray(x_u[valid_mask], dtype=float)
+    y_valid = np.asarray(y_u[valid_mask], dtype=float)
+    failure_valid = np.asarray(failure_mask[valid_mask], dtype=bool)
+    safe_valid = ~failure_valid
+
+    return {
+        'x_record': x_record,
+        'y_record': y_record,
+        'u_x': x_valid,
+        'u_y': y_valid,
+        'failure_mask': failure_valid,
+        'safe_mask': safe_valid,
+        'plot_count': int(x_valid.size),
+        'failure_count': int(np.sum(failure_valid)),
+        'safe_count': int(np.sum(safe_valid))
+    }
+
+
+def prepare_failure_surface_3d_plot_data(failure_cloud_data: Dict[str, Any],
+                                         x_variable_name: str,
+                                         y_variable_name: str,
+                                         z_variable_name: str) -> Optional[Dict[str, Any]]:
+    """Siapkan pasangan data `u1-u2-u3` dan kelas safe/failed untuk failure surface 3D."""
+    variables = (failure_cloud_data or {}).get('variables', {}) or {}
+    x_record = variables.get(str(x_variable_name))
+    y_record = variables.get(str(y_variable_name))
+    z_record = variables.get(str(z_variable_name))
+    if not x_record or not y_record or not z_record:
+        return None
+
+    x_values = np.asarray(x_record.get('values', []), dtype=float)
+    y_values = np.asarray(y_record.get('values', []), dtype=float)
+    z_values = np.asarray(z_record.get('values', []), dtype=float)
+    failure_mask = np.asarray(failure_cloud_data.get('failure_mask', []), dtype=bool)
+
+    common_size = min(
+        int(x_values.size),
+        int(y_values.size),
+        int(z_values.size),
+        int(failure_mask.size)
+    )
+    if common_size <= 0:
+        return None
+
+    x_values = x_values[:common_size]
+    y_values = y_values[:common_size]
+    z_values = z_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+
+    x_u = transform_failure_cloud_values_to_standard_normal_space(x_values, x_record)
+    y_u = transform_failure_cloud_values_to_standard_normal_space(y_values, y_record)
+    z_u = transform_failure_cloud_values_to_standard_normal_space(z_values, z_record)
+    valid_mask = np.isfinite(x_u) & np.isfinite(y_u) & np.isfinite(z_u)
+    if not np.any(valid_mask):
+        return None
+
+    x_valid = np.asarray(x_u[valid_mask], dtype=float)
+    y_valid = np.asarray(y_u[valid_mask], dtype=float)
+    z_valid = np.asarray(z_u[valid_mask], dtype=float)
+    failure_valid = np.asarray(failure_mask[valid_mask], dtype=bool)
+    safe_valid = ~failure_valid
+
+    return {
+        'x_record': x_record,
+        'y_record': y_record,
+        'z_record': z_record,
+        'u_x': x_valid,
+        'u_y': y_valid,
+        'u_z': z_valid,
+        'failure_mask': failure_valid,
+        'safe_mask': safe_valid,
+        'plot_count': int(x_valid.size),
+        'failure_count': int(np.sum(failure_valid)),
+        'safe_count': int(np.sum(safe_valid))
+    }
+
+
+def build_beta_circle_values(x_limits: Tuple[float, float],
+                             y_limits: Tuple[float, float]) -> List[float]:
+    """Pilih radius lingkar beta yang masih relevan di area plot."""
+    max_radius = max(
+        abs(float(x_limits[0])),
+        abs(float(x_limits[1])),
+        abs(float(y_limits[0])),
+        abs(float(y_limits[1]))
+    )
+    candidate_values = [1.0, 2.0, 3.0, 4.0]
+    return [
+        beta_value
+        for beta_value in candidate_values
+        if beta_value <= max_radius + 0.25
+    ]
+
+
+def build_nice_contour_step(max_abs_value: float,
+                            target_half_steps: int = 4) -> float:
+    """Pilih langkah kontur simetris yang cukup bersih untuk dibaca."""
+    try:
+        numeric_value = abs(float(max_abs_value))
+    except (TypeError, ValueError):
+        numeric_value = 0.0
+    if not np.isfinite(numeric_value) or numeric_value <= 1e-12:
+        return 1.0
+
+    half_steps = max(int(target_half_steps), 1)
+    raw_step = numeric_value / float(half_steps)
+    exponent = np.floor(np.log10(raw_step))
+    scale = 10.0 ** exponent
+    normalized = raw_step / scale
+    if normalized <= 1.0:
+        factor = 1.0
+    elif normalized <= 2.0:
+        factor = 2.0
+    elif normalized <= 5.0:
+        factor = 5.0
+    else:
+        factor = 10.0
+    return float(factor * scale)
+
+
+def estimate_failure_surface_2d_mpp_from_grid(grid_x: np.ndarray,
+                                              grid_y: np.ndarray,
+                                              score_grid: np.ndarray) -> Optional[Dict[str, Any]]:
+    """Estimasi MPP 2D dari titik potong `g_hat(u)=0` yang terdekat ke origin."""
+    x_array = np.asarray(grid_x, dtype=float)
+    y_array = np.asarray(grid_y, dtype=float)
+    score_array = np.asarray(score_grid, dtype=float)
+    if x_array.ndim != 2 or y_array.ndim != 2 or score_array.ndim != 2:
+        return None
+    if x_array.shape != y_array.shape or x_array.shape != score_array.shape:
+        return None
+
+    candidate_points: List[Tuple[float, float]] = []
+    num_rows, num_cols = score_array.shape
+
+    def append_zero_crossing(x1: float, y1: float, s1: float,
+                             x2: float, y2: float, s2: float) -> None:
+        if not all(np.isfinite(value) for value in (x1, y1, s1, x2, y2, s2)):
+            return
+        if s1 == 0.0 and s2 == 0.0:
+            candidate_points.append((0.5 * (x1 + x2), 0.5 * (y1 + y2)))
+            return
+        if s1 == 0.0:
+            candidate_points.append((x1, y1))
+            return
+        if s2 == 0.0:
+            candidate_points.append((x2, y2))
+            return
+        if (s1 < 0.0 and s2 > 0.0) or (s1 > 0.0 and s2 < 0.0):
+            denominator = (s2 - s1)
+            if abs(float(denominator)) <= 1e-12:
+                t_value = 0.5
+            else:
+                t_value = float(-s1 / denominator)
+            t_value = float(np.clip(t_value, 0.0, 1.0))
+            candidate_points.append((
+                x1 + t_value * (x2 - x1),
+                y1 + t_value * (y2 - y1)
+            ))
+
+    for row_index in range(num_rows):
+        for col_index in range(num_cols - 1):
+            append_zero_crossing(
+                float(x_array[row_index, col_index]),
+                float(y_array[row_index, col_index]),
+                float(score_array[row_index, col_index]),
+                float(x_array[row_index, col_index + 1]),
+                float(y_array[row_index, col_index + 1]),
+                float(score_array[row_index, col_index + 1])
+            )
+
+    for row_index in range(num_rows - 1):
+        for col_index in range(num_cols):
+            append_zero_crossing(
+                float(x_array[row_index, col_index]),
+                float(y_array[row_index, col_index]),
+                float(score_array[row_index, col_index]),
+                float(x_array[row_index + 1, col_index]),
+                float(y_array[row_index + 1, col_index]),
+                float(score_array[row_index + 1, col_index])
+            )
+
+    if not candidate_points:
+        return None
+
+    candidate_array = np.asarray(candidate_points, dtype=float)
+    candidate_array = candidate_array[
+        np.isfinite(candidate_array[:, 0]) & np.isfinite(candidate_array[:, 1])
+    ]
+    if candidate_array.size == 0:
+        return None
+
+    radii = np.linalg.norm(candidate_array, axis=1)
+    if radii.size == 0 or not np.any(np.isfinite(radii)):
+        return None
+
+    best_index = int(np.nanargmin(radii))
+    best_point = np.asarray(candidate_array[best_index], dtype=float)
+    beta_value = float(radii[best_index])
+    return {
+        'point': best_point,
+        'beta': beta_value
+    }
+
+
+def get_failure_surface_axis_limits(values: np.ndarray) -> Tuple[float, float]:
+    """Batas sumbu simetris untuk tampilan ruang normal baku `U`."""
+    numeric_values = np.asarray(values, dtype=float)
+    if numeric_values.size == 0:
+        return -4.0, 4.0
+
+    finite_values = numeric_values[np.isfinite(numeric_values)]
+    if finite_values.size == 0:
+        return -4.0, 4.0
+
+    max_abs = max(
+        float(np.max(np.abs(finite_values))),
+        3.0
+    )
+    limit = max_abs + 0.45
+    return -limit, limit
+
+
+def downsample_xy_series(x_values: np.ndarray,
+                         y_values: np.ndarray,
+                         max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Padatkan pasangan titik `x-y` secara merata."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    common_size = min(int(x_array.size), int(y_array.size))
+    if common_size <= 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+    base_indices = np.arange(common_size, dtype=int)
+    selected_indices = downsample_index_array(base_indices, int(max_points))
+    return x_array[selected_indices], y_array[selected_indices]
+
+
+def downsample_xyz_series(x_values: np.ndarray,
+                          y_values: np.ndarray,
+                          z_values: np.ndarray,
+                          max_points: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Padatkan pasangan titik `x-y-z` secara merata."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    z_array = np.asarray(z_values, dtype=float).reshape(-1)
+    common_size = min(int(x_array.size), int(y_array.size), int(z_array.size))
+    if common_size <= 0:
+        return (
+            np.asarray([], dtype=float),
+            np.asarray([], dtype=float),
+            np.asarray([], dtype=float)
+        )
+
+    base_indices = np.arange(common_size, dtype=int)
+    selected_indices = downsample_index_array(base_indices, int(max_points))
+    return (
+        x_array[selected_indices],
+        y_array[selected_indices],
+        z_array[selected_indices]
+    )
+
+
+def build_failure_surface_3d_quadratic_features(x_values: np.ndarray,
+                                                y_values: np.ndarray,
+                                                z_values: np.ndarray) -> np.ndarray:
+    """Bangun fitur kuadratik implisit 3D untuk surrogate batas gagal."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    z_array = np.asarray(z_values, dtype=float).reshape(-1)
+    return np.column_stack([
+        np.ones_like(x_array, dtype=float),
+        x_array,
+        y_array,
+        z_array,
+        x_array * x_array,
+        x_array * y_array,
+        y_array * y_array,
+        x_array * z_array,
+        y_array * z_array,
+        z_array * z_array
+    ])
+
+
+def build_failure_surface_polynomial_features(x_values: np.ndarray,
+                                              y_values: np.ndarray) -> np.ndarray:
+    """Bangun fitur kuadratik 2D untuk surrogate batas gagal."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    return np.column_stack([
+        np.ones_like(x_array, dtype=float),
+        x_array,
+        y_array,
+        x_array * x_array,
+        x_array * y_array,
+        y_array * y_array
+    ])
+
+
+def estimate_failure_surface_grid_from_kde(failure_x: np.ndarray,
+                                           failure_y: np.ndarray,
+                                           safe_x: np.ndarray,
+                                           safe_y: np.ndarray,
+                                           grid_x: np.ndarray,
+                                           grid_y: np.ndarray) -> Optional[np.ndarray]:
+    """Estimasi score grid dengan pemisahan densitas `KDE`."""
+    grid_points = np.vstack([grid_x.ravel(), grid_y.ravel()])
+    failure_points = np.vstack([failure_x, failure_y])
+    safe_points = np.vstack([safe_x, safe_y])
+    rng = np.random.default_rng(20260510)
+    jitter_scale = 1e-6
+    failure_points = failure_points + rng.normal(
+        loc=0.0,
+        scale=jitter_scale,
+        size=failure_points.shape
+    )
+    safe_points = safe_points + rng.normal(
+        loc=0.0,
+        scale=jitter_scale,
+        size=safe_points.shape
+    )
+
+    try:
+        failure_kde = stats.gaussian_kde(failure_points)
+        safe_kde = stats.gaussian_kde(safe_points)
+        failure_density = np.asarray(failure_kde(grid_points), dtype=float)
+        safe_density = np.asarray(safe_kde(grid_points), dtype=float)
+    except Exception:
+        return None
+
+    epsilon = 1e-12
+    failure_prior = float(failure_x.size) / float(failure_x.size + safe_x.size)
+    safe_prior = float(safe_x.size) / float(failure_x.size + safe_x.size)
+    score = (
+        np.log(failure_density + epsilon)
+        + np.log(failure_prior + epsilon)
+        - np.log(safe_density + epsilon)
+        - np.log(safe_prior + epsilon)
+    )
+    return np.asarray(score.reshape(grid_x.shape), dtype=float)
+
+
+def estimate_failure_surface_grid_from_quadratic_surrogate(failure_x: np.ndarray,
+                                                           failure_y: np.ndarray,
+                                                           safe_x: np.ndarray,
+                                                           safe_y: np.ndarray,
+                                                           grid_x: np.ndarray,
+                                                           grid_y: np.ndarray) -> Optional[np.ndarray]:
+    """Fallback robust: surrogate kuadratik ridge dari klasifikasi safe/failed."""
+    train_x = np.concatenate([safe_x, failure_x]).astype(float)
+    train_y = np.concatenate([safe_y, failure_y]).astype(float)
+    labels = np.concatenate([
+        -np.ones_like(safe_x, dtype=float),
+        np.ones_like(failure_x, dtype=float)
+    ]).astype(float)
+    if min(int(safe_x.size), int(failure_x.size)) < 2:
+        return None
+
+    features = build_failure_surface_polynomial_features(train_x, train_y)
+    if features.shape[0] < 4:
+        return None
+
+    try:
+        ridge_lambda = 1e-3
+        lhs = features.T @ features + ridge_lambda * np.eye(features.shape[1], dtype=float)
+        rhs = features.T @ labels
+        coefficients = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        try:
+            coefficients = np.linalg.lstsq(features, labels, rcond=None)[0]
+        except Exception:
+            return None
+
+    train_scores = np.asarray(features @ coefficients, dtype=float)
+    safe_scores = train_scores[:safe_x.size]
+    failure_scores = train_scores[safe_x.size:]
+    if safe_scores.size == 0 or failure_scores.size == 0:
+        return None
+    threshold = 0.5 * (
+        float(np.mean(safe_scores))
+        + float(np.mean(failure_scores))
+    )
+
+    grid_features = build_failure_surface_polynomial_features(
+        np.asarray(grid_x, dtype=float).ravel(),
+        np.asarray(grid_y, dtype=float).ravel()
+    )
+    score = (grid_features @ coefficients) - threshold
+    if not np.any(np.isfinite(score)):
+        return None
+    return np.asarray(score.reshape(grid_x.shape), dtype=float)
+
+
+def estimate_failure_surface_grid_from_linear_surrogate(failure_x: np.ndarray,
+                                                        failure_y: np.ndarray,
+                                                        safe_x: np.ndarray,
+                                                        safe_y: np.ndarray,
+                                                        grid_x: np.ndarray,
+                                                        grid_y: np.ndarray) -> Optional[np.ndarray]:
+    """Fallback paling sederhana: separator linear ridge pada ruang `U`."""
+    train_x = np.concatenate([safe_x, failure_x]).astype(float)
+    train_y = np.concatenate([safe_y, failure_y]).astype(float)
+    labels = np.concatenate([
+        -np.ones_like(safe_x, dtype=float),
+        np.ones_like(failure_x, dtype=float)
+    ]).astype(float)
+    if min(int(safe_x.size), int(failure_x.size)) < 1:
+        return None
+
+    features = np.column_stack([
+        np.ones_like(train_x, dtype=float),
+        train_x,
+        train_y
+    ])
+    if features.shape[0] < 2:
+        return None
+
+    try:
+        ridge_lambda = 1e-3
+        lhs = features.T @ features + ridge_lambda * np.eye(features.shape[1], dtype=float)
+        rhs = features.T @ labels
+        coefficients = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        try:
+            coefficients = np.linalg.lstsq(features, labels, rcond=None)[0]
+        except Exception:
+            return None
+
+    train_scores = np.asarray(features @ coefficients, dtype=float)
+    safe_scores = train_scores[:safe_x.size]
+    failure_scores = train_scores[safe_x.size:]
+    if safe_scores.size == 0 or failure_scores.size == 0:
+        return None
+    threshold = 0.5 * (
+        float(np.mean(safe_scores))
+        + float(np.mean(failure_scores))
+    )
+
+    grid_features = np.column_stack([
+        np.ones_like(np.asarray(grid_x, dtype=float).ravel(), dtype=float),
+        np.asarray(grid_x, dtype=float).ravel(),
+        np.asarray(grid_y, dtype=float).ravel()
+    ])
+    score = (grid_features @ coefficients) - threshold
+    if not np.any(np.isfinite(score)):
+        return None
+    return np.asarray(score.reshape(grid_x.shape), dtype=float)
+
+
+def estimate_failure_surface_grid_from_centroid_separator(failure_x: np.ndarray,
+                                                          failure_y: np.ndarray,
+                                                          safe_x: np.ndarray,
+                                                          safe_y: np.ndarray,
+                                                          grid_x: np.ndarray,
+                                                          grid_y: np.ndarray) -> Optional[np.ndarray]:
+    """Fallback final: garis pemisah berbasis centroid kelas safe/failed."""
+    if min(int(failure_x.size), int(safe_x.size)) < 1:
+        return None
+
+    safe_centroid = np.asarray([
+        float(np.mean(safe_x)),
+        float(np.mean(safe_y))
+    ], dtype=float)
+    failure_centroid = np.asarray([
+        float(np.mean(failure_x)),
+        float(np.mean(failure_y))
+    ], dtype=float)
+    direction = failure_centroid - safe_centroid
+    direction_norm = float(np.linalg.norm(direction))
+    if not np.isfinite(direction_norm) or direction_norm <= 1e-12:
+        direction = np.asarray([1.0, 0.0], dtype=float)
+        direction_norm = 1.0
+    unit_direction = direction / direction_norm
+
+    safe_projection = (
+        unit_direction[0] * np.asarray(safe_x, dtype=float)
+        + unit_direction[1] * np.asarray(safe_y, dtype=float)
+    )
+    failure_projection = (
+        unit_direction[0] * np.asarray(failure_x, dtype=float)
+        + unit_direction[1] * np.asarray(failure_y, dtype=float)
+    )
+    threshold = 0.5 * (
+        float(np.mean(safe_projection))
+        + float(np.mean(failure_projection))
+    )
+
+    score = (
+        unit_direction[0] * np.asarray(grid_x, dtype=float)
+        + unit_direction[1] * np.asarray(grid_y, dtype=float)
+        - threshold
+    )
+    if not np.any(np.isfinite(score)):
+        return None
+    return np.asarray(score, dtype=float)
+
+
+def estimate_failure_surface_grid(surface_plot_data: Dict[str, Any],
+                                  grid_size: int = FAILURE_SURFACE_GRID_SIZE,
+                                  max_class_points: int = FAILURE_SURFACE_MAX_CLASS_POINTS) -> Optional[Dict[str, Any]]:
+    """Estimasi batas gagal `g_hat(u)=0` dari hasil safe/failed Monte Carlo."""
+    u_x = np.asarray(surface_plot_data.get('u_x', []), dtype=float)
+    u_y = np.asarray(surface_plot_data.get('u_y', []), dtype=float)
+    failure_mask = np.asarray(surface_plot_data.get('failure_mask', []), dtype=bool)
+    safe_mask = np.asarray(surface_plot_data.get('safe_mask', []), dtype=bool)
+
+    failure_x = u_x[failure_mask]
+    failure_y = u_y[failure_mask]
+    safe_x = u_x[safe_mask]
+    safe_y = u_y[safe_mask]
+    if min(int(failure_x.size), int(safe_x.size), int(failure_y.size), int(safe_y.size)) < 2:
+        return None
+
+    failure_x, failure_y = downsample_xy_series(
+        failure_x,
+        failure_y,
+        max_points=int(max_class_points)
+    )
+    safe_x, safe_y = downsample_xy_series(
+        safe_x,
+        safe_y,
+        max_points=int(max_class_points)
+    )
+    if min(int(failure_x.size), int(safe_x.size)) < 2:
+        return None
+
+    x_limits = get_failure_surface_axis_limits(u_x)
+    y_limits = get_failure_surface_axis_limits(u_y)
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(x_limits[0], x_limits[1], int(grid_size)),
+        np.linspace(y_limits[0], y_limits[1], int(grid_size))
+    )
+    score_grid = None
+    estimator_method = None
+
+    if min(int(failure_x.size), int(safe_x.size)) >= 6:
+        score_grid = estimate_failure_surface_grid_from_kde(
+            failure_x,
+            failure_y,
+            safe_x,
+            safe_y,
+            grid_x,
+            grid_y
+        )
+        if score_grid is not None:
+            estimator_method = 'kde'
+
+    if score_grid is None:
+        score_grid = estimate_failure_surface_grid_from_quadratic_surrogate(
+            failure_x,
+            failure_y,
+            safe_x,
+            safe_y,
+            grid_x,
+            grid_y
+        )
+        if score_grid is not None:
+            estimator_method = 'quadratic'
+
+    if score_grid is None:
+        score_grid = estimate_failure_surface_grid_from_linear_surrogate(
+            failure_x,
+            failure_y,
+            safe_x,
+            safe_y,
+            grid_x,
+            grid_y
+        )
+        if score_grid is not None:
+            estimator_method = 'linear'
+
+    if score_grid is None:
+        score_grid = estimate_failure_surface_grid_from_centroid_separator(
+            failure_x,
+            failure_y,
+            safe_x,
+            safe_y,
+            grid_x,
+            grid_y
+        )
+        if score_grid is not None:
+            estimator_method = 'centroid'
+
+    if score_grid is None:
+        return None
+
+    return {
+        'grid_x': grid_x,
+        'grid_y': grid_y,
+        'score_grid': np.asarray(score_grid, dtype=float),
+        'x_limits': x_limits,
+        'y_limits': y_limits,
+        'estimator_method': str(estimator_method or 'unknown')
+    }
+
+
+def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any],
+                                              x_variable_name: str,
+                                              y_variable_name: str) -> Tuple[Optional[plt.Figure], Dict[str, Any]]:
+    """Bangun plot surface failure cloud 2D beserta metadata render."""
+    surface_plot_data = prepare_failure_surface_plot_data(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name
+    )
+    if surface_plot_data is None:
+        return None, {}
+
+    surface_grid = estimate_failure_surface_grid(surface_plot_data)
+    if surface_grid is None:
+        return None, {}
+
+    x_record = surface_plot_data['x_record']
+    y_record = surface_plot_data['y_record']
+    u_x = np.asarray(surface_plot_data.get('u_x', []), dtype=float)
+    u_y = np.asarray(surface_plot_data.get('u_y', []), dtype=float)
+    safe_mask = np.asarray(surface_plot_data.get('safe_mask', []), dtype=bool)
+    failure_mask = np.asarray(surface_plot_data.get('failure_mask', []), dtype=bool)
+    grid_x = np.asarray(surface_grid['grid_x'], dtype=float)
+    grid_y = np.asarray(surface_grid['grid_y'], dtype=float)
+    score_grid = np.asarray(surface_grid['score_grid'], dtype=float)
+    signed_margin_grid = -score_grid
+    estimator_method = str(surface_grid.get('estimator_method', 'unknown') or 'unknown')
+    score_min = float(np.nanmin(score_grid))
+    score_max = float(np.nanmax(score_grid))
+    estimated_mpp = estimate_failure_surface_2d_mpp_from_grid(
+        grid_x,
+        grid_y,
+        score_grid
+    )
+    if not (score_min <= 0.0 <= score_max):
+        return None, {
+            'x_variable_name': str(x_variable_name),
+            'y_variable_name': str(y_variable_name),
+            'estimator_method': estimator_method,
+            'score_min': score_min,
+            'score_max': score_max
+        }
+
+    fig, axis = plt.subplots(figsize=(9.6, 7.2), dpi=180)
+    axis.set_facecolor('#ffffff')
+
+    finite_margin = signed_margin_grid[np.isfinite(signed_margin_grid)]
+    max_abs_margin = max(
+        float(np.max(np.abs(finite_margin))) if finite_margin.size else 0.0,
+        1e-6
+    )
+    fill_levels = np.linspace(-max_abs_margin, max_abs_margin, 19)
+    contour_fill = axis.contourf(
+        grid_x,
+        grid_y,
+        signed_margin_grid,
+        levels=fill_levels,
+        cmap='RdYlBu',
+        alpha=0.16,
+        antialiased=True,
+        zorder=0
+    )
+    contour_step = build_nice_contour_step(max_abs_margin)
+    nonzero_levels = np.asarray(
+        [
+            value for value in (
+                contour_step * np.arange(-4, 5, dtype=float)
+            )
+            if (
+                not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                and abs(float(value)) <= max_abs_margin * 1.02
+            )
+        ],
+        dtype=float
+    )
+    if nonzero_levels.size > 0:
+        axis.contour(
+            grid_x,
+            grid_y,
+            signed_margin_grid,
+            levels=np.sort(nonzero_levels),
+            colors='#64748b',
+            linewidths=0.65,
+            alpha=0.48,
+            linestyles='dashed',
+            zorder=1
+        )
+
+    beta_circle_values = build_beta_circle_values(
+        surface_grid['x_limits'],
+        surface_grid['y_limits']
+    )
+    for beta_value in beta_circle_values:
+        circle = plt.Circle(
+            (0.0, 0.0),
+            radius=float(beta_value),
+            fill=False,
+            linestyle='--',
+            linewidth=0.8,
+            edgecolor='#cbd5e1',
+            alpha=0.75
+        )
+        axis.add_patch(circle)
+        axis.text(
+            float(beta_value) * 0.70,
+            float(beta_value) * 0.72,
+            rf"$\beta={beta_value:.0f}$",
+            color='#475569',
+            fontsize=8.5
+        )
+
+    safe_x = u_x[safe_mask]
+    safe_y = u_y[safe_mask]
+    failure_x = u_x[failure_mask]
+    failure_y = u_y[failure_mask]
+    safe_x, safe_y = downsample_xy_series(
+        safe_x,
+        safe_y,
+        max_points=FAILURE_SURFACE_MAX_SCATTER_POINTS_PER_CLASS
+    )
+    failure_x, failure_y = downsample_xy_series(
+        failure_x,
+        failure_y,
+        max_points=FAILURE_SURFACE_MAX_SCATTER_POINTS_PER_CLASS
+    )
+
+    if safe_x.size > 0:
+        axis.scatter(
+            safe_x,
+            safe_y,
+            s=12,
+            color='#1d4ed8',
+            alpha=0.88,
+            edgecolors='none',
+            label=f"Safe Samples, g(u) > 0 ({int(safe_x.size):,})",
+            zorder=2
+        )
+    if failure_x.size > 0:
+        axis.scatter(
+            failure_x,
+            failure_y,
+            s=12,
+            color='#ef4444',
+            alpha=0.88,
+            edgecolors='none',
+            label=f"Failed Samples, g(u) < 0 ({int(failure_x.size):,})",
+            zorder=2
+        )
+
+    axis.contour(
+        grid_x,
+        grid_y,
+        signed_margin_grid,
+        levels=[0.0],
+        colors=['#111827'],
+        linewidths=2.4,
+        zorder=3
+    )
+    axis.plot(
+        [],
+        [],
+        color='#111827',
+        linewidth=2.4,
+        label='Nonlinear contour, g_hat(u)=0'
+    )
+
+    if estimated_mpp is not None:
+        mpp_point = np.asarray(estimated_mpp.get('point', []), dtype=float).reshape(-1)
+        mpp_beta = coerce_finite_float(estimated_mpp.get('beta'))
+        if mpp_point.size == 2 and mpp_beta is not None:
+            axis.plot(
+                [0.0, float(mpp_point[0])],
+                [0.0, float(mpp_point[1])],
+                linestyle='--',
+                linewidth=1.3,
+                color='#a21caf',
+                label=f"Estimated Beta Line, beta={mpp_beta:.2f}",
+                zorder=3
+            )
+            axis.scatter(
+                [float(mpp_point[0])],
+                [float(mpp_point[1])],
+                marker='o',
+                s=52,
+                color='#111827',
+                edgecolors='#ffffff',
+                linewidths=0.5,
+                label=f"Estimated MPP, beta={mpp_beta:.2f}",
+                zorder=4
+            )
+            axis.annotate(
+                f"MPP\nbeta={mpp_beta:.2f}",
+                xy=(float(mpp_point[0]), float(mpp_point[1])),
+                xytext=(10, -12),
+                textcoords='offset points',
+                fontsize=8.7,
+                color='#111827',
+                ha='left',
+                va='top',
+                bbox=dict(
+                    boxstyle='round,pad=0.18',
+                    facecolor='white',
+                    edgecolor='#cbd5e1',
+                    alpha=0.92
+                )
+            )
+
+    axis.scatter(
+        [0.0],
+        [0.0],
+        marker='x',
+        s=62,
+        color='#111827',
+        linewidths=1.4,
+        label='Origin',
+        zorder=4
+    )
+    axis.text(
+        0.10,
+        -0.14,
+        "O (Origin)",
+        fontsize=9,
+        color='#111827'
+    )
+
+    axis.axhline(0.0, color='#94a3b8', linewidth=0.8, linestyle='--', alpha=0.9)
+    axis.axvline(0.0, color='#94a3b8', linewidth=0.8, linestyle='--', alpha=0.9)
+    axis.set_xlim(*surface_grid['x_limits'])
+    axis.set_ylim(*surface_grid['y_limits'])
+    axis.set_aspect('equal', adjustable='box')
+    axis.set_xlabel(build_failure_surface_axis_label(x_record))
+    axis.set_ylabel(build_failure_surface_axis_label(y_record))
+    axis.set_title(
+        (
+            "Failure Cloud and Nonlinear Contour g_hat(u)=0 "
+            f"| Method: {estimator_method.upper()}"
+        ),
+        fontsize=12,
+        pad=12
+    )
+    axis.grid(True, alpha=0.18, linestyle='--')
+    axis.text(
+        0.04,
+        0.93,
+        "DAERAH AMAN\n g(u) > 0",
+        transform=axis.transAxes,
+        ha='left',
+        va='top',
+        fontsize=10,
+        color='#1d4ed8',
+        fontweight='700'
+    )
+    axis.text(
+        0.96,
+        0.10,
+        "DAERAH GAGAL\n g(u) < 0",
+        transform=axis.transAxes,
+        ha='right',
+        va='bottom',
+        fontsize=10,
+        color='#dc2626',
+        fontweight='700'
+    )
+    fig.colorbar(
+        contour_fill,
+        ax=axis,
+        fraction=0.046,
+        pad=0.04,
+        label='Estimated signed margin g_hat(u) (-)'
+    )
+    axis.text(
+        0.82,
+        0.80,
+        "g_hat(u) = 0",
+        transform=axis.transAxes,
+        fontsize=10,
+        color='#111827',
+        fontweight='700'
+    )
+    axis.legend(loc='upper right', fontsize=8.2, frameon=True)
+
+    fig.suptitle(
+        "Failure Cloud in Standard Normal Space (U-space)",
+        fontsize=13,
+        y=0.98
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig, {
+        'x_variable_name': str(x_variable_name),
+        'y_variable_name': str(y_variable_name),
+        'estimator_method': estimator_method,
+        'score_min': score_min,
+        'score_max': score_max,
+        'estimated_mpp_beta': (
+            coerce_finite_float((estimated_mpp or {}).get('beta'))
+            if estimated_mpp is not None else
+            None
+        )
+    }
+
+
+def build_failure_surface_figure(failure_cloud_data: Dict[str, Any],
+                                 x_variable_name: str,
+                                 y_variable_name: str) -> Optional[plt.Figure]:
+    """Bangun plot surface failure cloud 2D pada ruang normal baku `U`."""
+    figure, _ = build_failure_surface_figure_and_metadata(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name
+    )
+    return figure
+
+
+def fit_failure_surface_3d_quadratic_model(surface_plot_data: Dict[str, Any],
+                                           max_points_per_class: int = FAILURE_SURFACE_MAX_CLASS_POINTS) -> Optional[Dict[str, Any]]:
+    """Fit surrogate kuadratik implisit untuk batas `g(u)=0` di ruang 3D."""
+    u_x = np.asarray(surface_plot_data.get('u_x', []), dtype=float)
+    u_y = np.asarray(surface_plot_data.get('u_y', []), dtype=float)
+    u_z = np.asarray(surface_plot_data.get('u_z', []), dtype=float)
+    failure_mask = np.asarray(surface_plot_data.get('failure_mask', []), dtype=bool)
+    safe_mask = np.asarray(surface_plot_data.get('safe_mask', []), dtype=bool)
+
+    failure_x, failure_y, failure_z = downsample_xyz_series(
+        u_x[failure_mask],
+        u_y[failure_mask],
+        u_z[failure_mask],
+        max_points=int(max_points_per_class)
+    )
+    safe_x, safe_y, safe_z = downsample_xyz_series(
+        u_x[safe_mask],
+        u_y[safe_mask],
+        u_z[safe_mask],
+        max_points=int(max_points_per_class)
+    )
+    if min(int(failure_x.size), int(safe_x.size)) < 4:
+        return None
+
+    safe_points = np.column_stack([safe_x, safe_y, safe_z]).astype(float)
+    failure_points = np.column_stack([failure_x, failure_y, failure_z]).astype(float)
+    train_points = np.vstack([safe_points, failure_points])
+    labels = np.concatenate([
+        -np.ones(int(safe_points.shape[0]), dtype=float),
+        np.ones(int(failure_points.shape[0]), dtype=float)
+    ]).astype(float)
+
+    features = build_failure_surface_3d_quadratic_features(
+        train_points[:, 0],
+        train_points[:, 1],
+        train_points[:, 2]
+    )
+    if features.shape[0] < features.shape[1]:
+        return None
+
+    try:
+        ridge_lambda = 1e-3
+        lhs = features.T @ features + ridge_lambda * np.eye(features.shape[1], dtype=float)
+        rhs = features.T @ labels
+        coefficients = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        try:
+            coefficients = np.linalg.lstsq(features, labels, rcond=None)[0]
+        except Exception:
+            return None
+
+    train_scores = np.asarray(features @ coefficients, dtype=float)
+    safe_scores = train_scores[:safe_points.shape[0]]
+    failure_scores = train_scores[safe_points.shape[0]:]
+    if safe_scores.size == 0 or failure_scores.size == 0:
+        return None
+
+    threshold = 0.5 * (
+        float(np.mean(safe_scores))
+        + float(np.mean(failure_scores))
+    )
+    adjusted_coefficients = np.asarray(coefficients, dtype=float).copy()
+    adjusted_coefficients[0] = float(adjusted_coefficients[0] - threshold)
+
+    safe_centroid = np.mean(safe_points, axis=0)
+    failure_centroid = np.mean(failure_points, axis=0)
+    reference_point = 0.5 * (safe_centroid + failure_centroid)
+
+    return {
+        'type': 'quadratic',
+        'coefficients': adjusted_coefficients,
+        'reference_point': np.asarray(reference_point, dtype=float),
+        'method': 'quadratic'
+    }
+
+
+def fit_failure_surface_3d_plane(surface_plot_data: Dict[str, Any],
+                                 max_points_per_class: int = FAILURE_SURFACE_MAX_CLASS_POINTS) -> Optional[Dict[str, Any]]:
+    """Fit bidang batas gagal linear pada ruang `U` tiga dimensi."""
+    u_x = np.asarray(surface_plot_data.get('u_x', []), dtype=float)
+    u_y = np.asarray(surface_plot_data.get('u_y', []), dtype=float)
+    u_z = np.asarray(surface_plot_data.get('u_z', []), dtype=float)
+    failure_mask = np.asarray(surface_plot_data.get('failure_mask', []), dtype=bool)
+    safe_mask = np.asarray(surface_plot_data.get('safe_mask', []), dtype=bool)
+
+    failure_x = u_x[failure_mask]
+    failure_y = u_y[failure_mask]
+    failure_z = u_z[failure_mask]
+    safe_x = u_x[safe_mask]
+    safe_y = u_y[safe_mask]
+    safe_z = u_z[safe_mask]
+
+    if min(int(failure_x.size), int(safe_x.size)) < 1:
+        return None
+
+    failure_x, failure_y, failure_z = downsample_xyz_series(
+        failure_x,
+        failure_y,
+        failure_z,
+        max_points=int(max_points_per_class)
+    )
+    safe_x, safe_y, safe_z = downsample_xyz_series(
+        safe_x,
+        safe_y,
+        safe_z,
+        max_points=int(max_points_per_class)
+    )
+    if min(int(failure_x.size), int(safe_x.size)) < 1:
+        return None
+
+    safe_points = np.column_stack([safe_x, safe_y, safe_z])
+    failure_points = np.column_stack([failure_x, failure_y, failure_z])
+    train_points = np.vstack([safe_points, failure_points]).astype(float)
+    labels = np.concatenate([
+        -np.ones(int(safe_points.shape[0]), dtype=float),
+        np.ones(int(failure_points.shape[0]), dtype=float)
+    ]).astype(float)
+
+    features = np.column_stack([
+        np.ones(int(train_points.shape[0]), dtype=float),
+        train_points
+    ])
+    method_name = 'linear'
+    try:
+        ridge_lambda = 1e-3
+        lhs = features.T @ features + ridge_lambda * np.eye(features.shape[1], dtype=float)
+        rhs = features.T @ labels
+        coefficients = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        try:
+            coefficients = np.linalg.lstsq(features, labels, rcond=None)[0]
+        except Exception:
+            coefficients = None
+
+    normal_vector = None
+    intercept_value = None
+    if coefficients is not None:
+        train_scores = np.asarray(features @ coefficients, dtype=float)
+        safe_scores = train_scores[:safe_points.shape[0]]
+        failure_scores = train_scores[safe_points.shape[0]:]
+        if safe_scores.size > 0 and failure_scores.size > 0:
+            threshold = 0.5 * (
+                float(np.mean(safe_scores))
+                + float(np.mean(failure_scores))
+            )
+            intercept_value = float(coefficients[0] - threshold)
+            normal_vector = np.asarray(coefficients[1:4], dtype=float)
+
+    if normal_vector is None or not np.all(np.isfinite(normal_vector)) or float(np.linalg.norm(normal_vector)) <= 1e-12:
+        safe_centroid = np.mean(safe_points, axis=0)
+        failure_centroid = np.mean(failure_points, axis=0)
+        normal_vector = np.asarray(failure_centroid - safe_centroid, dtype=float)
+        if not np.all(np.isfinite(normal_vector)) or float(np.linalg.norm(normal_vector)) <= 1e-12:
+            return None
+        midpoint = 0.5 * (safe_centroid + failure_centroid)
+        intercept_value = float(-np.dot(normal_vector, midpoint))
+        method_name = 'centroid'
+
+    return {
+        'normal': np.asarray(normal_vector, dtype=float),
+        'intercept': float(intercept_value),
+        'type': 'plane',
+        'method': str(method_name)
+    }
+
+
+def build_failure_surface_3d_mesh(plane_model: Dict[str, Any],
+                                  x_limits: Tuple[float, float],
+                                  y_limits: Tuple[float, float],
+                                  z_limits: Tuple[float, float],
+                                  grid_size: int = FAILURE_SURFACE_3D_GRID_SIZE) -> Optional[Dict[str, Any]]:
+    """Bangun mesh bidang `g_hat(u)=0` pada ruang tiga dimensi."""
+    normal = np.asarray((plane_model or {}).get('normal', []), dtype=float).reshape(-1)
+    if normal.size != 3 or not np.all(np.isfinite(normal)):
+        return None
+    intercept = coerce_finite_float((plane_model or {}).get('intercept'))
+    if intercept is None:
+        return None
+
+    axis_limits = [tuple(x_limits), tuple(y_limits), tuple(z_limits)]
+    dependent_axis = int(np.argmax(np.abs(normal)))
+    if abs(float(normal[dependent_axis])) <= 1e-12:
+        return None
+    independent_axes = [axis_index for axis_index in range(3) if axis_index != dependent_axis]
+
+    grid_a, grid_b = np.meshgrid(
+        np.linspace(axis_limits[independent_axes[0]][0], axis_limits[independent_axes[0]][1], int(grid_size)),
+        np.linspace(axis_limits[independent_axes[1]][0], axis_limits[independent_axes[1]][1], int(grid_size))
+    )
+    dependent_values = -(
+        float(intercept)
+        + float(normal[independent_axes[0]]) * grid_a
+        + float(normal[independent_axes[1]]) * grid_b
+    ) / float(normal[dependent_axis])
+
+    mesh_axes = [None, None, None]
+    mesh_axes[independent_axes[0]] = np.asarray(grid_a, dtype=float)
+    mesh_axes[independent_axes[1]] = np.asarray(grid_b, dtype=float)
+    mesh_axes[dependent_axis] = np.asarray(dependent_values, dtype=float)
+
+    lower_limit, upper_limit = axis_limits[dependent_axis]
+    valid_mask = (
+        np.isfinite(mesh_axes[0])
+        & np.isfinite(mesh_axes[1])
+        & np.isfinite(mesh_axes[2])
+        & (mesh_axes[dependent_axis] >= float(lower_limit))
+        & (mesh_axes[dependent_axis] <= float(upper_limit))
+    )
+    if not np.any(valid_mask):
+        return None
+
+    for axis_index in range(3):
+        axis_array = np.asarray(mesh_axes[axis_index], dtype=float)
+        axis_array = np.where(valid_mask, axis_array, np.nan)
+        mesh_axes[axis_index] = axis_array
+
+    return {
+        'X': np.asarray(mesh_axes[0], dtype=float),
+        'Y': np.asarray(mesh_axes[1], dtype=float),
+        'Z': np.asarray(mesh_axes[2], dtype=float),
+        'dependent_axis': int(dependent_axis)
+    }
+
+
+def build_failure_surface_3d_quadratic_mesh(quadratic_model: Dict[str, Any],
+                                            x_limits: Tuple[float, float],
+                                            y_limits: Tuple[float, float],
+                                            z_limits: Tuple[float, float],
+                                            grid_size: int = FAILURE_SURFACE_3D_GRID_SIZE) -> Optional[Dict[str, Any]]:
+    """Bangun mesh permukaan kuadratik implisit `g_hat(u)=0` pada ruang 3D."""
+    coefficients = np.asarray(
+        (quadratic_model or {}).get('coefficients', []),
+        dtype=float
+    ).reshape(-1)
+    if coefficients.size != 10 or not np.all(np.isfinite(coefficients)):
+        return None
+
+    reference_point = np.asarray(
+        (quadratic_model or {}).get('reference_point', [0.0, 0.0, 0.0]),
+        dtype=float
+    ).reshape(-1)
+    reference_z = float(reference_point[2]) if reference_point.size >= 3 else 0.0
+
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(float(x_limits[0]), float(x_limits[1]), int(grid_size)),
+        np.linspace(float(y_limits[0]), float(y_limits[1]), int(grid_size))
+    )
+
+    a_value = float(coefficients[9])
+    b_value = (
+        float(coefficients[3])
+        + float(coefficients[7]) * grid_x
+        + float(coefficients[8]) * grid_y
+    )
+    c_value = (
+        float(coefficients[0])
+        + float(coefficients[1]) * grid_x
+        + float(coefficients[2]) * grid_y
+        + float(coefficients[4]) * (grid_x ** 2)
+        + float(coefficients[5]) * (grid_x * grid_y)
+        + float(coefficients[6]) * (grid_y ** 2)
+    )
+
+    z_surface = np.full_like(grid_x, np.nan, dtype=float)
+    if abs(a_value) <= 1e-12:
+        valid_linear = np.abs(b_value) > 1e-12
+        z_linear = np.full_like(grid_x, np.nan, dtype=float)
+        z_linear[valid_linear] = -c_value[valid_linear] / b_value[valid_linear]
+        z_surface = z_linear
+    else:
+        discriminant = (b_value ** 2) - (4.0 * a_value * c_value)
+        valid_quadratic = discriminant >= 0.0
+        sqrt_discriminant = np.full_like(grid_x, np.nan, dtype=float)
+        sqrt_discriminant[valid_quadratic] = np.sqrt(discriminant[valid_quadratic])
+        z_root_1 = np.full_like(grid_x, np.nan, dtype=float)
+        z_root_2 = np.full_like(grid_x, np.nan, dtype=float)
+        denominator = 2.0 * a_value
+        z_root_1[valid_quadratic] = (
+            -b_value[valid_quadratic] + sqrt_discriminant[valid_quadratic]
+        ) / denominator
+        z_root_2[valid_quadratic] = (
+            -b_value[valid_quadratic] - sqrt_discriminant[valid_quadratic]
+        ) / denominator
+
+        root_1_valid = (
+            np.isfinite(z_root_1)
+            & (z_root_1 >= float(z_limits[0]))
+            & (z_root_1 <= float(z_limits[1]))
+        )
+        root_2_valid = (
+            np.isfinite(z_root_2)
+            & (z_root_2 >= float(z_limits[0]))
+            & (z_root_2 <= float(z_limits[1]))
+        )
+
+        choose_root_1 = np.abs(z_root_1 - reference_z) <= np.abs(z_root_2 - reference_z)
+        z_surface = np.where(
+            choose_root_1 & root_1_valid,
+            z_root_1,
+            z_surface
+        )
+        z_surface = np.where(
+            (~choose_root_1) & root_2_valid,
+            z_root_2,
+            z_surface
+        )
+        z_surface = np.where(
+            np.isnan(z_surface) & root_1_valid,
+            z_root_1,
+            z_surface
+        )
+        z_surface = np.where(
+            np.isnan(z_surface) & root_2_valid,
+            z_root_2,
+            z_surface
+        )
+
+    valid_mask = (
+        np.isfinite(grid_x)
+        & np.isfinite(grid_y)
+        & np.isfinite(z_surface)
+        & (z_surface >= float(z_limits[0]))
+        & (z_surface <= float(z_limits[1]))
+    )
+    if not np.any(valid_mask):
+        return None
+
+    grid_z = np.where(valid_mask, z_surface, np.nan)
+    return {
+        'X': np.asarray(grid_x, dtype=float),
+        'Y': np.asarray(grid_y, dtype=float),
+        'Z': np.asarray(grid_z, dtype=float),
+        'dependent_axis': 2
+    }
+
+
+def estimate_failure_surface_3d_mpp_from_mesh(mesh: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Estimasi titik MPP sebagai titik pada mesh yang paling dekat ke origin."""
+    mesh_x = np.asarray((mesh or {}).get('X', []), dtype=float)
+    mesh_y = np.asarray((mesh or {}).get('Y', []), dtype=float)
+    mesh_z = np.asarray((mesh or {}).get('Z', []), dtype=float)
+    if mesh_x.size == 0 or mesh_y.size == 0 or mesh_z.size == 0:
+        return None
+
+    valid_mask = np.isfinite(mesh_x) & np.isfinite(mesh_y) & np.isfinite(mesh_z)
+    if not np.any(valid_mask):
+        return None
+
+    valid_points = np.column_stack([
+        mesh_x[valid_mask],
+        mesh_y[valid_mask],
+        mesh_z[valid_mask]
+    ]).astype(float)
+    radii = np.linalg.norm(valid_points, axis=1)
+    if radii.size == 0 or not np.any(np.isfinite(radii)):
+        return None
+
+    best_index = int(np.nanargmin(radii))
+    best_point = np.asarray(valid_points[best_index], dtype=float)
+    beta_value = float(radii[best_index])
+    return {
+        'point': best_point,
+        'beta': beta_value
+    }
+
+
+def build_failure_surface_3d_figure(failure_cloud_data: Dict[str, Any],
+                                    x_variable_name: str,
+                                    y_variable_name: str,
+                                    z_variable_name: str) -> Optional[plt.Figure]:
+    """Bangun plot 3D failure cloud dan permukaan batas `g(u)=0`."""
+    surface_plot_data = prepare_failure_surface_3d_plot_data(
+        failure_cloud_data,
+        x_variable_name,
+        y_variable_name,
+        z_variable_name
+    )
+    if surface_plot_data is None:
+        return None
+
+    u_x = np.asarray(surface_plot_data.get('u_x', []), dtype=float)
+    u_y = np.asarray(surface_plot_data.get('u_y', []), dtype=float)
+    u_z = np.asarray(surface_plot_data.get('u_z', []), dtype=float)
+    safe_mask = np.asarray(surface_plot_data.get('safe_mask', []), dtype=bool)
+    failure_mask = np.asarray(surface_plot_data.get('failure_mask', []), dtype=bool)
+    x_limits = get_failure_surface_axis_limits(u_x)
+    y_limits = get_failure_surface_axis_limits(u_y)
+    z_limits = get_failure_surface_axis_limits(u_z)
+
+    surface_model = fit_failure_surface_3d_quadratic_model(surface_plot_data)
+    mesh = None
+    if surface_model is not None:
+        mesh = build_failure_surface_3d_quadratic_mesh(
+            surface_model,
+            x_limits=x_limits,
+            y_limits=y_limits,
+            z_limits=z_limits
+        )
+
+    if mesh is None:
+        surface_model = fit_failure_surface_3d_plane(surface_plot_data)
+        if surface_model is None:
+            return None
+        mesh = build_failure_surface_3d_mesh(
+            surface_model,
+            x_limits=x_limits,
+            y_limits=y_limits,
+            z_limits=z_limits
+        )
+    if mesh is None or surface_model is None:
+        return None
+
+    safe_x, safe_y, safe_z = downsample_xyz_series(
+        u_x[safe_mask],
+        u_y[safe_mask],
+        u_z[safe_mask],
+        max_points=FAILURE_SURFACE_MAX_SCATTER_POINTS_PER_CLASS
+    )
+    failure_x, failure_y, failure_z = downsample_xyz_series(
+        u_x[failure_mask],
+        u_y[failure_mask],
+        u_z[failure_mask],
+        max_points=FAILURE_SURFACE_MAX_SCATTER_POINTS_PER_CLASS
+    )
+
+    x_record = surface_plot_data['x_record']
+    y_record = surface_plot_data['y_record']
+    z_record = surface_plot_data['z_record']
+    method_name = str((surface_model or {}).get('method', 'linear') or 'linear').upper()
+    estimated_mpp = estimate_failure_surface_3d_mpp_from_mesh(mesh)
+
+    fig = plt.figure(figsize=(10.0, 7.8), dpi=180)
+    axis = fig.add_subplot(111, projection='3d')
+    axis.set_facecolor('#ffffff')
+
+    if safe_x.size > 0:
+        axis.scatter(
+            safe_x,
+            safe_y,
+            safe_z,
+            s=10,
+            color='#1d4ed8',
+            alpha=0.86,
+            depthshade=False,
+            label=f"Safe Samples ({int(safe_x.size):,})"
+        )
+    if failure_x.size > 0:
+        axis.scatter(
+            failure_x,
+            failure_y,
+            failure_z,
+            s=10,
+            color='#ef4444',
+            alpha=0.86,
+            depthshade=False,
+            label=f"Failed Samples ({int(failure_x.size):,})"
+        )
+
+    axis.plot_surface(
+        np.asarray(mesh['X'], dtype=float),
+        np.asarray(mesh['Y'], dtype=float),
+        np.asarray(mesh['Z'], dtype=float),
+        color='#f59e0b',
+        alpha=0.30,
+        linewidth=0.3,
+        edgecolor='#b45309',
+        antialiased=True,
+        shade=False
+    )
+
+    try:
+        axis.contour(
+            np.asarray(mesh['X'], dtype=float),
+            np.asarray(mesh['Y'], dtype=float),
+            np.asarray(mesh['Z'], dtype=float),
+            zdir='z',
+            offset=float(z_limits[0]),
+            levels=10,
+            colors='#cbd5e1',
+            linewidths=0.7
+        )
+    except Exception:
+        pass
+
+    axis.scatter(
+        [0.0],
+        [0.0],
+        [0.0],
+        marker='x',
+        s=58,
+        color='#111827',
+        linewidths=1.4,
+        depthshade=False,
+        label='Origin'
+    )
+
+    if estimated_mpp is not None:
+        mpp_point = np.asarray(estimated_mpp.get('point', []), dtype=float).reshape(-1)
+        mpp_beta = coerce_finite_float(estimated_mpp.get('beta'))
+        if mpp_point.size == 3 and mpp_beta is not None:
+            axis.scatter(
+                [float(mpp_point[0])],
+                [float(mpp_point[1])],
+                [float(mpp_point[2])],
+                marker='o',
+                s=42,
+                color='#111827',
+                edgecolors='#ffffff',
+                linewidths=0.5,
+                depthshade=False,
+                label=f"Estimated MPP, beta={mpp_beta:.2f}"
+            )
+            axis.plot(
+                [0.0, float(mpp_point[0])],
+                [0.0, float(mpp_point[1])],
+                [0.0, float(mpp_point[2])],
+                linestyle='--',
+                linewidth=1.2,
+                color='#a21caf'
+            )
+            axis.text(
+                float(mpp_point[0]),
+                float(mpp_point[1]),
+                float(mpp_point[2]),
+                f"  MPP\n  beta={mpp_beta:.2f}",
+                color='#111827',
+                fontsize=8.5
+            )
+
+    axis.set_xlim(*x_limits)
+    axis.set_ylim(*y_limits)
+    axis.set_zlim(*z_limits)
+    axis.set_xlabel(build_failure_surface_axis_label(x_record), labelpad=8)
+    axis.set_ylabel(build_failure_surface_axis_label(y_record), labelpad=8)
+    axis.set_zlabel(build_failure_surface_axis_label(z_record), labelpad=8)
+    axis.view_init(elev=24, azim=-58)
+    axis.grid(True, alpha=0.16)
+    axis.set_title(
+        f"3D Failure Surface g(u)=0 | Method: {method_name}",
+        fontsize=12,
+        pad=12
+    )
+
+    legend_handles = [
+        Line2D([], [], linestyle='none', marker='o', color='#1d4ed8', markersize=5, label='Safe Samples'),
+        Line2D([], [], linestyle='none', marker='o', color='#ef4444', markersize=5, label='Failed Samples'),
+        Patch(
+            facecolor='#f59e0b',
+            edgecolor='#b45309',
+            alpha=0.30,
+            label='Estimated Failure Surface'
+        ),
+        Line2D([], [], linestyle='none', marker='x', color='#111827', markersize=6, label='Origin')
+    ]
+    if estimated_mpp is not None:
+        mpp_beta = coerce_finite_float(estimated_mpp.get('beta'))
+        mpp_label = (
+            f"Estimated MPP, beta={mpp_beta:.2f}"
+            if mpp_beta is not None else
+            'Estimated MPP'
+        )
+        legend_handles.extend([
+            Line2D([], [], linestyle='none', marker='o', color='#111827', markersize=6, label=mpp_label),
+            Line2D([], [], linestyle='--', color='#a21caf', linewidth=1.2, label='Estimated Beta Line')
+        ])
+    axis.legend(
+        handles=legend_handles,
+        loc='upper right',
+        fontsize=8.2,
+        frameon=True
+    )
+
+    fig.suptitle(
+        "3D Failure Cloud and Estimated Surface in Standard Normal Space (U-space)",
+        fontsize=13,
+        y=0.98
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    return fig
+
+
+def get_failure_surface_candidate_pairs(variable_names: List[str],
+                                        preferred_pair: Optional[Tuple[str, str]] = None,
+                                        max_variables: int = 10,
+                                        max_pairs: int = 30) -> List[Tuple[str, str]]:
+    """Bangun daftar pasangan kandidat untuk auto-fallback failure surface."""
+    ordered_names = [
+        str(var_name)
+        for var_name in (variable_names or [])[:max(2, int(max_variables))]
+    ]
+    candidate_pairs: List[Tuple[str, str]] = []
+    seen_pairs = set()
+
+    def append_pair(left_name: str, right_name: str) -> None:
+        if not left_name or not right_name or str(left_name) == str(right_name):
+            return
+        pair = (str(left_name), str(right_name))
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)
+        candidate_pairs.append(pair)
+
+    if preferred_pair is not None:
+        append_pair(preferred_pair[0], preferred_pair[1])
+
+    for left_index in range(len(ordered_names)):
+        for right_index in range(left_index + 1, len(ordered_names)):
+            append_pair(ordered_names[left_index], ordered_names[right_index])
+            if len(candidate_pairs) >= int(max_pairs):
+                return candidate_pairs
+
+    return candidate_pairs
+
+
+def resolve_failure_surface_figure_with_fallback(failure_cloud_data: Dict[str, Any],
+                                                 ordered_variable_names: List[str],
+                                                 x_variable_name: str,
+                                                 y_variable_name: str) -> Tuple[Optional[plt.Figure], Dict[str, Any]]:
+    """Cari pasangan yang berhasil dirender bila pasangan awal gagal."""
+    candidate_pairs = get_failure_surface_candidate_pairs(
+        ordered_variable_names,
+        preferred_pair=(str(x_variable_name), str(y_variable_name))
+    )
+    last_metadata: Dict[str, Any] = {}
+    requested_pair = (str(x_variable_name), str(y_variable_name))
+
+    for candidate_x, candidate_y in candidate_pairs:
+        figure, metadata = build_failure_surface_figure_and_metadata(
+            failure_cloud_data,
+            candidate_x,
+            candidate_y
+        )
+        if figure is not None:
+            resolved_metadata = dict(metadata or {})
+            resolved_metadata['requested_pair'] = requested_pair
+            resolved_metadata['used_requested_pair'] = (
+                str(candidate_x) == requested_pair[0]
+                and str(candidate_y) == requested_pair[1]
+            )
+            return figure, resolved_metadata
+        if metadata:
+            last_metadata = dict(metadata)
+
+    if last_metadata:
+        last_metadata['requested_pair'] = requested_pair
+        last_metadata['used_requested_pair'] = False
+    return None, last_metadata
+
+
+def build_failure_surface_unavailable_message(results_bundle: Dict[str, Any],
+                                              failure_cloud_data: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """Bangun pesan unavailable yang membedakan kasus `Pf ~ 0` dan `Pf ~ 1`."""
+    summary = (results_bundle or {}).get('summary', {}) or {}
+    num_simulations = int(
+        summary.get('num_simulations')
+        or failure_cloud_data.get('num_simulations')
+        or 0
+    )
+    failures = int(
+        summary.get('failures')
+        or failure_cloud_data.get('failures')
+        or 0
+    )
+    failures = max(failures, 0)
+    safe_samples = max(num_simulations - failures, 0)
+    pf_value = coerce_finite_float(summary.get('Pf'))
+
+    if num_simulations > 0:
+        pf_granularity = 2.0 / float(num_simulations)
+    else:
+        pf_granularity = 0.0
+    pf_low_threshold = max(pf_granularity, 0.01)
+    pf_high_threshold = 1.0 - pf_low_threshold
+
+    if (
+        num_simulations > 0 and (
+            failures < 2
+            or (pf_value is not None and pf_value <= pf_low_threshold)
+        )
+    ):
+        return (
+            "Failure surface tidak ada karena `Pf ~ 0`, sehingga kejadian gagal "
+            "hampir tidak ada pada hasil Monte Carlo.",
+            (
+                f"Detail: `Pf = {format_metric(pf_value, 6)}` | "
+                f"`failure = {failures:,}` dari `N = {num_simulations:,}`"
+            )
+        )
+
+    if (
+        num_simulations > 0 and (
+            safe_samples < 2
+            or (pf_value is not None and pf_value >= pf_high_threshold)
+        )
+    ):
+        return (
+            "Failure surface tidak ada karena `Pf ~ 1`, sehingga sampel aman "
+            "hampir tidak ada pada hasil Monte Carlo.",
+            (
+                f"Detail: `Pf = {format_metric(pf_value, 6)}` | "
+                f"`safe = {safe_samples:,}` dari `N = {num_simulations:,}`"
+            )
+        )
+
+    return (
+        "Failure surface belum dapat dibentuk untuk pasangan variabel ini. "
+        "Biasanya ini terjadi bila sampel `safe/failed` terlalu sedikit atau "
+        "sebaran data terlalu degenerat untuk estimasi batas 2D.",
+        None
+    )
+
+
+def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[str, Any],
+                                                      results_bundle: Dict[str, Any],
+                                                      heading_level: str = "####") -> None:
+    """Tampilkan tab failure surface pada ruang normal baku."""
+    st.markdown(f"{heading_level} Failure Surface Ruang Normal Baku")
+    st.caption(
+        "Bagian berikut adalah visualisasi `failure surface` pada ruang normal baku `U`, "
+        "yakni interpretasi geometrik yang paling dekat dengan konsep `beta` klasik."
+    )
+    if not failure_cloud_data:
+        st.info(
+            "Dataset failure surface ruang normal baku belum tersedia. Jalankan analisis "
+            "probabilistik agar sampel Monte Carlo dapat diproyeksikan ke ruang dua variabel."
+        )
+        return
+
+    variable_records = (failure_cloud_data or {}).get('variables', {}) or {}
+    if len(variable_records) < 2:
+        st.info("Failure surface ruang normal baku memerlukan minimal dua variabel acak yang tersimpan.")
+        return
+
+    sensitivity_results = (results_bundle or {}).get('sensitivity_results', {}) or {}
+    ordered_variable_names = get_failure_cloud_variable_sort_order(
+        failure_cloud_data,
+        sensitivity_results=sensitivity_results
+    )
+    default_x, default_y = get_failure_cloud_default_variable_names(
+        failure_cloud_data,
+        sensitivity_results=sensitivity_results
+    )
+    default_x_3d, default_y_3d, default_z_3d = get_failure_cloud_default_three_variable_names(
+        failure_cloud_data,
+        sensitivity_results=sensitivity_results
+    )
+    if default_x is None or default_y is None:
+        st.info("Variabel default failure cloud belum bisa ditentukan dari hasil saat ini.")
+        return
+
+    st.markdown(f"{heading_level} Nonlinear Contour g(x)=0")
+    st.caption(
+        "Plot ini menampilkan `failure cloud` hasil Monte Carlo pada pasangan dua variabel "
+        "acak yang dipilih, setelah ditransformasikan ke ruang normal baku `U`."
+    )
+    st.caption(
+        "Titik `biru` adalah sampel `safe`, titik `merah` adalah sampel `failed`, "
+        "dan garis hitam tebal merepresentasikan `nonlinear contour g_hat(u) = 0` "
+        "yang dibentuk dari pemisahan kedua kelompok tersebut."
+    )
+    st.caption(
+        "Warna latar dan garis kontur tipis menunjukkan `signed margin g_hat(u)` hasil "
+        "aproksimasi berbasis data SMC. Lingkar putus-putus `beta` dan titik origin "
+        "ditampilkan agar pembacaan posisi cloud pada `standard normal space` lebih mudah."
+    )
+
+    if failure_cloud_data.get('used_downsampling'):
+        st.caption(
+            "Untuk menjaga performa dashboard, estimasi surface ini dibangun dari subset "
+            "sampel Monte Carlo yang dipilih merata dari hasil simulasi."
+        )
+    if failure_cloud_data.get('failed_points_truncated'):
+        st.caption(
+            "Jumlah sampel gagal yang dipakai untuk estimasi surface sudah dipadatkan karena "
+            "jumlah kejadian gagal melebihi batas penyimpanan visual."
+        )
+
+    x_index = ordered_variable_names.index(default_x)
+    y_index = ordered_variable_names.index(default_y)
+    selector_cols = st.columns(3)
+    x_variable_name = selector_cols[0].selectbox(
+        "Sumbu X",
+        options=ordered_variable_names,
+        index=x_index,
+        format_func=lambda var_name: format_failure_cloud_variable_label(
+            variable_records.get(var_name, {}),
+            short=False
+        ),
+        key="failure_cloud_x_selector"
+    )
+    y_variable_name = selector_cols[1].selectbox(
+        "Sumbu Y",
+        options=ordered_variable_names,
+        index=y_index,
+        format_func=lambda var_name: format_failure_cloud_variable_label(
+            variable_records.get(var_name, {}),
+            short=False
+        ),
+        key="failure_cloud_y_selector"
+    )
+    z_variable_name = None
+    if default_z_3d is not None and default_z_3d in ordered_variable_names:
+        z_index = ordered_variable_names.index(default_z_3d)
+    else:
+        z_index = min(2, len(ordered_variable_names) - 1)
+    if len(ordered_variable_names) >= 3:
+        z_variable_name = selector_cols[2].selectbox(
+            "Sumbu Z",
+            options=ordered_variable_names,
+            index=z_index,
+            format_func=lambda var_name: format_failure_cloud_variable_label(
+                variable_records.get(var_name, {}),
+                short=False
+            ),
+            key="failure_cloud_z_selector"
+        )
+    else:
+        selector_cols[2].info("Minimal 3 variabel acak diperlukan untuk plot 3D.")
+
+    if str(x_variable_name) == str(y_variable_name):
+        st.warning("Pilih variabel `X` dan `Y` yang berbeda agar failure surface informatif.")
+        return
+
+    failure_surface_fig, failure_surface_meta = resolve_failure_surface_figure_with_fallback(
+        failure_cloud_data,
+        ordered_variable_names=ordered_variable_names,
+        x_variable_name=str(x_variable_name),
+        y_variable_name=str(y_variable_name)
+    )
+    if failure_surface_fig is not None:
+        used_requested_pair = bool(
+            (failure_surface_meta or {}).get('used_requested_pair', True)
+        )
+        resolved_x_name = str(
+            (failure_surface_meta or {}).get('x_variable_name', str(x_variable_name))
+        )
+        resolved_y_name = str(
+            (failure_surface_meta or {}).get('y_variable_name', str(y_variable_name))
+        )
+        if not used_requested_pair:
+            resolved_x_label = format_failure_cloud_variable_label(
+                variable_records.get(resolved_x_name, {}),
+                short=False
+            )
+            resolved_y_label = format_failure_cloud_variable_label(
+                variable_records.get(resolved_y_name, {}),
+                short=False
+            )
+            estimator_method = str(
+                (failure_surface_meta or {}).get('estimator_method', 'unknown')
+            ).upper()
+            st.caption(
+                "Pasangan variabel yang dipilih tidak menghasilkan contour yang stabil, "
+                f"sehingga surface dialihkan otomatis ke pasangan `{resolved_x_label}` vs "
+                f"`{resolved_y_label}` dengan estimator `{estimator_method}`."
+            )
+        render_plot(
+            failure_surface_fig,
+            interactive=True,
+            viewer_key=f"failure-surface-{sanitize_dom_id(str(resolved_x_name))}-{sanitize_dom_id(str(resolved_y_name))}",
+            alt_text="Failure surface probabilistik Monte Carlo",
+            viewer_height=700,
+            download_basename=f"failure-surface-{resolved_x_name}-vs-{resolved_y_name}"
+        )
+    else:
+        diagnostic_parts = []
+        estimator_method = str(
+            (failure_surface_meta or {}).get('estimator_method', '')
+        ).strip()
+        if estimator_method:
+            diagnostic_parts.append(f"estimator terakhir: `{estimator_method.upper()}`")
+        score_min = coerce_finite_float((failure_surface_meta or {}).get('score_min'))
+        score_max = coerce_finite_float((failure_surface_meta or {}).get('score_max'))
+        if score_min is not None and score_max is not None:
+            diagnostic_parts.append(
+                f"rentang score grid: `{score_min:.4f}` s.d. `{score_max:.4f}`"
+            )
+        unavailable_message, unavailable_detail = build_failure_surface_unavailable_message(
+            results_bundle,
+            failure_cloud_data
+        )
+        st.info(unavailable_message)
+        if unavailable_detail:
+            st.caption(unavailable_detail)
+        if diagnostic_parts:
+            st.caption("Diagnostik: " + " | ".join(diagnostic_parts))
+
+    st.markdown(f"{heading_level} Failure Surface 3D")
+    st.caption(
+        "Panel ini menampilkan `failure cloud` tiga dimensi pada `(u1, u2, u3)` "
+        "beserta permukaan aproksimasi batas `g(u)=0`, seperti inset perspektif 3D pada contoh."
+    )
+    st.caption(
+        "Jika data memadai, permukaan 3D dibentuk sebagai `surface kuadratik/nonlinear`. "
+        "Jika tidak, plot otomatis fallback ke bidang linear. Titik `MPP` estimasi dan "
+        "garis `beta` dari origin ke MPP juga ditampilkan pada panel ini."
+    )
+    if len(ordered_variable_names) < 3 or z_variable_name is None:
+        st.info("Plot 3D belum tersedia karena variabel acak yang tersimpan kurang dari 3.")
+        return
+
+    resolved_z_variable_name = str(z_variable_name)
+    if resolved_z_variable_name in {str(x_variable_name), str(y_variable_name)}:
+        auto_z_variable_name = get_first_distinct_failure_cloud_variable_name(
+            ordered_variable_names,
+            excluded_names=[str(x_variable_name), str(y_variable_name)]
+        )
+        if auto_z_variable_name is None:
+            st.info("Plot 3D belum dapat dibentuk karena tidak ada variabel `Z` yang berbeda.")
+            return
+        resolved_z_variable_name = str(auto_z_variable_name)
+        resolved_z_label = format_failure_cloud_variable_label(
+            variable_records.get(resolved_z_variable_name, {}),
+            short=False
+        )
+        st.caption(
+            f"Sumbu `Z` otomatis dialihkan ke `{resolved_z_label}` agar berbeda dari `X` dan `Y`."
+        )
+
+    failure_surface_3d_fig = build_failure_surface_3d_figure(
+        failure_cloud_data,
+        x_variable_name=str(x_variable_name),
+        y_variable_name=str(y_variable_name),
+        z_variable_name=str(resolved_z_variable_name)
+    )
+    if failure_surface_3d_fig is not None:
+        render_plot(
+            failure_surface_3d_fig,
+            interactive=True,
+            viewer_key=(
+                "failure-surface-3d-"
+                f"{sanitize_dom_id(str(x_variable_name))}-"
+                f"{sanitize_dom_id(str(y_variable_name))}-"
+                f"{sanitize_dom_id(str(resolved_z_variable_name))}"
+            ),
+            alt_text="Failure surface 3D probabilistik Monte Carlo",
+            viewer_height=760,
+            tight_bbox=False,
+            download_basename=(
+                f"failure-surface-3d-{x_variable_name}-"
+                f"{y_variable_name}-{resolved_z_variable_name}"
+            )
+        )
+    else:
+        unavailable_message, unavailable_detail = build_failure_surface_unavailable_message(
+            results_bundle,
+            failure_cloud_data
+        )
+        st.info(unavailable_message)
+        if unavailable_detail:
+            st.caption(unavailable_detail)
+
+
 def get_probabilistic_mc_convergence_state_specs() -> List[Dict[str, str]]:
     """Spesifikasi warna dan label limit-state pada tab Simulasi MC."""
     return [
@@ -7127,6 +13063,437 @@ def find_exact_interaction_boundary_state(fc: float,
     return min(candidates, key=lambda candidate: candidate['lambda'])
 
 
+def _estimate_interaction_label_box(text: str,
+                                    x_span: float,
+                                    y_span: float) -> Tuple[float, float]:
+    """Estimasi ukuran box label dalam koordinat data untuk menghindari overlap."""
+    lines = [str(line) for line in str(text).splitlines()]
+    if not lines:
+        lines = [str(text)]
+
+    max_line_length = max(len(line) for line in lines)
+    line_count = max(len(lines), 1)
+    box_width = max(0.12 * x_span, min(0.34 * x_span, 0.0075 * x_span * max_line_length))
+    box_height = max(0.10 * y_span, min(0.30 * y_span, 0.060 * y_span * line_count))
+    return float(box_width), float(box_height)
+
+
+def _interaction_label_bounds(anchor_x: float,
+                              anchor_y: float,
+                              box_width: float,
+                              box_height: float,
+                              ha: str,
+                              va: str) -> Tuple[float, float, float, float]:
+    """Hitung bounds box label berdasarkan titik anchor dan alignment."""
+    if ha == 'left':
+        x_min = anchor_x
+        x_max = anchor_x + box_width
+    elif ha == 'right':
+        x_min = anchor_x - box_width
+        x_max = anchor_x
+    else:
+        x_min = anchor_x - (0.5 * box_width)
+        x_max = anchor_x + (0.5 * box_width)
+
+    if va == 'bottom':
+        y_min = anchor_y
+        y_max = anchor_y + box_height
+    elif va == 'top':
+        y_min = anchor_y - box_height
+        y_max = anchor_y
+    else:
+        y_min = anchor_y - (0.5 * box_height)
+        y_max = anchor_y + (0.5 * box_height)
+
+    return float(x_min), float(y_min), float(x_max), float(y_max)
+
+
+def _interaction_box_point_distance(bounds: Tuple[float, float, float, float],
+                                    point: Tuple[float, float],
+                                    x_span: float,
+                                    y_span: float) -> float:
+    """Hitung jarak ternormalisasi antara box label dan titik tertentu."""
+    x_min, y_min, x_max, y_max = bounds
+    point_x, point_y = point
+    delta_x = max(x_min - point_x, 0.0, point_x - x_max)
+    delta_y = max(y_min - point_y, 0.0, point_y - y_max)
+    return float(np.hypot(
+        delta_x / max(x_span, 1e-9),
+        delta_y / max(y_span, 1e-9)
+    ))
+
+
+def _interaction_box_overlap_ratio(left_bounds: Tuple[float, float, float, float],
+                                   right_bounds: Tuple[float, float, float, float]) -> float:
+    """Hitung rasio overlap dua box label."""
+    left_x_min, left_y_min, left_x_max, left_y_max = left_bounds
+    right_x_min, right_y_min, right_x_max, right_y_max = right_bounds
+    overlap_width = max(0.0, min(left_x_max, right_x_max) - max(left_x_min, right_x_min))
+    overlap_height = max(0.0, min(left_y_max, right_y_max) - max(left_y_min, right_y_min))
+    overlap_area = overlap_width * overlap_height
+    left_area = max((left_x_max - left_x_min) * (left_y_max - left_y_min), 1e-9)
+    return float(overlap_area / left_area)
+
+
+def _build_interaction_label_candidates(base_x: float,
+                                        base_y: float,
+                                        x_span: float,
+                                        y_span: float,
+                                        radial_scale: float = 1.0) -> List[Dict[str, Any]]:
+    """Bangun kandidat posisi label di sekitar titik acuan."""
+    offset_x = max(0.10 * x_span, 8.0) * float(radial_scale)
+    offset_y = max(0.11 * y_span, 18.0) * float(radial_scale)
+    far_offset_x = 1.35 * offset_x
+    far_offset_y = 1.30 * offset_y
+
+    return [
+        {'x': base_x + offset_x, 'y': base_y + offset_y, 'ha': 'left', 'va': 'bottom'},
+        {'x': base_x - offset_x, 'y': base_y + offset_y, 'ha': 'right', 'va': 'bottom'},
+        {'x': base_x + offset_x, 'y': base_y - offset_y, 'ha': 'left', 'va': 'top'},
+        {'x': base_x - offset_x, 'y': base_y - offset_y, 'ha': 'right', 'va': 'top'},
+        {'x': base_x + far_offset_x, 'y': base_y, 'ha': 'left', 'va': 'center'},
+        {'x': base_x - far_offset_x, 'y': base_y, 'ha': 'right', 'va': 'center'},
+        {'x': base_x, 'y': base_y + far_offset_y, 'ha': 'center', 'va': 'bottom'},
+        {'x': base_x, 'y': base_y - far_offset_y, 'ha': 'center', 'va': 'top'}
+    ]
+
+
+def _build_interaction_line_label_candidates(target_x: float,
+                                             target_y: float,
+                                             x_span: float,
+                                             y_span: float) -> List[Dict[str, Any]]:
+    """Bangun kandidat label garis lambda di beberapa titik sepanjang garis."""
+    candidates: List[Dict[str, Any]] = []
+    for fraction in (0.16, 0.26, 0.38, 0.62):
+        base_x = float(target_x) * float(fraction)
+        base_y = float(target_y) * float(fraction)
+        candidates.extend(
+            _build_interaction_label_candidates(
+                base_x,
+                base_y,
+                x_span,
+                y_span,
+                radial_scale=0.75
+            )
+        )
+    return candidates
+
+
+def _choose_interaction_label_position(axis,
+                                       text: str,
+                                       point_x: float,
+                                       point_y: float,
+                                       avoid_points: Optional[List[Tuple[float, float]]] = None,
+                                       avoid_boxes: Optional[List[Tuple[float, float, float, float]]] = None,
+                                       candidate_positions: Optional[List[Dict[str, Any]]] = None,
+                                       radial_scale: float = 1.0) -> Dict[str, Any]:
+    """Pilih kandidat posisi label terbaik agar box tetap rapi dan minim overlap."""
+    x_min, x_max = axis.get_xlim()
+    y_min, y_max = axis.get_ylim()
+    x_span = max(float(x_max - x_min), 1.0)
+    y_span = max(float(y_max - y_min), 1.0)
+    box_width, box_height = _estimate_interaction_label_box(text, x_span, y_span)
+
+    candidates = candidate_positions or _build_interaction_label_candidates(
+        point_x,
+        point_y,
+        x_span,
+        y_span,
+        radial_scale=radial_scale
+    )
+    avoid_points = list(avoid_points or [])
+    avoid_boxes = list(avoid_boxes or [])
+    base_point = (float(point_x), float(point_y))
+
+    best_choice = None
+    best_score = -float('inf')
+    for candidate in candidates:
+        bounds = _interaction_label_bounds(
+            float(candidate['x']),
+            float(candidate['y']),
+            box_width,
+            box_height,
+            str(candidate['ha']),
+            str(candidate['va'])
+        )
+
+        overflow_penalty = (
+            max(x_min - bounds[0], 0.0)
+            + max(bounds[2] - x_max, 0.0)
+        ) / x_span + (
+            max(y_min - bounds[1], 0.0)
+            + max(bounds[3] - y_max, 0.0)
+        ) / y_span
+
+        overlap_penalty = sum(
+            _interaction_box_overlap_ratio(bounds, other_bounds)
+            for other_bounds in avoid_boxes
+        )
+
+        point_clearances = [
+            _interaction_box_point_distance(bounds, other_point, x_span, y_span)
+            for other_point in avoid_points
+        ]
+        min_point_clearance = min(point_clearances) if point_clearances else 1.0
+        base_point_clearance = _interaction_box_point_distance(
+            bounds,
+            base_point,
+            x_span,
+            y_span
+        )
+
+        score = (
+            3.0 * min_point_clearance
+            + 0.8 * base_point_clearance
+            - 8.0 * overflow_penalty
+            - 14.0 * overlap_penalty
+        )
+
+        if score > best_score:
+            best_score = score
+            best_choice = {
+                'x': float(candidate['x']),
+                'y': float(candidate['y']),
+                'ha': str(candidate['ha']),
+                'va': str(candidate['va']),
+                'bounds': bounds
+            }
+
+    if best_choice is None:
+        best_choice = {
+            'x': float(point_x),
+            'y': float(point_y),
+            'ha': 'left',
+            'va': 'bottom',
+            'bounds': _interaction_label_bounds(
+                float(point_x),
+                float(point_y),
+                box_width,
+                box_height,
+                'left',
+                'bottom'
+            )
+        }
+    return best_choice
+
+
+def _build_interaction_offset_candidates(scale: float = 1.0) -> List[Dict[str, Any]]:
+    """Kandidat offset label dalam satuan points untuk anotasi titik."""
+    near = 14.0 * float(scale)
+    mid = 28.0 * float(scale)
+    far = 42.0 * float(scale)
+    return [
+        {'dx': near, 'dy': near, 'ha': 'left', 'va': 'bottom'},
+        {'dx': -near, 'dy': near, 'ha': 'right', 'va': 'bottom'},
+        {'dx': near, 'dy': -near, 'ha': 'left', 'va': 'top'},
+        {'dx': -near, 'dy': -near, 'ha': 'right', 'va': 'top'},
+        {'dx': mid, 'dy': 0.0, 'ha': 'left', 'va': 'center'},
+        {'dx': -mid, 'dy': 0.0, 'ha': 'right', 'va': 'center'},
+        {'dx': 0.0, 'dy': mid, 'ha': 'center', 'va': 'bottom'},
+        {'dx': 0.0, 'dy': -mid, 'ha': 'center', 'va': 'top'},
+        {'dx': far, 'dy': near, 'ha': 'left', 'va': 'bottom'},
+        {'dx': -far, 'dy': near, 'ha': 'right', 'va': 'bottom'},
+        {'dx': far, 'dy': -near, 'ha': 'left', 'va': 'top'},
+        {'dx': -far, 'dy': -near, 'ha': 'right', 'va': 'top'}
+    ]
+
+
+def _build_interaction_line_annotation_candidates(target_x: float,
+                                                  target_y: float,
+                                                  scale: float = 1.0) -> List[Dict[str, Any]]:
+    """Kandidat anotasi untuk label garis lambda di beberapa titik sepanjang garis."""
+    candidates: List[Dict[str, Any]] = []
+    for fraction in (0.18, 0.30, 0.44, 0.60):
+        anchor_xy = (float(target_x) * float(fraction), float(target_y) * float(fraction))
+        for offset_candidate in _build_interaction_offset_candidates(scale=scale):
+            candidates.append({
+                'anchor_xy': anchor_xy,
+                'dx': float(offset_candidate['dx']),
+                'dy': float(offset_candidate['dy']),
+                'ha': str(offset_candidate['ha']),
+                'va': str(offset_candidate['va'])
+            })
+    return candidates
+
+
+def _interaction_bbox_overlap_ratio_display(left_bbox,
+                                            right_bbox) -> float:
+    """Rasio overlap dua bbox dalam koordinat display."""
+    overlap_width = max(0.0, min(left_bbox.x1, right_bbox.x1) - max(left_bbox.x0, right_bbox.x0))
+    overlap_height = max(0.0, min(left_bbox.y1, right_bbox.y1) - max(left_bbox.y0, right_bbox.y0))
+    overlap_area = overlap_width * overlap_height
+    left_area = max(left_bbox.width * left_bbox.height, 1e-9)
+    return float(overlap_area / left_area)
+
+
+def _interaction_bbox_point_clearance_display(bbox,
+                                              point_display: Tuple[float, float],
+                                              axes_bbox) -> float:
+    """Jarak ternormalisasi antara bbox label dan titik dalam koordinat display."""
+    point_x, point_y = point_display
+    delta_x = max(bbox.x0 - point_x, 0.0, point_x - bbox.x1)
+    delta_y = max(bbox.y0 - point_y, 0.0, point_y - bbox.y1)
+    axes_diagonal = max(
+        float(np.hypot(float(axes_bbox.width), float(axes_bbox.height))),
+        1e-9
+    )
+    return float(np.hypot(delta_x, delta_y) / axes_diagonal)
+
+
+def _choose_interaction_annotation_spec(axis,
+                                        renderer,
+                                        text: str,
+                                        target_xy: Tuple[float, float],
+                                        occupied_bboxes: Optional[List[Any]] = None,
+                                        avoid_points: Optional[List[Tuple[float, float]]] = None,
+                                        candidate_specs: Optional[List[Dict[str, Any]]] = None,
+                                        with_arrow: bool = True,
+                                        fontsize: float = 8.0) -> Dict[str, Any]:
+    """Pilih spesifikasi anotasi terbaik berdasarkan bbox render aktual Matplotlib."""
+    axes_bbox = axis.get_window_extent(renderer)
+    occupied_bboxes = list(occupied_bboxes or [])
+    avoid_points_display = [
+        axis.transData.transform((float(point[0]), float(point[1])))
+        for point in (avoid_points or [])
+    ]
+    target_xy = (float(target_xy[0]), float(target_xy[1]))
+    candidates = list(candidate_specs or [])
+    if not candidates:
+        candidates = [
+            {
+                'anchor_xy': target_xy,
+                'dx': float(offset_candidate['dx']),
+                'dy': float(offset_candidate['dy']),
+                'ha': str(offset_candidate['ha']),
+                'va': str(offset_candidate['va'])
+            }
+            for offset_candidate in _build_interaction_offset_candidates()
+        ]
+
+    best_spec = None
+    best_score = -float('inf')
+    for candidate in candidates:
+        anchor_xy = tuple(candidate.get('anchor_xy', target_xy))
+        temporary_annotation = axis.annotate(
+            text,
+            xy=anchor_xy,
+            xytext=(float(candidate['dx']), float(candidate['dy'])),
+            textcoords='offset points',
+            ha=str(candidate['ha']),
+            va=str(candidate['va']),
+            fontsize=float(fontsize),
+            annotation_clip=False,
+            bbox=dict(
+                boxstyle='round,pad=0.22',
+                facecolor='white',
+                alpha=0.90,
+                edgecolor='#cbd5e1'
+            ),
+            arrowprops=(
+                dict(arrowstyle='->', color='#9ca3af', lw=0.9)
+                if with_arrow else
+                None
+            )
+        )
+        candidate_bbox = temporary_annotation.get_window_extent(renderer).expanded(1.03, 1.08)
+        temporary_annotation.remove()
+
+        overflow_penalty = (
+            max(float(axes_bbox.x0) - float(candidate_bbox.x0), 0.0)
+            + max(float(candidate_bbox.x1) - float(axes_bbox.x1), 0.0)
+            + max(float(axes_bbox.y0) - float(candidate_bbox.y0), 0.0)
+            + max(float(candidate_bbox.y1) - float(axes_bbox.y1), 0.0)
+        ) / max(float(axes_bbox.width + axes_bbox.height), 1e-9)
+        overlap_penalty = sum(
+            _interaction_bbox_overlap_ratio_display(candidate_bbox, other_bbox)
+            for other_bbox in occupied_bboxes
+        )
+        point_clearance = min(
+            (
+                _interaction_bbox_point_clearance_display(candidate_bbox, point_display, axes_bbox)
+                for point_display in avoid_points_display
+            ),
+            default=1.0
+        )
+        offset_length = float(np.hypot(float(candidate['dx']), float(candidate['dy'])))
+        offset_penalty = offset_length / 180.0
+
+        score = (
+            4.0 * point_clearance
+            - 12.0 * overlap_penalty
+            - 8.0 * overflow_penalty
+            - 0.25 * offset_penalty
+        )
+        if score > best_score:
+            best_score = score
+            best_spec = {
+                'anchor_xy': anchor_xy,
+                'dx': float(candidate['dx']),
+                'dy': float(candidate['dy']),
+                'ha': str(candidate['ha']),
+                'va': str(candidate['va'])
+            }
+
+    if best_spec is None:
+        best_spec = {
+            'anchor_xy': target_xy,
+            'dx': 16.0,
+            'dy': 16.0,
+            'ha': 'left',
+            'va': 'bottom'
+        }
+    return best_spec
+
+
+def _add_interaction_annotation(axis,
+                                renderer,
+                                text: str,
+                                target_xy: Tuple[float, float],
+                                bbox_edgecolor: str,
+                                occupied_bboxes: List[Any],
+                                avoid_points: Optional[List[Tuple[float, float]]] = None,
+                                candidate_specs: Optional[List[Dict[str, Any]]] = None,
+                                with_arrow: bool = True,
+                                fontsize: float = 8.0,
+                                text_color: Optional[str] = None):
+    """Tambahkan anotasi final dan simpan bbox-nya agar label berikutnya menghindar."""
+    chosen_spec = _choose_interaction_annotation_spec(
+        axis,
+        renderer,
+        text=text,
+        target_xy=target_xy,
+        occupied_bboxes=occupied_bboxes,
+        avoid_points=avoid_points,
+        candidate_specs=candidate_specs,
+        with_arrow=with_arrow,
+        fontsize=fontsize
+    )
+    annotation = axis.annotate(
+        text,
+        xy=tuple(chosen_spec['anchor_xy']),
+        xytext=(float(chosen_spec['dx']), float(chosen_spec['dy'])),
+        textcoords='offset points',
+        ha=str(chosen_spec['ha']),
+        va=str(chosen_spec['va']),
+        fontsize=float(fontsize),
+        color=text_color,
+        annotation_clip=False,
+        bbox=dict(
+            boxstyle='round,pad=0.22',
+            facecolor='white',
+            alpha=0.90,
+            edgecolor=bbox_edgecolor
+        ),
+        arrowprops=(
+            dict(arrowstyle='->', color=bbox_edgecolor, lw=0.9)
+            if with_arrow else
+            None
+        )
+    )
+    occupied_bboxes.append(annotation.get_window_extent(renderer).expanded(1.03, 1.08))
+    return annotation
+
+
 def build_interaction_diagram_figure(input_data: Dict,
                                      latest_simulation: Dict,
                                      latest_result: Dict,
@@ -7475,44 +13842,98 @@ def build_interaction_diagram_figure(input_data: Dict,
     full_y_padding = max(60.0, 0.08 * full_y_span)
     axes[0].set_xlim(max(0.0, full_x_min - full_x_padding), full_x_max + full_x_padding)
     axes[0].set_ylim(full_y_min - full_y_padding, full_y_max + full_y_padding)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
 
-    line_mid_x = 0.5 * line_target_moment
-    line_mid_y = 0.5 * line_target_axial
-    axes[0].annotate(
-        f"Demand\nM={max_moment:.2f} kN.m\nP={demand_axial:.2f} kN",
-        xy=(max_moment, demand_axial),
-        xytext=(12, 12),
-        textcoords='offset points',
-        arrowprops=dict(arrowstyle='->', color='#d62828', lw=1.0),
-        fontsize=8,
-        ha='left',
-        va='bottom'
-    )
+    demand_full_text = f"Demand\nM={max_moment:.2f} kN.m\nP={demand_axial:.2f} kN"
+    boundary_full_text = None
     if exact_boundary_moment is not None and exact_boundary_axial is not None and c_boundary_exact is not None:
-        axes[0].annotate(
-            (
-                "Boundary exact\n"
-                f"M={exact_boundary_moment:.2f} kN.m\n"
-                f"P={exact_boundary_axial:.2f} kN\n"
-                f"c={c_boundary_exact:.3f} mm"
-            ),
-            xy=(exact_boundary_moment, exact_boundary_axial),
-            xytext=(-14, 14),
-            textcoords='offset points',
-            arrowprops=dict(arrowstyle='->', color='#7c3aed', lw=1.0),
-            fontsize=8,
-            ha='right',
-            va='bottom'
+        boundary_full_text = (
+            "Boundary exact\n"
+            f"M={exact_boundary_moment:.2f} kN.m\n"
+            f"P={exact_boundary_axial:.2f} kN\n"
+            f"c={c_boundary_exact:.3f} mm"
         )
-    axes[0].text(
-        line_mid_x,
-        line_mid_y,
-        f"Garis lambda\nlambda = {line_target_lambda:.4f}",
-        fontsize=8,
-        ha='left',
-        va='bottom',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85, edgecolor='#9ca3af')
+    lambda_full_text = f"Garis lambda\nlambda = {line_target_lambda:.4f}"
+
+    full_label_boxes: List[Any] = []
+    if boundary_full_text is not None:
+        _add_interaction_annotation(
+            axes[0],
+            renderer,
+            boundary_full_text,
+            target_xy=(exact_boundary_moment, exact_boundary_axial),
+            bbox_edgecolor='#7c3aed',
+            occupied_bboxes=full_label_boxes,
+            avoid_points=[
+                (max_moment, demand_axial),
+                (line_target_moment, line_target_axial),
+                (0.0, 0.0)
+            ],
+            candidate_specs=[
+                {
+                    'anchor_xy': (exact_boundary_moment, exact_boundary_axial),
+                    'dx': float(offset_candidate['dx']),
+                    'dy': float(offset_candidate['dy']),
+                    'ha': str(offset_candidate['ha']),
+                    'va': str(offset_candidate['va'])
+                }
+                for offset_candidate in _build_interaction_offset_candidates(scale=1.0)
+            ],
+            with_arrow=True,
+            fontsize=8.0,
+            text_color='#7c3aed'
+        )
+
+    _add_interaction_annotation(
+        axes[0],
+        renderer,
+        demand_full_text,
+        target_xy=(max_moment, demand_axial),
+        bbox_edgecolor='#d62828',
+        occupied_bboxes=full_label_boxes,
+        avoid_points=[
+            (line_target_moment, line_target_axial),
+            (exact_boundary_moment if exact_boundary_moment is not None else boundary_moment,
+             exact_boundary_axial if exact_boundary_axial is not None else boundary_axial),
+            (0.0, 0.0)
+        ],
+        candidate_specs=[
+            {
+                'anchor_xy': (max_moment, demand_axial),
+                'dx': float(offset_candidate['dx']),
+                'dy': float(offset_candidate['dy']),
+                'ha': str(offset_candidate['ha']),
+                'va': str(offset_candidate['va'])
+            }
+            for offset_candidate in _build_interaction_offset_candidates(scale=0.95)
+        ],
+        with_arrow=True,
+        fontsize=8.0,
+        text_color='#d62828'
     )
+
+    _add_interaction_annotation(
+        axes[0],
+        renderer,
+        lambda_full_text,
+        target_xy=(0.5 * line_target_moment, 0.5 * line_target_axial),
+        bbox_edgecolor='#9ca3af',
+        occupied_bboxes=full_label_boxes,
+        avoid_points=[
+            (max_moment, demand_axial),
+            (line_target_moment, line_target_axial),
+            (0.0, 0.0)
+        ],
+        candidate_specs=_build_interaction_line_annotation_candidates(
+            line_target_moment,
+            line_target_axial,
+            scale=0.82
+        ),
+        with_arrow=False,
+        fontsize=8.0
+    )
+
     axes[0].set_title(f'Diagram Interaksi Elemen {elem_id}')
     axes[0].legend(loc='upper right', fontsize=8)
 
@@ -7529,38 +13950,85 @@ def build_interaction_diagram_figure(input_data: Dict,
     axes[1].set_xlim(min(zoom_x_values) - x_padding, max(zoom_x_values) + x_padding)
     axes[1].set_ylim(min(zoom_y_values) - y_padding, max(zoom_y_values) + y_padding)
     axes[1].set_title('Zoom Titik Kontrol')
-    axes[1].annotate(
-        f"Demand\nM={max_moment:.2f} kN.m\nP={demand_axial:.2f} kN",
-        xy=(max_moment, demand_axial),
-        xytext=(8, 8),
-        textcoords='offset points',
-        fontsize=8,
-        color='#d62828',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85, edgecolor='#d62828')
-    )
-    if exact_boundary_moment is not None and exact_boundary_axial is not None:
-        axes[1].annotate(
-            (
-                "Boundary exact\n"
-                f"M={exact_boundary_moment:.2f} kN.m\n"
-                f"P={exact_boundary_axial:.2f} kN\n"
-                f"c={c_boundary_exact:.3f} mm"
-            ),
-            xy=(exact_boundary_moment, exact_boundary_axial),
-            xytext=(8, -52),
-            textcoords='offset points',
-            fontsize=8,
-            color='#7c3aed',
-            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85, edgecolor='#7c3aed')
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    zoom_label_boxes: List[Any] = []
+    if boundary_full_text is not None:
+        _add_interaction_annotation(
+            axes[1],
+            renderer,
+            boundary_full_text,
+            target_xy=(exact_boundary_moment, exact_boundary_axial),
+            bbox_edgecolor='#7c3aed',
+            occupied_bboxes=zoom_label_boxes,
+            avoid_points=[
+                (max_moment, demand_axial),
+                (line_target_moment, line_target_axial),
+                (0.0, 0.0)
+            ],
+            candidate_specs=[
+                {
+                    'anchor_xy': (exact_boundary_moment, exact_boundary_axial),
+                    'dx': float(offset_candidate['dx']),
+                    'dy': float(offset_candidate['dy']),
+                    'ha': str(offset_candidate['ha']),
+                    'va': str(offset_candidate['va'])
+                }
+                for offset_candidate in _build_interaction_offset_candidates(scale=0.88)
+            ],
+            with_arrow=True,
+            fontsize=8.0,
+            text_color='#7c3aed'
         )
-    axes[1].text(
-        line_mid_x,
-        line_mid_y,
-        f"lambda = {line_target_lambda:.4f}",
-        fontsize=8,
-        ha='left',
-        va='bottom',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85, edgecolor='#9ca3af')
+
+    _add_interaction_annotation(
+        axes[1],
+        renderer,
+        demand_full_text,
+        target_xy=(max_moment, demand_axial),
+        bbox_edgecolor='#d62828',
+        occupied_bboxes=zoom_label_boxes,
+        avoid_points=[
+            (line_target_moment, line_target_axial),
+            (exact_boundary_moment if exact_boundary_moment is not None else boundary_moment,
+             exact_boundary_axial if exact_boundary_axial is not None else boundary_axial),
+            (0.0, 0.0)
+        ],
+        candidate_specs=[
+            {
+                'anchor_xy': (max_moment, demand_axial),
+                'dx': float(offset_candidate['dx']),
+                'dy': float(offset_candidate['dy']),
+                'ha': str(offset_candidate['ha']),
+                'va': str(offset_candidate['va'])
+            }
+            for offset_candidate in _build_interaction_offset_candidates(scale=0.84)
+        ],
+        with_arrow=True,
+        fontsize=8.0,
+        text_color='#d62828'
+    )
+
+    lambda_zoom_text = f"lambda = {line_target_lambda:.4f}"
+    _add_interaction_annotation(
+        axes[1],
+        renderer,
+        lambda_zoom_text,
+        target_xy=(0.5 * line_target_moment, 0.5 * line_target_axial),
+        bbox_edgecolor='#9ca3af',
+        occupied_bboxes=zoom_label_boxes,
+        avoid_points=[
+            (max_moment, demand_axial),
+            (line_target_moment, line_target_axial),
+            (0.0, 0.0)
+        ],
+        candidate_specs=_build_interaction_line_annotation_candidates(
+            line_target_moment,
+            line_target_axial,
+            scale=0.72
+        ),
+        with_arrow=False,
+        fontsize=8.0
     )
 
     fig.suptitle(
@@ -7797,6 +14265,29 @@ if run_analysis:
             st.session_state['results_bundle'] = analysis.get_results_bundle()
             st.session_state['portal_elements'] = analysis.portal.elements
             st.session_state['portal_nodes'] = analysis.data['geometry']['nodes'].astype(float)
+            st.session_state['failure_cloud_data'] = (
+                build_probabilistic_failure_cloud_data(
+                    analysis.mc_results,
+                    analysis.random_variables,
+                    analysis.data
+                )
+                if analysis.is_probabilistic else
+                {}
+            )
+            st.session_state['limit_state_physical_cloud_data'] = (
+                build_probabilistic_limit_state_physical_cloud_data(
+                    analysis
+                )
+                if analysis.is_probabilistic else
+                {}
+            )
+            st.session_state['axial_moment_pm_cloud_data'] = (
+                build_probabilistic_axial_moment_pm_cloud_data(
+                    analysis
+                )
+                if analysis.is_probabilistic else
+                {}
+            )
             st.session_state['analysis_source'] = uploaded_file.name if uploaded_file else resolved_file
             st.success("Analisis selesai. Dashboard di bawah sudah diperbarui.")
         except Exception as exc:
@@ -7823,6 +14314,9 @@ if preview_input_data is not None:
 results_bundle = st.session_state.get('results_bundle')
 portal_elements = st.session_state.get('portal_elements')
 portal_nodes = st.session_state.get('portal_nodes')
+failure_cloud_data = st.session_state.get('failure_cloud_data', {})
+limit_state_physical_cloud_data = st.session_state.get('limit_state_physical_cloud_data', {})
+axial_moment_pm_cloud_data = st.session_state.get('axial_moment_pm_cloud_data', {})
 analysis_source = st.session_state.get('analysis_source')
 selected_analysis_mode = (
     'probabilistic' if is_sidebar_probabilistic else 'deterministic'
@@ -7944,6 +14438,8 @@ dashboard_tabs = [
     "Output Sensitivitas Probabilistik",
     "Histogram",
     "Simulasi MC",
+    "Failure Cloud Fisik",
+    "Failure Cloud U-Space",
     "Risk Map",
     "Laporan"
 ]
@@ -8330,6 +14826,12 @@ elif active_dashboard_tab == "Output Reliability":
                     is_probabilistic=is_probabilistic
                 )
             )
+        if is_probabilistic:
+            render_output_reliability_beta_sketch_section(
+                results_bundle=results_bundle or {},
+                input_data=input_data,
+                heading_level="####"
+            )
 
 elif active_dashboard_tab == "Output Sensitivitas Probabilistik":
     if not results_bundle:
@@ -8372,6 +14874,38 @@ elif active_dashboard_tab == "Simulasi MC":
         render_probabilistic_mc_convergence_output_section(
             results_bundle,
             input_data=analysis_input_data,
+            heading_level="####"
+        )
+
+elif active_dashboard_tab == "Failure Cloud Fisik":
+    if not results_bundle:
+        st.info("Failure cloud ruang fisik akan tersedia setelah analisis dijalankan.")
+    elif not is_probabilistic:
+        st.info(
+            "Tab `Failure Cloud Fisik` khusus untuk mode probabilistik. "
+            "Jalankan analisis probabilistik agar sebaran Monte Carlo di ruang fisik dapat ditampilkan."
+        )
+    else:
+        render_probabilistic_limit_state_physical_failure_cloud_section(
+            physical_cloud_data=limit_state_physical_cloud_data or {},
+            axial_moment_pm_cloud_data=axial_moment_pm_cloud_data or {},
+            results_bundle=results_bundle,
+            input_data=analysis_input_data,
+            heading_level="####"
+        )
+
+elif active_dashboard_tab == "Failure Cloud U-Space":
+    if not results_bundle:
+        st.info("Failure cloud ruang normal baku akan tersedia setelah analisis dijalankan.")
+    elif not is_probabilistic:
+        st.info(
+            "Tab `Failure Cloud U-Space` khusus untuk mode probabilistik. "
+            "Jalankan analisis probabilistik agar sebaran safe/failed Monte Carlo pada ruang normal baku dapat ditampilkan."
+        )
+    else:
+        render_probabilistic_failure_cloud_output_section(
+            failure_cloud_data=failure_cloud_data or {},
+            results_bundle=results_bundle,
             heading_level="####"
         )
 
