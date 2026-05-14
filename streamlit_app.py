@@ -4777,6 +4777,7 @@ def build_probabilistic_limit_state_physical_cloud_data(
     analysis_history = list(analysis.mc_results.get('max_forces_history', []) or [])
     if not analysis_history:
         return {}
+    sample_history = list(analysis.mc_results.get('random_samples_history', []) or [])
 
     state_specs = {
         str(spec['key']): spec
@@ -4791,22 +4792,59 @@ def build_probabilistic_limit_state_physical_cloud_data(
             continue
 
         for elem_id in sorted(int(value) for value in elem_ids):
-            responses = []
-            for analysis_result in analysis_history:
+            response_records = []
+            for sample_index, analysis_result in enumerate(analysis_history):
                 response = analysis._extract_limit_state_histogram_response(
                     analysis_result,
                     int(elem_id),
                     str(limit_state)
                 )
                 if response:
-                    responses.append(response)
+                    response_records.append({
+                        'response': dict(response),
+                        'random_sample': (
+                            sample_history[sample_index]
+                            if (
+                                sample_index < len(sample_history)
+                                and isinstance(sample_history[sample_index], dict)
+                            ) else
+                            {}
+                        )
+                    })
 
-            if not responses:
+            if not response_records:
                 continue
 
-            r_values = np.asarray([float(item['R']) for item in responses], dtype=float)
-            q_values = np.asarray([float(item['Q']) for item in responses], dtype=float)
-            g_values = np.asarray([float(item['g']) for item in responses], dtype=float)
+            def build_material_sample_array(variable_key: str) -> np.ndarray:
+                sampled_values = []
+                for response_record in response_records:
+                    material_value = get_physical_limit_state_material_sample_value(
+                        analysis.data,
+                        int(elem_id),
+                        response_record.get('random_sample') or {},
+                        variable_key
+                    )
+                    sampled_values.append(
+                        np.nan if material_value is None else float(material_value)
+                    )
+                return np.asarray(sampled_values, dtype=float)
+
+            r_values = np.asarray(
+                [float(item['response']['R']) for item in response_records],
+                dtype=float
+            )
+            q_values = np.asarray(
+                [float(item['response']['Q']) for item in response_records],
+                dtype=float
+            )
+            g_values = np.asarray(
+                [float(item['response']['g']) for item in response_records],
+                dtype=float
+            )
+            fc_values = build_material_sample_array('fc')
+            fy_tarik_values = build_material_sample_array('fy_tarik')
+            fy_tekan_values = build_material_sample_array('fy_tekan')
+            fy_geser_values = build_material_sample_array('fy_geser')
             failure_mask = np.asarray(g_values < 0.0, dtype=bool)
             sample_indices = np.arange(g_values.size, dtype=int)
 
@@ -4852,7 +4890,13 @@ def build_probabilistic_limit_state_physical_cloud_data(
                 'R': r_values[selected_indices].astype(float).tolist(),
                 'Q': q_values[selected_indices].astype(float).tolist(),
                 'g': g_values[selected_indices].astype(float).tolist(),
-                'failure_mask': failure_mask[selected_indices].astype(bool).tolist()
+                'failure_mask': failure_mask[selected_indices].astype(bool).tolist(),
+                'material_samples': {
+                    'fc': fc_values[selected_indices].astype(float).tolist(),
+                    'fy_tarik': fy_tarik_values[selected_indices].astype(float).tolist(),
+                    'fy_tekan': fy_tekan_values[selected_indices].astype(float).tolist(),
+                    'fy_geser': fy_geser_values[selected_indices].astype(float).tolist()
+                }
             }
 
     element_ids = sorted(
@@ -4906,6 +4950,7 @@ def build_probabilistic_axial_moment_pm_cloud_data(
     analysis_history = list(analysis.mc_results.get('max_forces_history', []) or [])
     if not analysis_history:
         return {}
+    sample_history = list(analysis.mc_results.get('random_samples_history', []) or [])
 
     applicable_element_ids = sorted(
         int(elem_id)
@@ -4925,8 +4970,9 @@ def build_probabilistic_axial_moment_pm_cloud_data(
         boundary_axial_values = []
         g_values = []
         lambda_values = []
+        response_records = []
 
-        for analysis_result in analysis_history:
+        for sample_index, analysis_result in enumerate(analysis_history):
             if not analysis_result:
                 continue
 
@@ -4972,9 +5018,33 @@ def build_probabilistic_axial_moment_pm_cloud_data(
             boundary_axial_values.append(float(boundary_axial))
             g_values.append(float(g_numeric))
             lambda_values.append(float(lambda_value))
+            response_records.append({
+                'random_sample': (
+                    sample_history[sample_index]
+                    if (
+                        sample_index < len(sample_history)
+                        and isinstance(sample_history[sample_index], dict)
+                    ) else
+                    {}
+                )
+            })
 
         if not g_values:
             continue
+
+        def build_material_sample_array(variable_key: str) -> np.ndarray:
+            sampled_values = []
+            for response_record in response_records:
+                material_value = get_physical_limit_state_material_sample_value(
+                    analysis.data,
+                    int(elem_id),
+                    response_record.get('random_sample') or {},
+                    variable_key
+                )
+                sampled_values.append(
+                    np.nan if material_value is None else float(material_value)
+                )
+            return np.asarray(sampled_values, dtype=float)
 
         demand_moment_array = np.asarray(demand_moment_values, dtype=float)
         demand_axial_array = np.asarray(demand_axial_values, dtype=float)
@@ -4982,6 +5052,9 @@ def build_probabilistic_axial_moment_pm_cloud_data(
         boundary_axial_array = np.asarray(boundary_axial_values, dtype=float)
         g_array = np.asarray(g_values, dtype=float)
         lambda_array = np.asarray(lambda_values, dtype=float)
+        fc_array = build_material_sample_array('fc')
+        fy_tarik_array = build_material_sample_array('fy_tarik')
+        fy_tekan_array = build_material_sample_array('fy_tekan')
         failure_mask = np.asarray(g_array < 0.0, dtype=bool)
         sample_indices = np.arange(g_array.size, dtype=int)
 
@@ -5051,6 +5124,11 @@ def build_probabilistic_axial_moment_pm_cloud_data(
             'g': g_array[selected_indices].astype(float).tolist(),
             'lambda': lambda_array[selected_indices].astype(float).tolist(),
             'failure_mask': failure_mask[selected_indices].astype(bool).tolist(),
+            'material_samples': {
+                'fc': fc_array[selected_indices].astype(float).tolist(),
+                'fy_tarik': fy_tarik_array[selected_indices].astype(float).tolist(),
+                'fy_tekan': fy_tekan_array[selected_indices].astype(float).tolist()
+            },
             'mean_curve_moment': list(mean_curve_moment),
             'mean_curve_axial': list(mean_curve_axial)
         }
@@ -5083,6 +5161,221 @@ def get_probabilistic_limit_state_physical_cloud_record(
         (element_record.get('states', {}) or {}).get(str(limit_state))
         or {}
     )
+
+
+def get_physical_limit_state_material_sample_value(input_data: Dict,
+                                                   elem_id: int,
+                                                   random_sample: Optional[Dict[str, Any]],
+                                                   variable_key: str) -> Optional[float]:
+    """Ambil nilai sampel material Monte Carlo untuk satu elemen."""
+    elem_id = int(elem_id)
+    random_sample = random_sample or {}
+    variable_name = str(variable_key).strip()
+
+    concrete_props = get_by_element_value(
+        input_data.get('concrete', {}).get('by_element', {}),
+        elem_id,
+        {}
+    ) or {}
+    steel_props = get_by_element_value(
+        input_data.get('steel', {}).get('by_element', {}),
+        elem_id,
+        {}
+    ) or {}
+
+    if variable_name == 'fc':
+        raw_value = random_sample.get(f'fc_E{int(elem_id)}')
+        if raw_value is None:
+            raw_value = concrete_props.get('mean')
+    elif variable_name == 'fy_tarik':
+        raw_value = random_sample.get(f'fy_tarik_E{int(elem_id)}')
+        if raw_value is None:
+            raw_value = steel_props.get('tarik_mean')
+    elif variable_name == 'fy_tekan':
+        raw_value = random_sample.get(f'fy_tekan_E{int(elem_id)}')
+        if raw_value is None:
+            raw_value = steel_props.get('tekan_mean')
+    elif variable_name == 'fy_geser':
+        raw_value = random_sample.get(f'fy_geser_E{int(elem_id)}')
+        if raw_value is None:
+            raw_value = steel_props.get('geser_mean')
+        if raw_value is None:
+            raw_value = steel_props.get('tarik_mean')
+    else:
+        return None
+
+    numeric_value = coerce_finite_float(raw_value)
+    if numeric_value is None or numeric_value <= 0.0:
+        return None
+    return float(numeric_value)
+
+
+def get_limit_state_physical_cloud_axis_values(record: Dict[str, Any],
+                                               axis_key: str) -> np.ndarray:
+    """Ambil array titik Monte Carlo untuk satu sumbu peta limit-state fisik."""
+    normalized_axis_key = str(axis_key).strip()
+    if normalized_axis_key == 'Q':
+        return np.asarray((record or {}).get('Q', []), dtype=float)
+    if normalized_axis_key == 'R':
+        return np.asarray((record or {}).get('R', []), dtype=float)
+
+    material_samples = (record or {}).get('material_samples', {}) or {}
+    return np.asarray(material_samples.get(normalized_axis_key, []), dtype=float)
+
+
+def get_axial_moment_custom_axis_values(record: Dict[str, Any],
+                                        axis_key: str) -> np.ndarray:
+    """Ambil array titik Monte Carlo untuk sumbu custom aksial-lentur."""
+    normalized_axis_key = str(axis_key).strip()
+    if normalized_axis_key == 'Pd':
+        return np.asarray((record or {}).get('demand_axial', []), dtype=float)
+    if normalized_axis_key == 'Md':
+        return np.asarray((record or {}).get('demand_moment', []), dtype=float)
+
+    material_samples = (record or {}).get('material_samples', {}) or {}
+    return np.asarray(material_samples.get(normalized_axis_key, []), dtype=float)
+
+
+def build_limit_state_physical_cloud_scatter_data(record: Dict[str, Any],
+                                                  x_axis_key: str,
+                                                  y_axis_key: str) -> Optional[Dict[str, Any]]:
+    """Siapkan data titik safe/fail Monte Carlo untuk overlay pada peta fisik."""
+    x_values = get_limit_state_physical_cloud_axis_values(record, x_axis_key)
+    y_values = get_limit_state_physical_cloud_axis_values(record, y_axis_key)
+    failure_mask = np.asarray((record or {}).get('failure_mask', []), dtype=bool)
+
+    common_size = min(
+        int(x_values.size),
+        int(y_values.size),
+        int(failure_mask.size)
+    )
+    if common_size <= 0:
+        return None
+
+    x_values = x_values[:common_size]
+    y_values = y_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+    valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(valid_mask):
+        return None
+
+    x_valid = x_values[valid_mask]
+    y_valid = y_values[valid_mask]
+    failure_valid = failure_mask[valid_mask]
+    safe_valid = ~failure_valid
+    return {
+        'x': x_valid,
+        'y': y_valid,
+        'failure_mask': failure_valid,
+        'safe_mask': safe_valid,
+        'failure_count': int(np.sum(failure_valid)),
+        'safe_count': int(np.sum(safe_valid))
+    }
+
+
+def build_axial_moment_custom_scatter_data(record: Dict[str, Any],
+                                           x_axis_key: str,
+                                           y_axis_key: str) -> Optional[Dict[str, Any]]:
+    """Siapkan titik safe/fail Monte Carlo untuk custom map aksial-lentur."""
+    x_values = get_axial_moment_custom_axis_values(record, x_axis_key)
+    y_values = get_axial_moment_custom_axis_values(record, y_axis_key)
+    failure_mask = np.asarray((record or {}).get('failure_mask', []), dtype=bool)
+
+    common_size = min(
+        int(x_values.size),
+        int(y_values.size),
+        int(failure_mask.size)
+    )
+    if common_size <= 0:
+        return None
+
+    x_values = x_values[:common_size]
+    y_values = y_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+    valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(valid_mask):
+        return None
+
+    x_valid = x_values[valid_mask]
+    y_valid = y_values[valid_mask]
+    failure_valid = failure_mask[valid_mask]
+    safe_valid = ~failure_valid
+    return {
+        'x': x_valid,
+        'y': y_valid,
+        'failure_mask': failure_valid,
+        'safe_mask': safe_valid,
+        'failure_count': int(np.sum(failure_valid)),
+        'safe_count': int(np.sum(safe_valid))
+    }
+
+
+def plot_limit_state_physical_cloud_scatter(axis,
+                                            scatter_data: Optional[Dict[str, Any]],
+                                            style_variant: str = 'default') -> None:
+    """Overlay titik SMC safe/fail pada peta limit-state fisik."""
+    if not scatter_data:
+        return
+
+    x_values = np.asarray(scatter_data.get('x', []), dtype=float)
+    y_values = np.asarray(scatter_data.get('y', []), dtype=float)
+    safe_mask = np.asarray(scatter_data.get('safe_mask', []), dtype=bool)
+    failure_mask = np.asarray(scatter_data.get('failure_mask', []), dtype=bool)
+
+    if x_values.size == 0 or y_values.size == 0:
+        return
+
+    variant_name = str(style_variant or 'default').strip().lower()
+    use_physical_cloud_style = variant_name == 'physical_cloud'
+
+    if np.any(safe_mask):
+        axis.scatter(
+            x_values[safe_mask],
+            y_values[safe_mask],
+            s=18 if use_physical_cloud_style else 24,
+            color=SAFE_CLOUD_COLOR,
+            alpha=0.34 if use_physical_cloud_style else 0.68,
+            edgecolors='none' if use_physical_cloud_style else '#ffffff',
+            linewidths=0.0 if use_physical_cloud_style else 0.28,
+            zorder=4,
+            label=(
+                f"Safe ({int(np.sum(safe_mask)):,})"
+                if use_physical_cloud_style else
+                f"SMC safe ({int(np.sum(safe_mask)):,})"
+            )
+        )
+    if np.any(failure_mask):
+        axis.scatter(
+            x_values[failure_mask],
+            y_values[failure_mask],
+            s=28 if use_physical_cloud_style else 30,
+            color='#dc2626' if use_physical_cloud_style else '#ff0000',
+            alpha=0.82 if use_physical_cloud_style else 0.88,
+            edgecolors='#ffffff',
+            linewidths=0.25 if use_physical_cloud_style else 0.30,
+            zorder=5,
+            label=(
+                f"Failed ({int(np.sum(failure_mask)):,})"
+                if use_physical_cloud_style else
+                f"SMC fail ({int(np.sum(failure_mask)):,})"
+            )
+        )
+
+
+def pin_contour_axes_to_grid(axis,
+                             grid_x: np.ndarray,
+                             grid_y: np.ndarray) -> None:
+    """Paksa batas sumbu mengikuti area grid contour agar warna menempel ke bingkai."""
+    x_values = np.asarray(grid_x, dtype=float)
+    y_values = np.asarray(grid_y, dtype=float)
+    finite_x = x_values[np.isfinite(x_values)]
+    finite_y = y_values[np.isfinite(y_values)]
+    if finite_x.size == 0 or finite_y.size == 0:
+        return
+
+    axis.set_xlim(float(np.min(finite_x)), float(np.max(finite_x)))
+    axis.set_ylim(float(np.min(finite_y)), float(np.max(finite_y)))
+    axis.margins(x=0.0, y=0.0)
 
 
 def build_probabilistic_limit_state_physical_cloud_figure(
@@ -5698,6 +5991,7 @@ def render_probabilistic_limit_state_physical_failure_cloud_section(
 
     render_physical_limit_state_function_map_section(
         physical_cloud_data=physical_cloud_data,
+        axial_moment_pm_cloud_data=axial_moment_pm_cloud_data or {},
         results_bundle=results_bundle,
         input_data=input_data,
         elem_id=int(selected_element_id),
@@ -5708,6 +6002,8 @@ def render_probabilistic_limit_state_physical_failure_cloud_section(
         axial_moment_pm_cloud_data=axial_moment_pm_cloud_data or {},
         element_reliability=(results_bundle or {}).get('element_reliability', {}),
         input_data=input_data,
+        latest_simulation=(results_bundle or {}).get('latest_simulation', {}),
+        latest_result=((results_bundle or {}).get('latest_simulation', {}) or {}).get('analysis_result'),
         elem_id=int(selected_element_id),
         heading_level=heading_level
     )
@@ -5915,24 +6211,189 @@ def evaluate_physical_signed_margin_surface_grid(
     }
 
 
+def compute_polyline_length(polyline: np.ndarray) -> float:
+    """Hitung panjang total polyline 2D."""
+    polyline_array = np.asarray(polyline, dtype=float)
+    if polyline_array.ndim != 2 or polyline_array.shape[0] < 2:
+        return 0.0
+    deltas = np.diff(polyline_array[:, :2], axis=0)
+    segment_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
+    return float(np.sum(segment_lengths))
+
+
+def compute_point_to_polyline_distances(points_x: np.ndarray,
+                                        points_y: np.ndarray,
+                                        polyline: np.ndarray) -> np.ndarray:
+    """Hitung jarak minimum titik-titik 2D ke sebuah polyline."""
+    x_array = np.asarray(points_x, dtype=float).reshape(-1)
+    y_array = np.asarray(points_y, dtype=float).reshape(-1)
+    common_size = min(int(x_array.size), int(y_array.size))
+    if common_size <= 0:
+        return np.asarray([], dtype=float)
+
+    points = np.column_stack([x_array[:common_size], y_array[:common_size]]).astype(float)
+    polyline_array = np.asarray(polyline, dtype=float)
+    if polyline_array.ndim != 2 or polyline_array.shape[0] < 2:
+        return np.full(points.shape[0], np.inf, dtype=float)
+
+    vertices = polyline_array[:, :2]
+    distances = np.full(points.shape[0], np.inf, dtype=float)
+    for start_point, end_point in zip(vertices[:-1], vertices[1:]):
+        segment = end_point - start_point
+        segment_length_squared = float(np.dot(segment, segment))
+        if segment_length_squared <= 1e-18:
+            projected_points = np.repeat(start_point[np.newaxis, :], points.shape[0], axis=0)
+        else:
+            projection_ratio = np.clip(
+                np.sum((points - start_point[np.newaxis, :]) * segment[np.newaxis, :], axis=1)
+                / segment_length_squared,
+                0.0,
+                1.0
+            )
+            projected_points = (
+                start_point[np.newaxis, :]
+                + projection_ratio[:, np.newaxis] * segment[np.newaxis, :]
+            )
+        current_distances = np.hypot(
+            points[:, 0] - projected_points[:, 0],
+            points[:, 1] - projected_points[:, 1]
+        )
+        distances = np.minimum(distances, current_distances)
+    return distances.astype(float)
+
+
+def select_primary_zero_contour_segment(
+    zero_segments: List[np.ndarray],
+    reference_x: Optional[np.ndarray] = None,
+    reference_y: Optional[np.ndarray] = None,
+    max_reference_points: int = 260
+) -> Dict[str, Any]:
+    """Pilih cabang contour `g_hat=0` yang paling representatif terhadap cloud boundary."""
+    cleaned_segments = []
+    for segment in zero_segments or []:
+        segment_array = np.asarray(segment, dtype=float)
+        if segment_array.ndim != 2 or segment_array.shape[0] < 2:
+            continue
+        segment_array = segment_array[:, :2]
+        valid_mask = np.isfinite(segment_array).all(axis=1)
+        segment_array = segment_array[valid_mask]
+        if segment_array.shape[0] < 2:
+            continue
+        cleaned_segments.append(segment_array.astype(float))
+
+    if not cleaned_segments:
+        return {
+            'segments': [],
+            'selected_segment': None,
+            'branch_count': 0,
+            'selection_applied': False
+        }
+
+    if len(cleaned_segments) == 1:
+        return {
+            'segments': cleaned_segments,
+            'selected_segment': cleaned_segments[0],
+            'branch_count': 1,
+            'selection_applied': False
+        }
+
+    reference_x_array = np.asarray(reference_x, dtype=float).reshape(-1)
+    reference_y_array = np.asarray(reference_y, dtype=float).reshape(-1)
+    common_size = min(int(reference_x_array.size), int(reference_y_array.size))
+    if common_size > 0:
+        reference_x_array = reference_x_array[:common_size]
+        reference_y_array = reference_y_array[:common_size]
+        valid_reference_mask = (
+            np.isfinite(reference_x_array)
+            & np.isfinite(reference_y_array)
+        )
+        reference_x_array = reference_x_array[valid_reference_mask]
+        reference_y_array = reference_y_array[valid_reference_mask]
+        if reference_x_array.size > int(max_reference_points):
+            reference_indices = downsample_index_array(
+                np.arange(reference_x_array.size, dtype=int),
+                int(max_reference_points)
+            )
+            reference_x_array = reference_x_array[reference_indices]
+            reference_y_array = reference_y_array[reference_indices]
+
+    def score_segment(segment: np.ndarray) -> Tuple[float, float, float, float]:
+        segment_length = compute_polyline_length(segment)
+        if reference_x_array.size == 0 or reference_y_array.size == 0:
+            return (
+                float('inf'),
+                float('inf'),
+                float('inf'),
+                -float(segment_length)
+            )
+
+        distances = compute_point_to_polyline_distances(
+            reference_x_array,
+            reference_y_array,
+            segment
+        )
+        finite_distances = distances[np.isfinite(distances)]
+        if finite_distances.size == 0:
+            return (
+                float('inf'),
+                float('inf'),
+                float('inf'),
+                -float(segment_length)
+            )
+
+        return (
+            float(np.quantile(finite_distances, 0.50)),
+            float(np.quantile(finite_distances, 0.85)),
+            float(np.mean(finite_distances)),
+            -float(segment_length)
+        )
+
+    selected_segment = min(cleaned_segments, key=score_segment)
+    return {
+        'segments': cleaned_segments,
+        'selected_segment': selected_segment,
+        'branch_count': int(len(cleaned_segments)),
+        'selection_applied': True
+    }
+
+
 def add_physical_signed_margin_contours(
     axis,
     surface_grid: Optional[Dict[str, Any]],
-    max_abs_g: Optional[float] = None
+    max_abs_g: Optional[float] = None,
+    zero_reference_x: Optional[np.ndarray] = None,
+    zero_reference_y: Optional[np.ndarray] = None,
+    show_fill: bool = True,
+    show_nonzero_guides: bool = True
 ):
-    """Tambahkan latar kontur `g_hat(x)` dan garis nol pada axis fisik."""
+    """Tambahkan kontur `g_hat(x)` dan garis nol pada axis fisik."""
     if not surface_grid:
-        return None
+        return {
+            'contour_fill': None,
+            'zero_contour_drawn': False,
+            'zero_contour_branch_count': 0,
+            'zero_contour_selection_applied': False
+        }
 
     grid_x = np.asarray(surface_grid.get('grid_x', []), dtype=float)
     grid_y = np.asarray(surface_grid.get('grid_y', []), dtype=float)
     grid_g = np.asarray(surface_grid.get('grid_g', []), dtype=float)
     if grid_x.size == 0 or grid_y.size == 0 or grid_g.size == 0:
-        return None
+        return {
+            'contour_fill': None,
+            'zero_contour_drawn': False,
+            'zero_contour_branch_count': 0,
+            'zero_contour_selection_applied': False
+        }
 
     finite_g = grid_g[np.isfinite(grid_g)]
     if finite_g.size == 0:
-        return None
+        return {
+            'contour_fill': None,
+            'zero_contour_drawn': False,
+            'zero_contour_branch_count': 0,
+            'zero_contour_selection_applied': False
+        }
 
     max_abs_value = (
         float(max_abs_g)
@@ -5941,17 +6402,19 @@ def add_physical_signed_margin_contours(
     )
     max_abs_value = max(max_abs_value, 1e-6)
 
-    fill_levels = np.linspace(-max_abs_value, max_abs_value, 19)
-    contour_fill = axis.contourf(
-        grid_x,
-        grid_y,
-        grid_g,
-        levels=fill_levels,
-        cmap='RdYlBu',
-        alpha=0.14,
-        antialiased=True,
-        zorder=0
-    )
+    contour_fill = None
+    if show_fill:
+        fill_levels = np.linspace(-max_abs_value, max_abs_value, 19)
+        contour_fill = axis.contourf(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=fill_levels,
+            cmap='RdYlBu',
+            alpha=0.14,
+            antialiased=True,
+            zorder=0
+        )
     contour_step = build_nice_contour_step(max_abs_value)
     nonzero_levels = np.asarray(
         [
@@ -5965,7 +6428,7 @@ def add_physical_signed_margin_contours(
         ],
         dtype=float
     )
-    if nonzero_levels.size > 0:
+    if show_nonzero_guides and nonzero_levels.size > 0:
         axis.contour(
             grid_x,
             grid_y,
@@ -5977,8 +6440,11 @@ def add_physical_signed_margin_contours(
             linestyles='dashed',
             zorder=1
         )
+    zero_contour_drawn = False
+    zero_contour_branch_count = 0
+    zero_contour_selection_applied = False
     if float(np.min(finite_g)) <= 0.0 <= float(np.max(finite_g)):
-        axis.contour(
+        zero_contour = axis.contour(
             grid_x,
             grid_y,
             grid_g,
@@ -5987,7 +6453,37 @@ def add_physical_signed_margin_contours(
             linewidths=2.2,
             zorder=2
         )
-    return contour_fill
+        zero_segments = list((zero_contour.allsegs or [[]])[0])
+        zero_contour.remove()
+
+        zero_segment_info = select_primary_zero_contour_segment(
+            zero_segments,
+            reference_x=zero_reference_x,
+            reference_y=zero_reference_y
+        )
+        zero_contour_branch_count = int(zero_segment_info.get('branch_count', 0) or 0)
+        zero_contour_selection_applied = bool(
+            zero_segment_info.get('selection_applied', False)
+        )
+        selected_segment = zero_segment_info.get('selected_segment')
+        if selected_segment is not None:
+            selected_segment_array = np.asarray(selected_segment, dtype=float)
+            if selected_segment_array.ndim == 2 and selected_segment_array.shape[0] >= 2:
+                axis.plot(
+                    selected_segment_array[:, 0],
+                    selected_segment_array[:, 1],
+                    color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+                    linewidth=2.2,
+                    zorder=2
+                )
+                zero_contour_drawn = True
+
+    return {
+        'contour_fill': contour_fill,
+        'zero_contour_drawn': bool(zero_contour_drawn),
+        'zero_contour_branch_count': int(zero_contour_branch_count),
+        'zero_contour_selection_applied': bool(zero_contour_selection_applied)
+    }
 
 
 def get_physical_limit_state_function_map_specs() -> List[Dict[str, str]]:
@@ -6296,6 +6792,49 @@ def get_physical_limit_state_custom_axis_specs(limit_state: str) -> List[Dict[st
                 'axis_label': 'R: Axial capacity (kN)',
                 'kind': 'capacity',
                 'unit': 'kN'
+            },
+            {
+                'key': 'fc',
+                'label': "Concrete strength fc'",
+                'short_label': "fc'",
+                'axis_label': "Concrete strength fc' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tarik',
+                'label': 'Tensile steel strength fy',
+                'short_label': 'fy',
+                'axis_label': 'Tensile steel strength fy (MPa)',
+                'kind': 'material',
+                'unit': 'MPa'
+            },
+            {
+                'key': 'fy_tekan',
+                'label': "Compressive steel strength fy'",
+                'short_label': "fy'",
+                'axis_label': "Compressive steel strength fy' (MPa)",
+                'kind': 'material',
+                'unit': 'MPa'
+            }
+        ]
+    if limit_state_key == 'axial_moment':
+        return [
+            {
+                'key': 'Pd',
+                'label': 'Q: Axial demand Pd',
+                'short_label': 'Pd',
+                'axis_label': 'Q: Axial demand Pd (kN)',
+                'kind': 'demand_axial',
+                'unit': 'kN'
+            },
+            {
+                'key': 'Md',
+                'label': 'Q: Moment demand Md',
+                'short_label': 'Md',
+                'axis_label': 'Q: Moment demand Md (kN.m)',
+                'kind': 'demand_moment',
+                'unit': 'kN.m'
             },
             {
                 'key': 'fc',
@@ -6752,6 +7291,7 @@ def build_limit_state_function_physical_space_figure(physical_cloud_data: Dict[s
             alpha=0.92,
             antialiased=True
         )
+        pin_contour_axes_to_grid(axis, grid_x, grid_y)
         contour_step = build_nice_contour_step(max_abs_g)
         line_levels = contour_step * np.arange(-4, 5, dtype=float)
         nonzero_levels = np.asarray(
@@ -6800,6 +7340,14 @@ def build_limit_state_function_physical_space_figure(physical_cloud_data: Dict[s
                 fontsize=8
             )
 
+        plot_limit_state_physical_cloud_scatter(
+            axis,
+            build_limit_state_physical_cloud_scatter_data(
+                record,
+                str(spec['x_var']),
+                str(spec['y_var'])
+            )
+        )
         x_stat = surface_grid['x_stat']
         y_stat = surface_grid['y_stat']
         axis.scatter(
@@ -6809,6 +7357,7 @@ def build_limit_state_function_physical_space_figure(physical_cloud_data: Dict[s
             s=70,
             color='#111827',
             linewidths=1.6,
+            zorder=6,
             label='Mean material point'
         )
         if has_zero_crossing:
@@ -6964,6 +7513,7 @@ def build_limit_state_function_demand_material_space_figure(physical_cloud_data:
             alpha=0.92,
             antialiased=True
         )
+        pin_contour_axes_to_grid(axis, grid_x, grid_y)
         contour_step = build_nice_contour_step(max_abs_g)
         line_levels = contour_step * np.arange(-4, 5, dtype=float)
         nonzero_levels = np.asarray(
@@ -7012,6 +7562,14 @@ def build_limit_state_function_demand_material_space_figure(physical_cloud_data:
                 fontsize=8
             )
 
+        plot_limit_state_physical_cloud_scatter(
+            axis,
+            build_limit_state_physical_cloud_scatter_data(
+                record,
+                'Q',
+                str(spec['material_var'])
+            )
+        )
         axis.scatter(
             [float(demand_stat['mean'])],
             [float(material_stat['mean'])],
@@ -7019,6 +7577,7 @@ def build_limit_state_function_demand_material_space_figure(physical_cloud_data:
             s=70,
             color='#111827',
             linewidths=1.6,
+            zorder=6,
             label='Mean operating point'
         )
         if has_zero_crossing:
@@ -7087,7 +7646,304 @@ def build_limit_state_function_demand_material_space_figure(physical_cloud_data:
     return fig
 
 
+def build_axial_moment_custom_axis_figure(axial_moment_pm_cloud_data: Dict[str, Any],
+                                          input_data: Dict,
+                                          elem_id: int,
+                                          x_axis_key: str,
+                                          y_axis_key: str) -> Optional[plt.Figure]:
+    """Bangun peta custom aksial-lentur pada ruang Pd/Md/material dengan `g = lambda - 1`."""
+    axis_specs = get_physical_limit_state_custom_axis_specs('axial_moment')
+    axis_lookup = {
+        str(spec['key']): spec
+        for spec in axis_specs
+    }
+    x_spec = axis_lookup.get(str(x_axis_key))
+    y_spec = axis_lookup.get(str(y_axis_key))
+    if x_spec is None or y_spec is None or str(x_spec['key']) == str(y_spec['key']):
+        return None
+
+    record = (
+        (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        or {}
+    )
+    if not record:
+        return None
+
+    scatter_data = build_axial_moment_custom_scatter_data(
+        record,
+        str(x_spec['key']),
+        str(y_spec['key'])
+    )
+    demand_axial_values = get_axial_moment_custom_axis_values(record, 'Pd')
+    demand_moment_values = get_axial_moment_custom_axis_values(record, 'Md')
+    demand_axial_values = demand_axial_values[np.isfinite(demand_axial_values)]
+    demand_moment_values = demand_moment_values[np.isfinite(demand_moment_values)]
+
+    material_snapshot = get_element_material_snapshot(
+        input_data,
+        latest_simulation=None,
+        is_probabilistic=True,
+        elem_id=int(elem_id)
+    )
+    section_inputs = get_section_capacity_inputs_from_input(input_data, int(elem_id))
+
+    reference_values = {
+        'Pd': float(np.mean(demand_axial_values)) if demand_axial_values.size else 0.0,
+        'Md': float(np.mean(demand_moment_values)) if demand_moment_values.size else 0.0,
+        'fc': float(material_snapshot['fc']),
+        'fy_tarik': float(material_snapshot['fy_tarik']),
+        'fy_tekan': float(material_snapshot['fy_tekan'])
+    }
+
+    def resolve_axis_limits(axis_spec: Dict[str, str]) -> Optional[Tuple[float, float]]:
+        axis_kind = str(axis_spec.get('kind'))
+        axis_key = str(axis_spec['key'])
+        if axis_kind == 'material':
+            material_stat = get_physical_limit_state_material_stat(
+                input_data,
+                int(elem_id),
+                axis_key
+            )
+            return build_physical_limit_state_variable_limits(material_stat)
+
+        demand_values = get_axial_moment_custom_axis_values(record, axis_key)
+        demand_values = demand_values[np.isfinite(demand_values)]
+        if demand_values.size > 0:
+            return get_failure_cloud_axis_limits(demand_values)
+
+        reference_value = coerce_finite_float(reference_values.get(axis_key))
+        if reference_value is None:
+            return None
+        padding = max(abs(float(reference_value)) * 0.20, 1.0)
+        return float(reference_value - padding), float(reference_value + padding)
+
+    x_limits = resolve_axis_limits(x_spec)
+    y_limits = resolve_axis_limits(y_spec)
+    if x_limits is None or y_limits is None:
+        return None
+
+    grid_x_values = np.linspace(float(x_limits[0]), float(x_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
+    grid_y_values = np.linspace(float(y_limits[0]), float(y_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
+    grid_x, grid_y = np.meshgrid(grid_x_values, grid_y_values)
+    grid_g = np.full_like(grid_x, np.nan, dtype=float)
+
+    for row_index in range(grid_y_values.size):
+        for col_index in range(grid_x_values.size):
+            current_values = dict(reference_values)
+            current_values[str(x_spec['key'])] = float(grid_x[row_index, col_index])
+            current_values[str(y_spec['key'])] = float(grid_y[row_index, col_index])
+
+            demand_axial = float(current_values['Pd'])
+            demand_moment = abs(float(current_values['Md']))
+            compression_demand = 0.0
+            tension_demand = 0.0
+            if demand_axial > AXIAL_DEMAND_TOLERANCE_KN:
+                compression_demand = float(demand_axial)
+            elif demand_axial < -AXIAL_DEMAND_TOLERANCE_KN:
+                tension_demand = float(-demand_axial)
+
+            try:
+                response = PerformanceFunction._get_axial_moment_capacity_check_result(
+                    compression_demand,
+                    tension_demand,
+                    demand_moment,
+                    float(current_values['fc']),
+                    float(current_values['fy_tarik']),
+                    section_inputs['section_geometry'],
+                    section_inputs['steel_area'],
+                    fy_tekan=float(current_values['fy_tekan']),
+                    use_code_phi=False
+                )
+            except Exception:
+                continue
+
+            g_value = coerce_finite_float((response or {}).get('g'))
+            if g_value is not None:
+                grid_g[row_index, col_index] = float(g_value)
+
+    finite_g = grid_g[np.isfinite(grid_g)]
+    if finite_g.size == 0:
+        return None
+
+    fig, axis = plt.subplots(figsize=(9.0, 6.2), dpi=180)
+    axis.set_facecolor('#f8fafc')
+
+    max_abs_g = max(float(np.max(np.abs(finite_g))), 1e-6)
+    fill_levels = np.linspace(-max_abs_g, max_abs_g, 19)
+    contour_fill = axis.contourf(
+        grid_x,
+        grid_y,
+        grid_g,
+        levels=fill_levels,
+        cmap='RdYlBu',
+        alpha=0.92,
+        antialiased=True
+    )
+    pin_contour_axes_to_grid(axis, grid_x, grid_y)
+
+    contour_step = build_nice_contour_step(max_abs_g)
+    line_levels = contour_step * np.arange(-4, 5, dtype=float)
+    nonzero_levels = np.asarray(
+        [
+            value for value in line_levels
+            if (
+                not np.isclose(value, 0.0, atol=max(contour_step * 1e-6, 1e-12))
+                and abs(float(value)) <= max_abs_g * 1.02
+            )
+        ],
+        dtype=float
+    )
+    if nonzero_levels.size > 0:
+        iso_contours = axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=np.sort(nonzero_levels),
+            colors='#ffffff',
+            linewidths=0.8,
+            alpha=0.72
+        )
+        axis.clabel(
+            iso_contours,
+            fmt=lambda value: f"{float(value):.0f}",
+            inline=True,
+            fontsize=7
+        )
+
+    has_zero_crossing = bool(float(np.min(finite_g)) <= 0.0 <= float(np.max(finite_g)))
+    if has_zero_crossing:
+        zero_contour = axis.contour(
+            grid_x,
+            grid_y,
+            grid_g,
+            levels=[0.0],
+            colors=[PHYSICAL_NONLINEAR_CONTOUR_COLOR],
+            linewidths=2.4
+        )
+        axis.clabel(
+            zero_contour,
+            fmt={0.0: 'g = 0'},
+            inline=True,
+            fontsize=8
+        )
+
+    plot_limit_state_physical_cloud_scatter(
+        axis,
+        scatter_data
+    )
+    reference_x = coerce_finite_float(reference_values.get(str(x_spec['key'])))
+    reference_y = coerce_finite_float(reference_values.get(str(y_spec['key'])))
+    if reference_x is not None and reference_y is not None:
+        axis.scatter(
+            [float(reference_x)],
+            [float(reference_y)],
+            marker='x',
+            s=70,
+            color='#111827',
+            linewidths=1.6,
+            zorder=6,
+            label='Mean reference point'
+        )
+
+    if has_zero_crossing:
+        axis.plot(
+            [],
+            [],
+            color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
+            linewidth=2.4,
+            label='Limit-state contour g = 0'
+        )
+    else:
+        axis.text(
+            0.02,
+            0.03,
+            "No g = 0 contour in the current range",
+            transform=axis.transAxes,
+            ha='left',
+            va='bottom',
+            fontsize=7.3,
+            color='#7c2d12',
+            bbox=dict(
+                boxstyle='round,pad=0.18',
+                facecolor='#fff7ed',
+                edgecolor='#fdba74',
+                alpha=0.92
+            )
+        )
+
+    note_parts = []
+    for axis_key in ('Pd', 'Md', 'fc', 'fy_tarik', 'fy_tekan'):
+        if axis_key in {str(x_spec['key']), str(y_spec['key'])}:
+            continue
+        reference_value = coerce_finite_float(reference_values.get(axis_key))
+        axis_spec = axis_lookup.get(axis_key)
+        if reference_value is None or axis_spec is None:
+            continue
+        decimals = 2 if axis_key in {'Pd', 'Md'} else 1
+        note_parts.append(
+            f"{axis_spec['short_label']} = {reference_value:.{decimals}f} {axis_spec['unit']}"
+        )
+    note_text = "Fixed at mean: " + " | ".join(note_parts) if note_parts else "All remaining variables use the reference mean values."
+    axis.text(
+        0.02,
+        0.98,
+        note_text,
+        transform=axis.transAxes,
+        ha='left',
+        va='top',
+        fontsize=7.2,
+        color='#334155',
+        bbox=dict(
+            boxstyle='round,pad=0.20',
+            facecolor='#ffffff',
+            edgecolor='#cbd5e1',
+            alpha=0.92
+        )
+    )
+    axis.text(
+        0.98,
+        0.98,
+        "Interaction check: g = lambda - 1",
+        transform=axis.transAxes,
+        ha='right',
+        va='top',
+        fontsize=7.3,
+        color='#334155',
+        bbox=dict(
+            boxstyle='round,pad=0.18',
+            facecolor='#ffffff',
+            edgecolor='#cbd5e1',
+            alpha=0.92
+        )
+    )
+
+    axis.set_xlabel(str(x_spec['axis_label']))
+    axis.set_ylabel(str(y_spec['axis_label']))
+    axis.set_title(
+        f"Axial-Flexure Interaction | Custom Physical g(x) Map: {x_spec['short_label']} vs {y_spec['short_label']}",
+        fontsize=10.8,
+        pad=10
+    )
+    axis.grid(True, alpha=0.16, linestyle='--')
+    axis.legend(loc='best', fontsize=7.5, frameon=True)
+
+    fig.suptitle(
+        f"Custom Nonlinear Limit-State Map | Element E{int(elem_id)}",
+        fontsize=13,
+        y=0.985
+    )
+    fig.tight_layout(rect=[0, 0, 0.93, 0.96])
+    colorbar_axis = fig.add_axes([0.94, 0.16, 0.015, 0.68])
+    fig.colorbar(
+        contour_fill,
+        cax=colorbar_axis,
+        label='Limit-state function g(x)'
+    )
+    return fig
+
+
 def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str, Any],
+                                                  axial_moment_pm_cloud_data: Dict[str, Any],
                                                   input_data: Dict,
                                                   latest_result: Optional[Dict],
                                                   elem_id: int,
@@ -7096,6 +7952,15 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
                                                   y_axis_key: str) -> Optional[plt.Figure]:
     """Bangun peta fungsi limit-state custom dengan kedua sumbu dapat dipilih."""
     limit_state_key = str(limit_state).strip().lower()
+    if limit_state_key == 'axial_moment':
+        return build_axial_moment_custom_axis_figure(
+            axial_moment_pm_cloud_data=axial_moment_pm_cloud_data,
+            input_data=input_data,
+            elem_id=int(elem_id),
+            x_axis_key=str(x_axis_key),
+            y_axis_key=str(y_axis_key)
+        )
+
     axis_specs = get_physical_limit_state_custom_axis_specs(limit_state_key)
     axis_lookup = {
         str(spec['key']): spec
@@ -7115,6 +7980,13 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
     capacity_stat = get_physical_limit_state_capacity_stat(record)
     if demand_stat is None:
         return None
+    scatter_data = build_limit_state_physical_cloud_scatter_data(
+        record,
+        str(x_spec['key']),
+        str(y_spec['key'])
+    )
+    scatter_x_values = np.asarray((scatter_data or {}).get('x', []), dtype=float)
+    scatter_y_values = np.asarray((scatter_data or {}).get('y', []), dtype=float)
 
     section_inputs = get_section_capacity_inputs_from_input(input_data, int(elem_id))
     material_snapshot = get_element_material_snapshot(
@@ -7186,6 +8058,18 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
     if x_limits is None or y_limits is None:
         return None
 
+    use_physical_qr_alignment = selected_axis_keys == {'Q', 'R'}
+    if (
+        use_physical_qr_alignment
+        and scatter_x_values.size > 0
+        and scatter_y_values.size > 0
+    ):
+        common_limits = get_failure_cloud_axis_limits(
+            np.concatenate([scatter_x_values, scatter_y_values])
+        )
+        x_limits = common_limits
+        y_limits = common_limits
+
     grid_x_values = np.linspace(float(x_limits[0]), float(x_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
     grid_y_values = np.linspace(float(y_limits[0]), float(y_limits[1]), PHYSICAL_LIMIT_STATE_FUNCTION_GRID_SIZE)
     grid_x, grid_y = np.meshgrid(grid_x_values, grid_y_values)
@@ -7241,6 +8125,9 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
         alpha=0.92,
         antialiased=True
     )
+    pin_contour_axes_to_grid(axis, grid_x, grid_y)
+    if use_physical_qr_alignment and hasattr(axis, 'set_box_aspect'):
+        axis.set_box_aspect(1.0)
 
     contour_step = build_nice_contour_step(max_abs_g)
     line_levels = contour_step * np.arange(-4, 5, dtype=float)
@@ -7290,8 +8177,23 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
             fontsize=8
         )
 
-    reference_x = coerce_finite_float(reference_values.get(str(x_spec['key'])))
-    reference_y = coerce_finite_float(reference_values.get(str(y_spec['key'])))
+    plot_limit_state_physical_cloud_scatter(
+        axis,
+        scatter_data,
+        style_variant='physical_cloud' if use_physical_qr_alignment else 'default'
+    )
+    if (
+        use_physical_qr_alignment
+        and scatter_x_values.size > 0
+        and scatter_y_values.size > 0
+    ):
+        reference_x = float(np.mean(scatter_x_values))
+        reference_y = float(np.mean(scatter_y_values))
+        reference_label = 'Sample Mean'
+    else:
+        reference_x = coerce_finite_float(reference_values.get(str(x_spec['key'])))
+        reference_y = coerce_finite_float(reference_values.get(str(y_spec['key'])))
+        reference_label = 'Mean reference point'
     if reference_x is not None and reference_y is not None:
         axis.scatter(
             [float(reference_x)],
@@ -7300,7 +8202,8 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
             s=70,
             color='#111827',
             linewidths=1.6,
-            label='Mean reference point'
+            zorder=6,
+            label=reference_label
         )
 
     if has_zero_crossing:
@@ -7390,8 +8293,12 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
         fontsize=10.8,
         pad=10
     )
-    axis.grid(True, alpha=0.16, linestyle='--')
-    axis.legend(loc='best', fontsize=7.5, frameon=True)
+    axis.grid(True, alpha=0.22 if use_physical_qr_alignment else 0.16, linestyle='--')
+    axis.legend(
+        loc='best',
+        fontsize=7.8 if use_physical_qr_alignment else 7.5,
+        frameon=True
+    )
 
     fig.suptitle(
         f"Custom Nonlinear Limit-State Map | Element E{int(elem_id)}",
@@ -7409,6 +8316,7 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
 
 
 def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[str, Any],
+                                                     axial_moment_pm_cloud_data: Dict[str, Any],
                                                      results_bundle: Dict[str, Any],
                                                      input_data: Dict,
                                                      elem_id: int,
@@ -7425,8 +8333,12 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
     )
     st.caption(
         "Anda sekarang juga bisa memilih pasangan sumbu custom, termasuk `R` dan `Q`, "
-        "atau tetap memakai tampilan preset seperti `Demand-Material Space` dan "
-        "`Material-Variable Space`."
+        "termasuk pasangan `Pd-Md/material` untuk `axial+flexure`, atau tetap memakai "
+        "tampilan preset seperti `Demand-Material Space` dan `Material-Variable Space`."
+    )
+    st.caption(
+        "Overlay titik SMC pada peta: bullet merah = sampel fail (`g(x) < 0`), "
+        "bullet biru = sampel safe (`g(x) >= 0`)."
     )
     map_view_mode = st.radio(
         "Map view",
@@ -7445,9 +8357,16 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
             "satu sumbu, peta akan mengikuti hubungan langsung `g = R - Q`; sedangkan "
             "variabel yang tidak dipilih ditahan pada nilai mean referensinya."
         )
+        available_limit_state_keys = {'moment', 'shear', 'axial'}
+        has_axial_moment_data = bool(
+            (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        )
+        if has_axial_moment_data:
+            available_limit_state_keys.add('axial_moment')
+
         limit_state_specs = [
             spec for spec in get_probabilistic_limit_state_histogram_specs()
-            if str(spec['key']) in {'moment', 'shear', 'axial'}
+            if str(spec['key']) in available_limit_state_keys
         ]
         limit_state_lookup = {
             str(spec['key']): str(spec.get('plot_label', spec['label']))
@@ -7505,6 +8424,7 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
             )
         figure = build_limit_state_function_custom_axis_figure(
             physical_cloud_data=physical_cloud_data,
+            axial_moment_pm_cloud_data=axial_moment_pm_cloud_data,
             input_data=input_data,
             latest_result=latest_result,
             elem_id=int(elem_id),
@@ -7559,7 +8479,7 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
         )
     if figure is None:
         st.info(
-            "Peta fungsi limit-state nonlinier untuk lentur, geser, dan aksial "
+            "Peta fungsi limit-state nonlinier untuk lentur, geser, aksial, atau axial-flexure "
             "belum dapat dibentuk pada elemen terpilih."
         )
         return
@@ -7577,11 +8497,18 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
 def build_probabilistic_axial_moment_pm_cloud_figure(
     axial_moment_pm_cloud_data: Dict[str, Any],
     elem_id: int,
-    show_boundary_envelope: bool = True,
     beta_value: Optional[float] = None,
-    show_nonlinear_contour: bool = True
+    show_envelope: bool = True,
+    show_nonlinear_contour: bool = True,
+    current_demand_moment: Optional[float] = None,
+    current_demand_axial: Optional[float] = None,
+    current_boundary_moment: Optional[float] = None,
+    current_boundary_axial: Optional[float] = None,
+    active_curve_moment: Optional[List[float]] = None,
+    active_curve_axial: Optional[List[float]] = None,
+    active_boundary_label: str = 'Active boundary point'
 ) -> Optional[plt.Figure]:
-    """Bangun figure contour nonlinier aksial-lentur pada ruang fisik `P-M`."""
+    """Bangun figure contour nonlinier aksial-lentur yang disederhanakan pada ruang `P-M`."""
     record = (
         (axial_moment_pm_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
         or {}
@@ -7594,14 +8521,12 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
     boundary_moment = np.asarray(record.get('boundary_moment', []), dtype=float)
     boundary_axial = np.asarray(record.get('boundary_axial', []), dtype=float)
     g_values = np.asarray(record.get('g', []), dtype=float)
-    failure_mask = np.asarray(record.get('failure_mask', []), dtype=bool)
     common_size = min(
         int(demand_moment.size),
         int(demand_axial.size),
         int(boundary_moment.size),
         int(boundary_axial.size),
-        int(g_values.size),
-        int(failure_mask.size)
+        int(g_values.size)
     )
     if common_size <= 0:
         return None
@@ -7611,8 +8536,6 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
     boundary_moment = boundary_moment[:common_size]
     boundary_axial = boundary_axial[:common_size]
     g_values = g_values[:common_size]
-    failure_mask = failure_mask[:common_size]
-    safe_mask = ~failure_mask
 
     valid_mask = (
         np.isfinite(demand_moment)
@@ -7629,7 +8552,7 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
     boundary_moment = boundary_moment[valid_mask]
     boundary_axial = boundary_axial[valid_mask]
     g_values = g_values[valid_mask]
-    failure_mask = failure_mask[valid_mask]
+    failure_mask = np.asarray(g_values < 0.0, dtype=bool)
     safe_mask = ~failure_mask
 
     mean_curve_moment = np.asarray(record.get('mean_curve_moment', []), dtype=float)
@@ -7640,85 +8563,143 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
     mean_curve_valid = np.isfinite(mean_curve_moment) & np.isfinite(mean_curve_axial)
     mean_curve_moment = mean_curve_moment[mean_curve_valid]
     mean_curve_axial = mean_curve_axial[mean_curve_valid]
+    active_curve_moment_array = np.asarray(active_curve_moment or [], dtype=float)
+    active_curve_axial_array = np.asarray(active_curve_axial or [], dtype=float)
+    active_curve_size = min(
+        int(active_curve_moment_array.size),
+        int(active_curve_axial_array.size)
+    )
+    active_curve_moment_array = active_curve_moment_array[:active_curve_size]
+    active_curve_axial_array = active_curve_axial_array[:active_curve_size]
+    active_curve_valid = (
+        np.isfinite(active_curve_moment_array)
+        & np.isfinite(active_curve_axial_array)
+    )
+    active_curve_moment_array = active_curve_moment_array[active_curve_valid]
+    active_curve_axial_array = active_curve_axial_array[active_curve_valid]
 
-    def build_boundary_envelope(moment_values: np.ndarray,
-                                axial_values: np.ndarray,
-                                max_bins: int = 18) -> Dict[str, np.ndarray]:
-        """Ringkas cloud boundary menjadi amplop persentil agar lebih komunikatif."""
-        x_values = np.asarray(moment_values, dtype=float)
-        y_values = np.asarray(axial_values, dtype=float)
-        valid_points = np.isfinite(x_values) & np.isfinite(y_values)
-        x_values = x_values[valid_points]
-        y_values = y_values[valid_points]
-        if x_values.size < 10:
-            return {}
+    current_demand_moment = coerce_finite_float(current_demand_moment)
+    current_demand_axial = coerce_finite_float(current_demand_axial)
+    current_boundary_moment = coerce_finite_float(current_boundary_moment)
+    current_boundary_axial = coerce_finite_float(current_boundary_axial)
 
-        num_bins = int(np.clip(np.sqrt(x_values.size), 8, max_bins))
-        x_min = float(np.min(x_values))
-        x_max = float(np.max(x_values))
-        if np.isclose(x_min, x_max, atol=1e-12, rtol=1e-9):
-            return {}
+    overlay_x_values = np.asarray(
+        [
+            value for value in (
+                current_demand_moment,
+                current_boundary_moment
+            )
+            if value is not None
+        ],
+        dtype=float
+    )
+    overlay_y_values = np.asarray(
+        [
+            value for value in (
+                current_demand_axial,
+                current_boundary_axial
+            )
+            if value is not None
+        ],
+        dtype=float
+    )
 
-        bin_edges = np.linspace(x_min, x_max, num_bins + 1)
-        centers = []
-        lowers = []
-        medians = []
-        uppers = []
-        counts = []
+    def build_boundary_envelope_band(x_values: np.ndarray,
+                                     y_values: np.ndarray,
+                                     lower_quantile: float = 0.10,
+                                     upper_quantile: float = 0.90) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bangun band statistik lokal `P10-P90` dari cloud boundary aktif Monte Carlo."""
+        finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+        if int(np.sum(finite_mask)) < 4:
+            empty = np.asarray([], dtype=float)
+            return empty, empty, empty
 
-        for index in range(num_bins):
-            left_edge = float(bin_edges[index])
-            right_edge = float(bin_edges[index + 1])
-            if index == num_bins - 1:
-                mask = (x_values >= left_edge) & (x_values <= right_edge)
-            else:
-                mask = (x_values >= left_edge) & (x_values < right_edge)
-            if int(np.sum(mask)) < 4:
+        x_valid = np.asarray(x_values[finite_mask], dtype=float)
+        y_valid = np.asarray(y_values[finite_mask], dtype=float)
+        sort_order = np.lexsort((y_valid, x_valid))
+        x_sorted = x_valid[sort_order]
+        y_sorted = y_valid[sort_order]
+        sample_count = int(x_sorted.size)
+        min_points_per_group = 8
+        max_groups = max(sample_count // min_points_per_group, 1)
+        group_count = int(np.clip(max_groups, 4, 24))
+        grouped_indices = [
+            group_indices
+            for group_indices in np.array_split(np.arange(sample_count, dtype=int), group_count)
+            if int(group_indices.size) > 0
+        ]
+        if len(grouped_indices) < 2:
+            empty = np.asarray([], dtype=float)
+            return empty, empty, empty
+
+        band_x = []
+        band_lower = []
+        band_upper = []
+        for group_indices in grouped_indices:
+            x_group = x_sorted[group_indices]
+            y_group = y_sorted[group_indices]
+            if x_group.size == 0 or y_group.size == 0:
                 continue
+            band_x.append(float(np.median(x_group)))
+            band_lower.append(float(np.quantile(y_group, lower_quantile)))
+            band_upper.append(float(np.quantile(y_group, upper_quantile)))
 
-            x_bin = x_values[mask]
-            y_bin = y_values[mask]
-            centers.append(float(np.median(x_bin)))
-            lowers.append(float(np.quantile(y_bin, 0.10)))
-            medians.append(float(np.quantile(y_bin, 0.50)))
-            uppers.append(float(np.quantile(y_bin, 0.90)))
-            counts.append(int(x_bin.size))
+        if len(band_x) < 2:
+            empty = np.asarray([], dtype=float)
+            return empty, empty, empty
 
-        if len(centers) < 3:
-            return {}
+        band_x_array = np.asarray(band_x, dtype=float)
+        band_lower_array = np.asarray(band_lower, dtype=float)
+        band_upper_array = np.asarray(band_upper, dtype=float)
+        valid_band_mask = (
+            np.isfinite(band_x_array)
+            & np.isfinite(band_lower_array)
+            & np.isfinite(band_upper_array)
+        )
+        if int(np.sum(valid_band_mask)) < 2:
+            empty = np.asarray([], dtype=float)
+            return empty, empty, empty
 
-        return {
-            'x': np.asarray(centers, dtype=float),
-            'y_lower': np.asarray(lowers, dtype=float),
-            'y_median': np.asarray(medians, dtype=float),
-            'y_upper': np.asarray(uppers, dtype=float),
-            'count': np.asarray(counts, dtype=int)
-        }
+        band_x_array = band_x_array[valid_band_mask]
+        band_lower_array = band_lower_array[valid_band_mask]
+        band_upper_array = band_upper_array[valid_band_mask]
+        band_lower_original = band_lower_array.copy()
+        band_upper_original = band_upper_array.copy()
+        band_lower_array = np.minimum(band_lower_original, band_upper_original)
+        band_upper_array = np.maximum(band_lower_original, band_upper_original)
+        return band_x_array, band_lower_array, band_upper_array
 
-    boundary_envelope = build_boundary_envelope(boundary_moment, boundary_axial)
+    envelope_moment, envelope_axial_lower, envelope_axial_upper = build_boundary_envelope_band(
+        boundary_moment,
+        boundary_axial
+    )
+
     full_x_values = np.concatenate(
         [
             demand_moment,
             boundary_moment,
-            mean_curve_moment if mean_curve_moment.size else np.asarray([], dtype=float)
+            mean_curve_moment if mean_curve_moment.size else np.asarray([], dtype=float),
+            active_curve_moment_array if active_curve_moment_array.size else np.asarray([], dtype=float),
+            overlay_x_values
         ]
     )
     full_y_values = np.concatenate(
         [
             demand_axial,
             boundary_axial,
-            mean_curve_axial if mean_curve_axial.size else np.asarray([], dtype=float)
+            mean_curve_axial if mean_curve_axial.size else np.asarray([], dtype=float),
+            active_curve_axial_array if active_curve_axial_array.size else np.asarray([], dtype=float),
+            overlay_y_values
         ]
     )
     full_x_limits = get_failure_cloud_axis_limits(full_x_values)
     full_y_limits = get_failure_cloud_axis_limits(full_y_values)
 
-    zoom_x_values = np.concatenate([demand_moment, boundary_moment])
-    zoom_y_values = np.concatenate([demand_axial, boundary_axial])
+    zoom_x_values = np.concatenate([demand_moment, boundary_moment, overlay_x_values])
+    zoom_y_values = np.concatenate([demand_axial, boundary_axial, overlay_y_values])
     zoom_x_limits = get_failure_cloud_axis_limits(zoom_x_values)
     zoom_y_limits = get_failure_cloud_axis_limits(zoom_y_values)
 
-    surface_model = None
     surface_full = None
     surface_zoom = None
     surface_max_abs_g = None
@@ -7775,125 +8756,150 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
 
     fig, axes = plt.subplots(1, 2, figsize=(15.0, 6.9), dpi=180)
     axes_list = list(np.asarray(axes).reshape(-1))
-    contour_fill_handles = []
     panel_surface_grids = [surface_full, surface_zoom]
+    multiple_zero_branch_detected = False
 
     for axis, surface_grid in zip(axes_list, panel_surface_grids):
         axis.set_facecolor('#f8fafc')
-        contour_fill = None
         if show_nonlinear_contour and surface_grid is not None:
-            contour_fill = add_physical_signed_margin_contours(
+            contour_result = add_physical_signed_margin_contours(
                 axis,
                 surface_grid,
-                max_abs_g=surface_max_abs_g
+                max_abs_g=surface_max_abs_g,
+                zero_reference_x=boundary_moment,
+                zero_reference_y=boundary_axial,
+                show_fill=True,
+                show_nonzero_guides=False
             )
-            if (
-                float(surface_grid.get('g_min', 1.0)) <= 0.0
-                and float(surface_grid.get('g_max', -1.0)) >= 0.0
-            ):
+            if contour_result.get('zero_contour_drawn'):
+                if int(contour_result.get('zero_contour_branch_count', 0) or 0) > 1:
+                    multiple_zero_branch_detected = True
                 axis.plot(
                     [],
                     [],
                     color=PHYSICAL_NONLINEAR_CONTOUR_COLOR,
                     linewidth=2.2,
-                    label='Nonlinear contour g_hat(M, P)=0'
+                    label=(
+                        'Principal nonlinear contour g_hat(M, P)=0'
+                        if contour_result.get('zero_contour_selection_applied') else
+                        'Nonlinear contour g_hat(M, P)=0'
+                    )
                 )
-        contour_fill_handles.append(contour_fill)
-        if mean_curve_moment.size > 1:
-            axis.plot(
-                mean_curve_moment,
-                mean_curve_axial,
-                color='#0f4c81',
-                linewidth=2.2,
-                label='Reference interaction curve (mean)'
-            )
-        if show_boundary_envelope and boundary_envelope:
-            axis.fill_between(
-                boundary_envelope['x'],
-                boundary_envelope['y_lower'],
-                boundary_envelope['y_upper'],
-                color='#94a3b8',
-                alpha=0.22,
-                linewidth=0.0,
-                label='Sample boundary envelope (P10-P90)'
-            )
-            axis.plot(
-                boundary_envelope['x'],
-                boundary_envelope['y_median'],
-                color='#475569',
-                linestyle='--',
-                linewidth=1.2,
-                alpha=0.95,
-                label='Sample boundary median'
-            )
-        elif show_boundary_envelope:
-            axis.scatter(
-                boundary_moment,
-                boundary_axial,
-                s=10,
-                color='#64748b',
-                alpha=0.20,
-                edgecolors='none',
-                label='Sample boundary, g=0'
-            )
+
         if np.any(safe_mask):
             axis.scatter(
                 demand_moment[safe_mask],
                 demand_axial[safe_mask],
-                s=20,
+                s=18,
                 color=SAFE_CLOUD_COLOR,
-                alpha=0.42,
+                alpha=0.30,
                 edgecolors='none',
-                label=f"Safe demand ({int(np.sum(safe_mask)):,})"
+                zorder=2.1,
+                label=f"Safe cloud ({int(np.sum(safe_mask)):,})"
             )
         if np.any(failure_mask):
             axis.scatter(
                 demand_moment[failure_mask],
                 demand_axial[failure_mask],
-                s=30,
+                s=28,
                 color='#dc2626',
-                alpha=0.84,
+                alpha=0.80,
                 edgecolors='#ffffff',
                 linewidths=0.25,
-                label=f"Failed demand ({int(np.sum(failure_mask)):,})"
+                zorder=2.2,
+                label=f"Fail cloud ({int(np.sum(failure_mask)):,})"
             )
-
-        mean_demand_moment = float(np.mean(demand_moment)) if demand_moment.size else None
-        mean_demand_axial = float(np.mean(demand_axial)) if demand_axial.size else None
-        mean_boundary_moment = float(np.mean(boundary_moment)) if boundary_moment.size else None
-        mean_boundary_axial = float(np.mean(boundary_axial)) if boundary_axial.size else None
-        if mean_demand_moment is not None and mean_demand_axial is not None:
-            axis.scatter(
-                [mean_demand_moment],
-                [mean_demand_axial],
-                marker='x',
-                s=80,
-                color='#0f172a',
-                linewidths=1.6,
-                label='Mean demand'
+        if show_envelope and envelope_moment.size > 1:
+            axis.fill_between(
+                envelope_moment,
+                envelope_axial_lower,
+                envelope_axial_upper,
+                facecolor='#9ca3af',
+                edgecolor='none',
+                linewidth=0.0,
+                alpha=0.22,
+                zorder=2.0,
+                label='Envelope boundary'
             )
-        if mean_boundary_moment is not None and mean_boundary_axial is not None:
-            axis.scatter(
-                [mean_boundary_moment],
-                [mean_boundary_axial],
-                marker='D',
-                s=42,
+        if mean_curve_moment.size > 1:
+            axis.plot(
+                mean_curve_moment,
+                mean_curve_axial,
+                color='#0f4c81',
+                linestyle='-.',
+                linewidth=1.8,
+                alpha=0.88,
+                label='Reference interaction curve (mean material)'
+            )
+        if active_curve_moment_array.size > 1:
+            axis.plot(
+                active_curve_moment_array,
+                active_curve_axial_array,
+                color='#2563eb',
+                linestyle='--',
+                linewidth=1.9,
+                alpha=0.88,
+                label='Active interaction curve (current sample)'
+            )
+        if (
+            current_demand_moment is not None
+            and current_demand_axial is not None
+            and current_boundary_moment is not None
+            and current_boundary_axial is not None
+        ):
+            axis.plot(
+                [current_demand_moment, current_boundary_moment],
+                [current_demand_axial, current_boundary_axial],
                 color='#2a9d8f',
-                alpha=0.95,
-                edgecolors='#ffffff',
-                linewidths=0.35,
-                label='Mean boundary'
+                linestyle='-.',
+                linewidth=1.35,
+                alpha=0.92,
+                label='Direction line to active boundary'
             )
-            if mean_demand_moment is not None and mean_demand_axial is not None:
-                axis.plot(
-                    [mean_demand_moment, mean_boundary_moment],
-                    [mean_demand_axial, mean_boundary_axial],
-                    color='#2a9d8f',
-                    linestyle=':',
-                    linewidth=1.0,
-                    alpha=0.9,
-                    label='Direction to mean boundary'
-                )
+            axis.scatter(
+                [current_boundary_moment],
+                [current_boundary_axial],
+                color='#ffffff',
+                marker='*',
+                s=260,
+                linewidths=0.0,
+                zorder=6.8,
+                label='_nolegend_'
+            )
+            axis.scatter(
+                [current_boundary_moment],
+                [current_boundary_axial],
+                color='#7c3aed',
+                marker='*',
+                s=185,
+                edgecolors='#7c3aed',
+                linewidths=0.6,
+                zorder=7.0,
+                label=str(active_boundary_label)
+            )
+            axis.scatter(
+                [current_boundary_moment],
+                [current_boundary_axial],
+                color='#581c87',
+                marker='o',
+                s=24,
+                edgecolors='#ffffff',
+                linewidths=0.70,
+                zorder=7.2,
+                label='_nolegend_'
+            )
+        if current_demand_moment is not None and current_demand_axial is not None:
+            axis.scatter(
+                [current_demand_moment],
+                [current_demand_axial],
+                marker='X',
+                s=116,
+                color='#111827',
+                edgecolors='#ffffff',
+                linewidths=0.75,
+                zorder=6.4,
+                label='Current point'
+            )
 
         axis.set_xlabel('Moment M (kN.m)')
         axis.set_ylabel('Axial P (kN)')
@@ -7906,7 +8912,7 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
     axes_list[1].set_xlim(*zoom_x_limits)
     axes_list[1].set_ylim(*zoom_y_limits)
     axes_list[1].set_title(
-        'Physical P-M Space | Zoomed Demand, Boundary, and g=0 Contour',
+        'Physical P-M Space | Zoomed Current Point and g=0 Contour',
         fontsize=11,
         pad=10
     )
@@ -7916,7 +8922,9 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
         (
             f"Valid N = {int(record.get('sample_count', 0))}\n"
             f"Failures = {int(record.get('failure_count', 0))}\n"
-            f"Pf(valid) = {float(record.get('Pf_from_g', 0.0)):.4f}"
+            f"Pf(valid) = {float(record.get('Pf_from_g', 0.0)):.4f}\n"
+            f"Current Point Md = {format_metric(current_demand_moment, 2)} kN.m\n"
+            f"Current Point Pd = {format_metric(current_demand_axial, 2)} kN"
         ),
         transform=axes_list[1].transAxes,
         ha='right',
@@ -7946,10 +8954,27 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
                 alpha=0.92
             )
         )
-    contour_fill_source = next(
-        (handle for handle in contour_fill_handles if handle is not None),
-        None
-    )
+    elif multiple_zero_branch_detected:
+        axes_list[0].text(
+            0.02,
+            0.02,
+            (
+                "Several mathematical branches of `g_hat(M,P)=0` were detected.\n"
+                "Only the branch closest to the sampled boundary cloud is shown."
+            ),
+            transform=axes_list[0].transAxes,
+            ha='left',
+            va='bottom',
+            fontsize=7.7,
+            color='#334155',
+            bbox=dict(
+                boxstyle='round,pad=0.22',
+                facecolor='#ffffff',
+                edgecolor='#cbd5e1',
+                alpha=0.93
+            )
+        )
+
     legend_handles, legend_labels = axes_list[1].get_legend_handles_labels()
     beta_text = format_metric(beta_value, 4) if beta_value is not None else '-'
     legend_handles.append(
@@ -7968,15 +8993,7 @@ def build_probabilistic_axial_moment_pm_cloud_figure(
         fontsize=13,
         y=0.99
     )
-    layout_rect = [0, 0, 0.90, 0.97] if contour_fill_source is not None else [0, 0, 1, 0.97]
-    fig.tight_layout(rect=layout_rect)
-    if contour_fill_source is not None:
-        colorbar_axis = fig.add_axes([0.915, 0.16, 0.016, 0.68])
-        fig.colorbar(
-            contour_fill_source,
-            cax=colorbar_axis,
-            label='Estimated nonlinear signed margin g_hat(M, P) (-)'
-        )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
 
 
@@ -7984,6 +9001,8 @@ def render_probabilistic_axial_moment_pm_cloud_section(
     axial_moment_pm_cloud_data: Dict[str, Any],
     element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
     input_data: Optional[Dict],
+    latest_simulation: Optional[Dict[str, Any]],
+    latest_result: Optional[Dict[str, Any]],
     elem_id: int,
     heading_level: str = "####"
 ) -> None:
@@ -8004,13 +9023,26 @@ def render_probabilistic_axial_moment_pm_cloud_section(
         "untuk elemen kolom, dibangun dari sampel probabilistik yang tersimpan."
     )
     st.caption(
-        "Dengan tampilan ini, batas gagal aksial-lentur terlihat langsung sebagai pola "
-        "nonlinier pada bidang fisik `M-P`, bukan hanya pada bentuk ternormalisasi `lambda`."
+        "Plot ini mempertahankan titik cloud `safe/fail`, marker `current point`, "
+        "latar contour berwarna `g(x)`, `direction line`, dan `reference interaction curve`. "
+        "Arsiran abu-abu `envelope boundary` adalah band statistik lokal `P10-P90` dan bisa "
+        "ditampilkan atau disembunyikan."
     )
     st.caption(
-        "Envelope abu-abu menunjukkan rentang boundary sampel `P10-P90`, garis abu-abu "
-        "putus-putus menunjukkan median boundary, dan latar warna menunjukkan "
-        "`signed margin g_hat(M,P)` hasil aproksimasi."
+        "Garis panduan `Current Md` dan `Current Pd` tidak ditampilkan. Posisi simulasi "
+        "aktif ditunjukkan langsung oleh marker `current point`, sedangkan `direction line` "
+        "tetap diarahkan ke boundary aktif yang sekarang diberi marker bintang ungu."
+    )
+    st.caption(
+        "Garis biru putus-titik menunjukkan `reference interaction curve` pada material mean; "
+        "garis ini hanya pembanding. Jika data simulasi aktif tersedia, dashboard juga "
+        "menampilkan `active interaction curve` agar marker boundary aktif tepat punya "
+        "kurva acuan yang konsisten."
+    )
+    st.caption(
+        "Jika surrogate kuadratik membentuk lebih dari satu cabang matematis `g_hat(M,P)=0`, "
+        "dashboard hanya menampilkan cabang utama yang paling dekat ke cloud boundary sampel "
+        "agar interpretasi visual tetap stabil."
     )
 
     if not available_column_ids:
@@ -8043,13 +9075,13 @@ def render_probabilistic_axial_moment_pm_cloud_section(
         )
         return
 
-    show_boundary_envelope = st.checkbox(
+    show_envelope = st.checkbox(
         "Tampilkan envelope boundary sampel (P10-P90)",
         value=True,
         key=f"axial_moment_pm_envelope_toggle_e{selected_pm_elem_id}"
     )
     show_nonlinear_contour = st.checkbox(
-        "Tampilkan contour nonlinier g(x)=0 dari sampel sSMC",
+        "Tampilkan contour nonlinier g(x)=0 dari sampel SMC",
         value=True,
         key=f"axial_moment_pm_contour_toggle_e{selected_pm_elem_id}"
     )
@@ -8060,13 +9092,42 @@ def render_probabilistic_axial_moment_pm_cloud_section(
             {}
         ) or {}
     ).get('Beta')
+    current_overlay = get_current_axial_moment_physical_overlay_from_latest_result(
+        input_data,
+        latest_simulation,
+        latest_result,
+        int(selected_pm_elem_id)
+    )
 
     pm_fig = build_probabilistic_axial_moment_pm_cloud_figure(
         axial_moment_pm_cloud_data,
         selected_pm_elem_id,
-        show_boundary_envelope=bool(show_boundary_envelope),
         beta_value=beta_value,
-        show_nonlinear_contour=bool(show_nonlinear_contour)
+        show_envelope=bool(show_envelope),
+        show_nonlinear_contour=bool(show_nonlinear_contour),
+        current_demand_moment=(
+            None if not current_overlay else current_overlay.get('demand_moment')
+        ),
+        current_demand_axial=(
+            None if not current_overlay else current_overlay.get('demand_axial')
+        ),
+        current_boundary_moment=(
+            None if not current_overlay else current_overlay.get('boundary_moment')
+        ),
+        current_boundary_axial=(
+            None if not current_overlay else current_overlay.get('boundary_axial')
+        ),
+        active_curve_moment=(
+            [] if not current_overlay else list(current_overlay.get('active_curve_moment', []) or [])
+        ),
+        active_curve_axial=(
+            [] if not current_overlay else list(current_overlay.get('active_curve_axial', []) or [])
+        ),
+        active_boundary_label=(
+            'Active boundary point (exact)'
+            if (current_overlay or {}).get('boundary_source') == 'exact' else
+            'Active boundary point (interp)'
+        )
     )
     if pm_fig is not None:
         render_plot(
@@ -12857,6 +13918,134 @@ def get_max_forces_entry_by_element(latest_result: Dict, elem_id: int) -> Dict:
     return {}
 
 
+def get_current_axial_moment_physical_overlay_from_latest_result(
+    input_data: Optional[Dict[str, Any]],
+    latest_simulation: Optional[Dict[str, Any]],
+    latest_result: Optional[Dict[str, Any]],
+    elem_id: int
+) -> Dict[str, Any]:
+    """Ambil demand, boundary aktif, dan kurva interaksi sampel aktif untuk overlay ruang fisik."""
+    if not latest_result:
+        return {}
+
+    max_forces_entry = get_max_forces_entry_by_element(latest_result, int(elem_id))
+    if not max_forces_entry:
+        return {}
+
+    demand_moment = coerce_finite_float(max_forces_entry.get('max_moment'))
+    if demand_moment is None:
+        return {}
+
+    axial_moment_meta = (
+        get_by_element_value(
+            latest_result.get('performance_axial_moment_metadata', {}),
+            int(elem_id),
+            {}
+        ) or {}
+    )
+    force_data = (max_forces_entry.get('forces') or {}) if isinstance(max_forces_entry, dict) else {}
+    demand_axial = resolve_axial_moment_plot_demand_axial(
+        force_data,
+        axial_moment_meta.get('controlling_state')
+    )
+
+    overlay_data = {
+        'demand_moment': abs(float(demand_moment)),
+        'demand_axial': float(demand_axial)
+    }
+    boundary_moment = coerce_finite_float(axial_moment_meta.get('phi_Mn'))
+    boundary_axial = coerce_finite_float(axial_moment_meta.get('phi_Pn'))
+    if boundary_moment is not None:
+        overlay_data['boundary_moment_interp'] = float(boundary_moment)
+    if boundary_axial is not None:
+        overlay_data['boundary_axial_interp'] = float(boundary_axial)
+    if boundary_moment is not None:
+        overlay_data['boundary_moment'] = float(boundary_moment)
+    if boundary_axial is not None:
+        overlay_data['boundary_axial'] = float(boundary_axial)
+
+    if not input_data:
+        return overlay_data
+
+    try:
+        section_inputs = get_section_capacity_inputs_from_input(input_data, int(elem_id))
+        material_snapshot = get_element_material_snapshot(
+            input_data,
+            latest_simulation,
+            True,
+            int(elem_id)
+        )
+        active_curve = PerformanceFunction._get_column_interaction_curve(
+            material_snapshot['fc'],
+            material_snapshot['fy_tarik'],
+            section_inputs['section_geometry'],
+            section_inputs['steel_area'],
+            fy_tekan=material_snapshot['fy_tekan'],
+            use_code_phi=False
+        )
+        active_curve_moment = [
+            float(point['phi_Mn'])
+            for point in (active_curve or [])
+            if coerce_finite_float(point.get('phi_Mn')) is not None
+            and coerce_finite_float(point.get('phi_Pn')) is not None
+        ]
+        active_curve_axial = [
+            float(point['phi_Pn'])
+            for point in (active_curve or [])
+            if coerce_finite_float(point.get('phi_Mn')) is not None
+            and coerce_finite_float(point.get('phi_Pn')) is not None
+        ]
+        if len(active_curve_moment) > 1 and len(active_curve_axial) > 1:
+            overlay_data['active_curve_moment'] = list(active_curve_moment)
+            overlay_data['active_curve_axial'] = list(active_curve_axial)
+
+        exact_boundary = find_exact_interaction_boundary_state(
+            material_snapshot['fc'],
+            material_snapshot['fy_tarik'],
+            material_snapshot['fy_tekan'],
+            section_inputs['section_geometry'],
+            section_inputs['steel_area'],
+            float(demand_axial),
+            abs(float(demand_moment)),
+            use_code_phi=False
+        )
+        if exact_boundary is not None:
+            exact_boundary_moment = coerce_finite_float(exact_boundary.get('phi_Mn'))
+            exact_boundary_axial = coerce_finite_float(exact_boundary.get('phi_Pn'))
+            if exact_boundary_moment is not None and exact_boundary_axial is not None:
+                overlay_data['boundary_moment_exact'] = float(exact_boundary_moment)
+                overlay_data['boundary_axial_exact'] = float(exact_boundary_axial)
+                overlay_data['boundary_moment'] = float(exact_boundary_moment)
+                overlay_data['boundary_axial'] = float(exact_boundary_axial)
+                overlay_data['boundary_source'] = 'exact'
+        else:
+            overlay_data['boundary_source'] = 'interp'
+    except Exception:
+        overlay_data.setdefault('boundary_source', 'interp')
+    return overlay_data
+
+
+def get_current_axial_moment_physical_demand_from_latest_result(
+    input_data: Optional[Dict[str, Any]],
+    latest_simulation: Optional[Dict[str, Any]],
+    latest_result: Optional[Dict[str, Any]],
+    elem_id: int
+) -> Dict[str, float]:
+    """Ambil titik demand aksial-lentur dari simulasi aktif untuk overlay ruang fisik."""
+    overlay_data = get_current_axial_moment_physical_overlay_from_latest_result(
+        input_data,
+        latest_simulation,
+        latest_result,
+        int(elem_id)
+    )
+    if not overlay_data:
+        return {}
+    return {
+        'moment': float(overlay_data['demand_moment']),
+        'axial': float(overlay_data['demand_axial'])
+    }
+
+
 def get_axial_demands_from_force_data(force_data: Dict) -> Dict[str, float]:
     """Ekstrak demand aksial tekan dan tarik maksimum dari gaya elemen."""
     axial_values = [
@@ -13794,6 +14983,43 @@ def build_interaction_diagram_figure(input_data: Dict,
         g_exact = float(lambda_exact - 1.0) if np.isfinite(lambda_exact) else float('inf')
         c_boundary_exact = float(exact_boundary.get('neutral_axis_depth', 0.0) or 0.0)
 
+    interp_boundary_available = bool(
+        np.isfinite(boundary_moment)
+        and np.isfinite(boundary_axial)
+    )
+    exact_boundary_found = bool(
+        exact_boundary_moment is not None
+        and exact_boundary_axial is not None
+        and np.isfinite(float(exact_boundary_moment))
+        and np.isfinite(float(exact_boundary_axial))
+    )
+    moment_span_reference = max(
+        max(moment_values) - min(moment_values) if moment_values else 0.0,
+        abs(max_moment),
+        abs(boundary_moment),
+        abs(exact_boundary_moment) if exact_boundary_moment is not None else 0.0,
+        1.0
+    )
+    axial_span_reference = max(
+        max(axial_values) - min(axial_values) if axial_values else 0.0,
+        abs(demand_axial),
+        abs(boundary_axial),
+        abs(exact_boundary_axial) if exact_boundary_axial is not None else 0.0,
+        1.0
+    )
+    exact_boundary_overlaps_interp = bool(
+        interp_boundary_available
+        and exact_boundary_found
+        and abs(float(exact_boundary_moment) - float(boundary_moment)) <= 0.015 * moment_span_reference
+        and abs(float(exact_boundary_axial) - float(boundary_axial)) <= 0.015 * axial_span_reference
+    )
+    if not exact_boundary_found:
+        boundary_exact_status = 'Tidak ditemukan'
+    elif exact_boundary_overlaps_interp:
+        boundary_exact_status = 'Ditemukan, hampir berimpit'
+    else:
+        boundary_exact_status = 'Ditemukan'
+
     line_target_moment = exact_boundary_moment if exact_boundary_moment is not None else boundary_moment
     line_target_axial = exact_boundary_axial if exact_boundary_axial is not None else boundary_axial
     line_target_lambda = lambda_exact if lambda_exact is not None else lambda_interp
@@ -13802,6 +15028,18 @@ def build_interaction_diagram_figure(input_data: Dict,
     for axis in axes:
         axis.plot(moment_values, axial_values, color='#0f4c81', lw=2.2, label='Kurva interaksi')
         axis.scatter([max_moment], [demand_axial], color='#d62828', s=55, zorder=5, label='Demand')
+        if interp_boundary_available:
+            axis.scatter(
+                [boundary_moment],
+                [boundary_axial],
+                marker='D',
+                s=155 if exact_boundary_overlaps_interp else 70,
+                facecolors='none' if exact_boundary_overlaps_interp else '#14b8a6',
+                edgecolors='#0f766e' if exact_boundary_overlaps_interp else '#ffffff',
+                linewidths=1.8 if exact_boundary_overlaps_interp else 0.9,
+                zorder=6.6,
+                label='Boundary interp'
+            )
         axis.plot(
             [0.0, line_target_moment],
             [0.0, line_target_axial],
@@ -13819,11 +15057,34 @@ def build_interaction_diagram_figure(input_data: Dict,
             axis.scatter(
                 [exact_boundary_moment],
                 [exact_boundary_axial],
+                color='#ffffff',
+                marker='*',
+                s=300,
+                linewidths=0.0,
+                zorder=7.8,
+                label='_nolegend_'
+            )
+            axis.scatter(
+                [exact_boundary_moment],
+                [exact_boundary_axial],
                 color='#7c3aed',
                 marker='*',
-                s=140,
-                zorder=7,
+                s=210,
+                edgecolors='#7c3aed',
+                linewidths=0.6,
+                zorder=8.0,
                 label='Boundary exact (c)'
+            )
+            axis.scatter(
+                [exact_boundary_moment],
+                [exact_boundary_axial],
+                color='#581c87',
+                marker='o',
+                s=30,
+                edgecolors='#ffffff',
+                linewidths=0.75,
+                zorder=8.3,
+                label='_nolegend_'
             )
 
     full_view_x_values = moment_values + [max_moment, line_target_moment]
@@ -14056,6 +15317,9 @@ def build_interaction_diagram_figure(input_data: Dict,
         'boundary_moment': boundary_moment,
         'boundary_axial_exact': exact_boundary_axial,
         'boundary_moment_exact': exact_boundary_moment,
+        'exact_boundary_found': exact_boundary_found,
+        'exact_boundary_overlaps_interp': exact_boundary_overlaps_interp,
+        'boundary_exact_status': boundary_exact_status,
         'controlling_state': controlling_state or '-',
         'material_snapshot': material_snapshot
     }
@@ -15117,8 +16381,11 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
             st.caption(
                 "Kurva dibentuk dari snapshot material simulasi yang sedang ditampilkan. "
                 "Panel kiri menampilkan kurva penuh, panel kanan fokus pada titik kontrol. "
-                "Titik `Demand`, `Boundary exact (c)`, dan `Garis lambda` "
+                "Titik `Demand`, `Boundary interp`, `Boundary exact (c)`, dan `Garis lambda` "
                 "diberi label langsung pada gambar. "
+                "Marker `Boundary interp` ditampilkan sebagai diamond toska, sedangkan "
+                "`Boundary exact (c)` ditampilkan sebagai bintang ungu berhalo dengan "
+                "titik pusat tambahan agar tetap terlihat meskipun menempel pada kurva. "
                 "Pada mode probabilistik kurva memakai `phi = 1`, sedangkan pada mode "
                 "deterministik kurva memakai `phi` sesuai SNI 2847:2019. "
                 "Gunakan scroll mouse atau pinch untuk memperbesar gambar."
@@ -15132,7 +16399,7 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
                     is_probabilistic,
                     selected_interaction_elem
                 )
-                demand_cols = st.columns(4)
+                demand_cols = st.columns(6)
                 demand_cols[0].metric(
                     "Demand Aksial (kN)",
                     format_metric(interaction_plot['demand_axial'], 3)
@@ -15142,15 +16409,23 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
                     format_metric(interaction_plot['demand_moment'], 3)
                 )
                 demand_cols[2].metric(
+                    "Boundary Interp P (kN)",
+                    format_metric(interaction_plot['boundary_axial'], 3)
+                )
+                demand_cols[3].metric(
+                    "Boundary Interp M (kN.m)",
+                    format_metric(interaction_plot['boundary_moment'], 3)
+                )
+                demand_cols[4].metric(
                     "Boundary Exact P (kN)",
                     format_metric(interaction_plot['boundary_axial_exact'], 3)
                 )
-                demand_cols[3].metric(
+                demand_cols[5].metric(
                     "Boundary Exact M (kN.m)",
                     format_metric(interaction_plot['boundary_moment_exact'], 3)
                 )
 
-                metric_cols = st.columns(5)
+                metric_cols = st.columns(6)
                 metric_cols[0].metric(
                     "Lambda Interp (-)",
                     format_metric(interaction_plot['lambda_interp'], 4)
@@ -15168,9 +16443,25 @@ elif active_dashboard_tab == "Kurva Interasi P-M":
                     format_metric(interaction_plot['g_exact'], 4)
                 )
                 metric_cols[4].metric(
+                    "Status Exact",
+                    str(interaction_plot.get('boundary_exact_status') or '-')
+                )
+                metric_cols[5].metric(
                     "Kontrol",
                     str(interaction_plot['controlling_state']).replace('-', ' ').title()
                 )
+                if not bool(interaction_plot.get('exact_boundary_found')):
+                    st.warning(
+                        "Boundary exact kontinu belum ditemukan untuk kondisi ini. "
+                        "Plot tetap menampilkan `Boundary interp` pada kurva dan "
+                        "`Garis lambda` menggunakan titik fallback tersebut."
+                    )
+                elif bool(interaction_plot.get('exact_boundary_overlaps_interp')):
+                    st.info(
+                        "Boundary exact ditemukan, tetapi posisinya hampir berimpit dengan "
+                        "boundary interp dan kurva interaksi. Pada plot, `exact` ditandai "
+                        "sebagai bintang ungu berhalo, sedangkan `interp` sebagai diamond toska."
+                    )
                 render_plot(
                     interaction_plot['figure'],
                     interactive=True,
