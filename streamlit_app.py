@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -77,6 +78,14 @@ FAILURE_SURFACE_3D_GRID_SIZE = 34
 MOMENT_EQUILIBRIUM_TOLERANCE_KNM = 1e-6
 DETERMINISTIC_RISK_WEIGHT_SEVERITY = 0.60
 DETERMINISTIC_RISK_WEIGHT_SENSITIVITY = 0.40
+BETA_SKETCH_POSITIVE_INFINITY_PLOT_VALUE = 6.0
+BETA_SKETCH_NEGATIVE_INFINITY_PLOT_VALUE = -6.0
+BETA_SKETCH_INFINITY_ASSUMPTION_NOTE = (
+    f"Visualization assumption for the reliability-index sketch: `+Inf` is plotted as a bar at "
+    f"`beta = {BETA_SKETCH_POSITIVE_INFINITY_PLOT_VALUE:.0f}`, while `-Inf` is plotted at "
+    f"`beta = {BETA_SKETCH_NEGATIVE_INFINITY_PLOT_VALUE:.0f}`. "
+    "The bar labels still display the original values `Inf` and `-Inf`."
+)
 
 RISK_LEVEL_COLORS = {
     'Rendah': '#0000ff',
@@ -962,6 +971,17 @@ def get_element_type_label(code: str) -> str:
         'K': 'Kolom'
     }
     return mapping.get(str(code).strip().upper(), '-')
+
+
+def get_element_type_display_label(code: str, language: str = 'id') -> str:
+    """Label jenis elemen untuk tampilan UI dalam bahasa yang dipilih."""
+    base_label = get_element_type_label(code)
+    if str(language or '').strip().lower() == 'en':
+        return {
+            'Balok': 'Beam',
+            'Kolom': 'Column'
+        }.get(base_label, base_label)
+    return base_label
 
 
 def build_internal_force_df(latest_result: Dict, input_data: Optional[Dict] = None) -> pd.DataFrame:
@@ -4142,7 +4162,7 @@ def get_probabilistic_limit_state_histogram_specs() -> List[Dict[str, str]]:
         {
             'key': 'axial_moment',
             'label': 'Aksial+Lentur',
-            'plot_label': 'Axial-Flexure Interaction',
+            'plot_label': 'Axial-Flexural Interaction',
             'unit': '(-)',
             'color': '#7c3aed'
         }
@@ -4961,6 +4981,10 @@ def build_probabilistic_limit_state_physical_cloud_data(
                 'failed_points_truncated': bool(
                     selected_failed.size < failure_indices.size
                 ),
+                'sample_indices': [
+                    int(response_records[int(index)].get('sample_index', int(index)))
+                    for index in selected_indices.astype(int)
+                ],
                 'R': r_values[selected_indices].astype(float).tolist(),
                 'Q': q_values[selected_indices].astype(float).tolist(),
                 'g': g_values[selected_indices].astype(float).tolist(),
@@ -5404,6 +5428,7 @@ def resolve_physical_map_beta_table_overlay(record: Dict[str, Any],
 
     return {
         'display_beta': beta_anchor.get('display_beta'),
+        'display_beta_raw': beta_anchor.get('display_beta_raw'),
         'sample_beta': beta_anchor.get('beta'),
         'selected_index': int(selected_index),
         'sample_x': float(sample_x),
@@ -6288,14 +6313,12 @@ def build_probabilistic_limit_state_physical_cloud_figure(
             x_limits = get_failure_cloud_axis_limits(
                 extend_numeric_array_with_optional_values(
                     x_values,
-                    projected_sample_x,
                     projected_mpp_x
                 )
             )
             y_limits = get_failure_cloud_axis_limits(
                 extend_numeric_array_with_optional_values(
                     y_values,
-                    projected_sample_y,
                     projected_mpp_y
                 )
             )
@@ -6379,8 +6402,6 @@ def build_probabilistic_limit_state_physical_cloud_figure(
             axis_values = np.concatenate([x_values, y_values]) if x_values.size else np.asarray([], dtype=float)
             axis_values = extend_numeric_array_with_optional_values(
                 axis_values,
-                projected_sample_x,
-                projected_sample_y,
                 projected_mpp_x,
                 projected_mpp_y
             )
@@ -6441,23 +6462,6 @@ def build_probabilistic_limit_state_physical_cloud_figure(
                 zorder=5,
                 label=f"Projected beta line, Beta(table)={projected_mpp_beta_label}"
             )
-            if (
-                projected_sample_x is not None
-                and projected_sample_y is not None
-                and not (
-                    np.isclose(projected_sample_x, projected_mpp_x, atol=1e-9, rtol=1e-9)
-                    and np.isclose(projected_sample_y, projected_mpp_y, atol=1e-9, rtol=1e-9)
-                )
-            ):
-                axis.plot(
-                    [float(projected_sample_x), float(projected_mpp_x)],
-                    [float(projected_sample_y), float(projected_mpp_y)],
-                    linestyle=':',
-                    linewidth=1.0,
-                    color='#d946ef',
-                    alpha=0.88,
-                    zorder=5
-                )
             axis.scatter(
                 [float(projected_mpp_x)],
                 [float(projected_mpp_y)],
@@ -8757,7 +8761,8 @@ def build_axial_moment_custom_axis_figure(axial_moment_pm_cloud_data: Dict[str, 
     if finite_g.size == 0:
         return None
 
-    fig, axis = plt.subplots(figsize=(9.0, 6.2), dpi=180)
+    figure_size = (10.6, 6.2) if use_physical_qr_alignment else (9.0, 6.2)
+    fig, axis = plt.subplots(figsize=figure_size, dpi=180)
     axis.set_facecolor('#f8fafc')
 
     max_abs_g = max(float(np.max(np.abs(finite_g))), 1e-6)
@@ -9239,8 +9244,10 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
         antialiased=True
     )
     pin_contour_axes_to_grid(axis, grid_x, grid_y)
-    if use_physical_qr_alignment and hasattr(axis, 'set_box_aspect'):
-        axis.set_box_aspect(1.0)
+    if use_physical_qr_alignment:
+        # Untuk pasangan Q-R, biarkan axis mengikuti lebar panel agar area plot
+        # tidak menyempit oleh box aspect persegi.
+        axis.set_aspect('auto')
 
     contour_step = build_nice_contour_step(max_abs_g)
     line_levels = contour_step * np.arange(-4, 5, dtype=float)
@@ -9538,8 +9545,11 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
         fontsize=13,
         y=0.985
     )
-    fig.tight_layout(rect=[0, 0, 0.93, 0.96])
-    colorbar_axis = fig.add_axes([0.94, 0.16, 0.015, 0.68])
+    tight_layout_rect = [0, 0, 0.95, 0.96] if use_physical_qr_alignment else [0, 0, 0.93, 0.96]
+    colorbar_left = 0.955 if use_physical_qr_alignment else 0.94
+    colorbar_width = 0.013 if use_physical_qr_alignment else 0.015
+    fig.tight_layout(rect=tight_layout_rect)
+    colorbar_axis = fig.add_axes([colorbar_left, 0.16, colorbar_width, 0.68])
     fig.colorbar(
         contour_fill,
         cax=colorbar_axis,
@@ -10379,7 +10389,7 @@ def build_output_reliability_beta_sketch_df(
         pf_value = reliability_record.get('Pf')
         beta_value = reliability_record.get('Beta')
         rows.append({
-            'Limit State': spec['label'],
+            'Limit State': spec.get('plot_label', spec['label']),
             'Pf (-)': pf_value,
             'Beta (-)': beta_value,
             'Jumlah Gagal (-)': reliability_record.get('failures'),
@@ -10389,20 +10399,57 @@ def build_output_reliability_beta_sketch_df(
     return pd.DataFrame(rows)
 
 
-def build_output_reliability_beta_sketch_figure(
+def build_output_reliability_limit_state_beta_sketch_df(
     element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
-    elem_id: int,
-    target_beta: float = 3.0
-) -> Optional[plt.Figure]:
-    """Sketsa batang nilai Beta tabel reliability untuk satu elemen."""
-    summary_df = build_output_reliability_beta_sketch_df(
-        element_reliability,
-        int(elem_id)
-    )
-    if summary_df.empty:
-        return None
+    input_data: Optional[Dict],
+    limit_state_key: str
+) -> pd.DataFrame:
+    """Bangun tabel Pf/Beta seluruh elemen untuk satu limit state tertentu."""
+    element_reliability = element_reliability or {}
+    state_records = element_reliability.get(str(limit_state_key), {}) or {}
+    if not state_records:
+        return pd.DataFrame()
 
-    labels = summary_df['Limit State'].astype(str).tolist()
+    available_element_ids = sorted({
+        int(elem_id)
+        for elem_id in state_records.keys()
+        if str(elem_id).strip() not in {'', '-'}
+    })
+    rows = []
+    for elem_id in available_element_ids:
+        reliability_record = get_by_element_value(
+            state_records,
+            int(elem_id),
+            {}
+        ) or {}
+        if not reliability_record:
+            continue
+
+        pf_value = reliability_record.get('Pf')
+        beta_value = reliability_record.get('Beta')
+        code = get_element_code_from_input(input_data, int(elem_id))
+        rows.append({
+            'Elemen (-)': int(elem_id),
+            'Nomor Elemen': f"E{int(elem_id)}",
+            'Kode': code,
+            'Jenis Elemen': get_element_type_label(code),
+            'Pf (-)': pf_value,
+            'Beta (-)': beta_value,
+            'Jumlah Gagal (-)': reliability_record.get('failures'),
+            'Level Risiko': describe_probabilistic_risk_level(pf_value, beta_value)
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_output_reliability_beta_sketch_plot_data(
+    summary_df: pd.DataFrame,
+    target_beta: float = 3.0
+) -> Dict[str, Any]:
+    """Siapkan data batang dan batas sumbu untuk sketsa beta reliability."""
+    if summary_df is None or summary_df.empty:
+        return {}
+
     pf_values = [
         coerce_finite_float(value)
         for value in summary_df['Pf (-)'].tolist()
@@ -10429,43 +10476,405 @@ def build_output_reliability_beta_sketch_figure(
             finite_beta_values.append(float(numeric_value))
         beta_numeric_values.append(float(numeric_value))
 
-    y_min = min([-0.4, target_beta - 3.4] + finite_beta_values) if finite_beta_values else -0.4
-    y_max = max([target_beta + 1.0] + finite_beta_values) if finite_beta_values else (target_beta + 1.0)
+    y_min = min(
+        [-0.4, float(target_beta) - 3.4] + finite_beta_values
+    ) if finite_beta_values else -0.4
+    y_max = max(
+        [float(target_beta) + 1.0] + finite_beta_values
+    ) if finite_beta_values else (float(target_beta) + 1.0)
     if has_negative_infinity:
-        y_min = min(y_min, -2.0)
+        y_min = min(y_min, float(BETA_SKETCH_NEGATIVE_INFINITY_PLOT_VALUE))
     if has_positive_infinity:
-        y_max = max(y_max, target_beta + 1.8)
+        y_max = max(y_max, float(BETA_SKETCH_POSITIVE_INFINITY_PLOT_VALUE))
     if np.isclose(y_min, y_max, atol=1e-12, rtol=1e-9):
         y_max = y_min + 1.0
 
-    y_padding = max((y_max - y_min) * 0.12, 0.45)
-    plot_min = y_min - y_padding * 0.35
+    y_padding = max((y_max - y_min) * 0.20, 0.75)
+    plot_min = y_min - (y_padding * 0.35)
     plot_max = y_max + y_padding
     plotted_beta_values = []
     for numeric_value in beta_numeric_values:
         if numeric_value is None:
             plotted_beta_values.append(np.nan)
         elif np.isposinf(numeric_value):
-            plotted_beta_values.append(plot_max - y_padding * 0.35)
+            plotted_beta_values.append(float(BETA_SKETCH_POSITIVE_INFINITY_PLOT_VALUE))
         elif np.isneginf(numeric_value):
-            plotted_beta_values.append(plot_min + y_padding * 0.35)
+            plotted_beta_values.append(float(BETA_SKETCH_NEGATIVE_INFINITY_PLOT_VALUE))
         else:
             plotted_beta_values.append(float(numeric_value))
 
     bar_colors = [
         RISK_LEVEL_COLORS.get(
-            describe_probabilistic_risk_level(pf_value, raw_beta),
+            normalize_risk_level(level),
             RISK_LEVEL_COLORS['Tidak Ada Data']
         )
-        for pf_value, raw_beta in zip(pf_values, beta_raw_values)
+        for level in summary_df['Level Risiko'].astype(str).tolist()
     ]
+
+    return {
+        'pf_values': pf_values,
+        'beta_raw_values': beta_raw_values,
+        'beta_numeric_values': beta_numeric_values,
+        'plotted_beta_values': plotted_beta_values,
+        'bar_colors': bar_colors,
+        'plot_min': float(plot_min),
+        'plot_max': float(plot_max),
+        'y_padding': float(y_padding)
+    }
+
+
+def configure_output_reliability_beta_y_axis(axis) -> None:
+    """Atur sumbu Y grafik reliability beta agar bertick utama per kelipatan 1."""
+    axis.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
+
+
+def _compute_display_bbox_overlap_ratio(left_bbox, right_bbox) -> float:
+    """Hitung rasio overlap dua bbox pada koordinat display."""
+    overlap_width = max(0.0, min(left_bbox.x1, right_bbox.x1) - max(left_bbox.x0, right_bbox.x0))
+    overlap_height = max(0.0, min(left_bbox.y1, right_bbox.y1) - max(left_bbox.y0, right_bbox.y0))
+    overlap_area = overlap_width * overlap_height
+    left_area = max(float(left_bbox.width) * float(left_bbox.height), 1e-9)
+    return float(overlap_area / left_area)
+
+
+def _clear_output_reliability_beta_sketch_annotations(axis) -> None:
+    """Hapus label beta sketch yang pernah ditambahkan sebelumnya pada axis."""
+    for text_obj in list(axis.texts):
+        if bool(getattr(text_obj, '_beta_sketch_annotation', False)):
+            text_obj.remove()
+
+
+def refresh_output_reliability_beta_sketch_annotations(axis) -> None:
+    """Hitung ulang posisi label beta sketch setelah layout figure final terbentuk."""
+    payload = getattr(axis, '_beta_sketch_annotation_payload', None)
+    if not payload:
+        return
+
+    annotate_output_reliability_beta_sketch_bars(
+        axis,
+        payload['bars'],
+        beta_raw_values=payload['beta_raw_values'],
+        beta_numeric_values=payload['beta_numeric_values'],
+        plotted_beta_values=payload['plotted_beta_values'],
+        pf_values=payload['pf_values'],
+        plot_min=payload['plot_min'],
+        plot_max=payload['plot_max'],
+        y_padding=payload['y_padding'],
+        fontsize=payload['fontsize']
+    )
+
+
+def annotate_output_reliability_beta_sketch_bars(
+    axis,
+    bars,
+    beta_raw_values: List[Any],
+    beta_numeric_values: List[Optional[float]],
+    plotted_beta_values: List[float],
+    pf_values: List[Optional[float]],
+    plot_min: float,
+    plot_max: float,
+    y_padding: float,
+    fontsize: float = 8.0
+) -> None:
+    """Tambahkan label `Beta` dan `Pf` di dekat batang tanpa keluar area plot."""
+    _clear_output_reliability_beta_sketch_annotations(axis)
+
+    max_iterations = 4
+    safety_margin_px = 8.0
+    for iteration in range(max_iterations):
+        axis.figure.canvas.draw()
+        renderer = axis.figure.canvas.get_renderer()
+        axes_bbox = axis.get_window_extent(renderer)
+        occupied_bboxes = []
+        placed_annotations = []
+
+        for bar, beta_raw_value, beta_value, plotted_value, pf_value in zip(
+            bars,
+            beta_raw_values,
+            beta_numeric_values,
+            plotted_beta_values,
+            pf_values
+            ):
+            if beta_value is None or not np.isfinite(float(plotted_value)):
+                continue
+
+            beta_text = format_beta_table_display(beta_raw_value, 3)
+            beta_label_text = f"$\\beta$={beta_text}"
+            pf_text = '-' if pf_value is None else f"Pf={pf_value:.2e}"
+
+            text_content = f"{beta_label_text}\n{pf_text}"
+            anchor_x = float(bar.get_x() + (bar.get_width() / 2.0))
+            anchor_y = float(plotted_value)
+            bar_bbox = bar.get_window_extent(renderer)
+            if float(plotted_value) >= 0.0:
+                candidate_specs = [
+                    {'dx': 0.0, 'dy': 10.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 18.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 28.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 38.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 48.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': -6.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -14.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -22.0, 'ha': 'center', 'va': 'top'}
+                ]
+            else:
+                candidate_specs = [
+                    {'dx': 0.0, 'dy': -10.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -18.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -28.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -38.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': -48.0, 'ha': 'center', 'va': 'top'},
+                    {'dx': 0.0, 'dy': 6.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 14.0, 'ha': 'center', 'va': 'bottom'},
+                    {'dx': 0.0, 'dy': 22.0, 'ha': 'center', 'va': 'bottom'}
+                ]
+
+            best_candidate = None
+            best_score = -float('inf')
+            for candidate in candidate_specs:
+                temporary_annotation = axis.annotate(
+                    text_content,
+                    xy=(anchor_x, anchor_y),
+                    xytext=(float(candidate['dx']), float(candidate['dy'])),
+                    textcoords='offset points',
+                    ha=str(candidate['ha']),
+                    va=str(candidate['va']),
+                    fontsize=float(fontsize),
+                    color='#0f172a',
+                    annotation_clip=False,
+                    bbox=dict(
+                        boxstyle='round,pad=0.20',
+                        facecolor='white',
+                        edgecolor='#cbd5e1',
+                        alpha=0.96
+                    )
+                )
+                candidate_bbox = temporary_annotation.get_window_extent(renderer).expanded(1.03, 1.08)
+                temporary_annotation.remove()
+
+                overflow_penalty = (
+                    max(float(axes_bbox.x0 - candidate_bbox.x0), 0.0)
+                    + max(float(candidate_bbox.x1 - axes_bbox.x1), 0.0)
+                    + max(float(axes_bbox.y0 - candidate_bbox.y0), 0.0)
+                    + max(float(candidate_bbox.y1 - axes_bbox.y1), 0.0)
+                )
+                bar_overlap_penalty = _compute_display_bbox_overlap_ratio(candidate_bbox, bar_bbox)
+                label_overlap_penalty = sum(
+                    _compute_display_bbox_overlap_ratio(candidate_bbox, other_bbox)
+                    for other_bbox in occupied_bboxes
+                )
+                distance_penalty = abs(float(candidate['dy'])) + (0.25 * abs(float(candidate['dx'])))
+                score = (
+                    -(0.40 * distance_penalty)
+                    - (0.55 * overflow_penalty)
+                    - (220.0 * bar_overlap_penalty)
+                    - (180.0 * label_overlap_penalty)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_candidate = {
+                        'dx': float(candidate['dx']),
+                        'dy': float(candidate['dy']),
+                        'ha': str(candidate['ha']),
+                        'va': str(candidate['va'])
+                    }
+
+            if best_candidate is None:
+                best_candidate = {
+                    'dx': 0.0,
+                    'dy': 18.0 if float(plotted_value) >= 0.0 else -18.0,
+                    'ha': 'center',
+                    'va': 'bottom' if float(plotted_value) >= 0.0 else 'top'
+                }
+
+            final_annotation = axis.annotate(
+                text_content,
+                xy=(anchor_x, anchor_y),
+                xytext=(float(best_candidate['dx']), float(best_candidate['dy'])),
+                textcoords='offset points',
+                ha=str(best_candidate['ha']),
+                va=str(best_candidate['va']),
+                fontsize=float(fontsize),
+                color='#0f172a',
+                annotation_clip=False,
+                bbox=dict(
+                    boxstyle='round,pad=0.20',
+                    facecolor='white',
+                    edgecolor='#cbd5e1',
+                    alpha=0.96
+                )
+            )
+            setattr(final_annotation, '_beta_sketch_annotation', True)
+            placed_annotations.append(final_annotation)
+            occupied_bboxes.append(
+                final_annotation.get_window_extent(renderer).expanded(1.03, 1.08)
+            )
+
+        axis.figure.canvas.draw()
+        renderer = axis.figure.canvas.get_renderer()
+        axes_bbox = axis.get_window_extent(renderer)
+        top_overflow = 0.0
+        bottom_overflow = 0.0
+        for annotation in placed_annotations:
+            annotation_bbox = annotation.get_window_extent(renderer).expanded(1.03, 1.08)
+            top_overflow = max(
+                top_overflow,
+                float(annotation_bbox.y1 - axes_bbox.y1 + safety_margin_px)
+            )
+            bottom_overflow = max(
+                bottom_overflow,
+                float(axes_bbox.y0 - annotation_bbox.y0 + safety_margin_px)
+            )
+
+        if top_overflow <= 0.0 and bottom_overflow <= 0.0:
+            break
+        if iteration >= (max_iterations - 1):
+            break
+
+        for annotation in placed_annotations:
+            annotation.remove()
+
+        current_y_min, current_y_max = axis.get_ylim()
+        axis_height_px = max(float(axes_bbox.height), 1e-9)
+        data_per_pixel = (float(current_y_max) - float(current_y_min)) / axis_height_px
+        axis.set_ylim(
+            float(current_y_min) - (bottom_overflow * data_per_pixel * 1.08),
+            float(current_y_max) + (top_overflow * data_per_pixel * 1.08)
+        )
+
+
+def draw_output_reliability_beta_sketch_axis(
+    axis,
+    summary_df: pd.DataFrame,
+    title: str,
+    x_label_column: str,
+    x_axis_label: Optional[str] = None,
+    target_beta: float = 3.0,
+    font_scale: float = 1.0
+) -> None:
+    """Gambar satu subplot sketsa beta reliability."""
+    if summary_df is None or summary_df.empty:
+        axis.axis('off')
+        axis.text(
+            0.5,
+            0.5,
+            "Reliability data are not available.",
+            ha='center',
+            va='center',
+            fontsize=10,
+            color='#475569',
+            bbox=dict(
+                boxstyle='round,pad=0.25',
+                facecolor='#f8fafc',
+                edgecolor='#cbd5e1'
+            )
+        )
+        axis.set_title(title, fontsize=11, pad=10)
+        return
+
+    plot_data = build_output_reliability_beta_sketch_plot_data(
+        summary_df,
+        target_beta=target_beta
+    )
+    if not plot_data:
+        axis.axis('off')
+        axis.set_title(title, fontsize=11, pad=10)
+        return
+
+    labels = summary_df[x_label_column].astype(str).tolist()
+    positions = np.arange(len(labels), dtype=float)
+    bars = axis.bar(
+        positions,
+        plot_data['plotted_beta_values'],
+        color=plot_data['bar_colors'],
+        alpha=0.88,
+        edgecolor='#0f172a',
+        linewidth=0.65
+    )
+    axis.axhline(
+        float(target_beta),
+        color='#111827',
+        linestyle='--',
+        linewidth=1.20
+    )
+    axis.axhline(
+        0.0,
+        color='#94a3b8',
+        linestyle=':',
+        linewidth=1.0,
+        alpha=0.95
+    )
+    axis.set_ylim(plot_data['plot_min'], plot_data['plot_max'])
+    configure_output_reliability_beta_y_axis(axis)
+    annotate_output_reliability_beta_sketch_bars(
+        axis,
+        bars,
+        beta_raw_values=plot_data['beta_raw_values'],
+        beta_numeric_values=plot_data['beta_numeric_values'],
+        plotted_beta_values=plot_data['plotted_beta_values'],
+        pf_values=plot_data['pf_values'],
+        plot_min=plot_data['plot_min'],
+        plot_max=plot_data['plot_max'],
+        y_padding=plot_data['y_padding'],
+        fontsize=8.0 * float(font_scale)
+    )
+    axis._beta_sketch_annotation_payload = {
+        'bars': bars,
+        'beta_raw_values': plot_data['beta_raw_values'],
+        'beta_numeric_values': plot_data['beta_numeric_values'],
+        'plotted_beta_values': plot_data['plotted_beta_values'],
+        'pf_values': plot_data['pf_values'],
+        'plot_min': plot_data['plot_min'],
+        'plot_max': plot_data['plot_max'],
+        'y_padding': plot_data['y_padding'],
+        'fontsize': 8.0 * float(font_scale)
+    }
+
+    rotation_angle = 0 if len(labels) <= 8 else 35
+    horizontal_alignment = 'center' if rotation_angle == 0 else 'right'
+    tick_fontsize = 8.4 if len(labels) <= 10 else 7.5
+    axis.set_xticks(positions)
+    axis.set_xticklabels(
+        labels,
+        rotation=rotation_angle,
+        ha=horizontal_alignment,
+        fontsize=tick_fontsize * float(font_scale)
+    )
+    if x_axis_label:
+        axis.set_xlabel(str(x_axis_label), fontsize=9.2 * float(font_scale))
+    axis.set_ylabel(r'Reliability Index, $\beta$ (-)')
+    axis.set_title(title, fontsize=11.0 * float(font_scale), pad=10)
+    axis.grid(True, axis='y', alpha=0.22, linestyle='--')
+    axis.margins(x=0.04)
+
+
+def build_output_reliability_beta_sketch_figure(
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    elem_id: int,
+    target_beta: float = 3.0
+) -> Optional[plt.Figure]:
+    """Sketsa batang nilai Beta tabel reliability untuk satu elemen."""
+    summary_df = build_output_reliability_beta_sketch_df(
+        element_reliability,
+        int(elem_id)
+    )
+    if summary_df.empty:
+        return None
+
+    labels = summary_df['Limit State'].astype(str).tolist()
+    plot_data = build_output_reliability_beta_sketch_plot_data(
+        summary_df,
+        target_beta=target_beta
+    )
+    if not plot_data:
+        return None
 
     fig, axis = plt.subplots(figsize=(10.4, 5.8), dpi=180)
     positions = np.arange(len(labels), dtype=float)
     bars = axis.bar(
         positions,
-        plotted_beta_values,
-        color=bar_colors,
+        plot_data['plotted_beta_values'],
+        color=plot_data['bar_colors'],
         alpha=0.88,
         edgecolor='#0f172a',
         linewidth=0.65
@@ -10484,48 +10893,164 @@ def build_output_reliability_beta_sketch_figure(
         linewidth=1.0,
         alpha=0.95
     )
-
-    for bar, beta_value, plotted_value, pf_value in zip(
+    axis.set_ylim(plot_data['plot_min'], plot_data['plot_max'])
+    configure_output_reliability_beta_y_axis(axis)
+    annotate_output_reliability_beta_sketch_bars(
+        axis,
         bars,
-        beta_numeric_values,
-        plotted_beta_values,
-        pf_values
-    ):
-        if beta_value is None or not np.isfinite(float(plotted_value)):
-            continue
-        if np.isposinf(beta_value):
-            beta_text = 'Infinity'
-        elif np.isneginf(beta_value):
-            beta_text = '-Infinity'
-        else:
-            beta_text = f"{float(beta_value):.3f}"
-        pf_text = '-' if pf_value is None else f"Pf={pf_value:.2e}"
-        text_offset = y_padding * 0.08
-        if float(plotted_value) >= 0.0:
-            y_text = float(plotted_value) + text_offset
-            vertical_alignment = 'bottom'
-        else:
-            y_text = float(plotted_value) - text_offset
-            vertical_alignment = 'top'
-        axis.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            y_text,
-            f"{beta_text}\n{pf_text}",
-            ha='center',
-            va=vertical_alignment,
-            fontsize=8.2,
-            color='#0f172a'
-        )
+        beta_raw_values=plot_data['beta_raw_values'],
+        beta_numeric_values=plot_data['beta_numeric_values'],
+        plotted_beta_values=plot_data['plotted_beta_values'],
+        pf_values=plot_data['pf_values'],
+        plot_min=plot_data['plot_min'],
+        plot_max=plot_data['plot_max'],
+        y_padding=plot_data['y_padding'],
+        fontsize=8.2
+    )
+    axis._beta_sketch_annotation_payload = {
+        'bars': bars,
+        'beta_raw_values': plot_data['beta_raw_values'],
+        'beta_numeric_values': plot_data['beta_numeric_values'],
+        'plotted_beta_values': plot_data['plotted_beta_values'],
+        'pf_values': plot_data['pf_values'],
+        'plot_min': plot_data['plot_min'],
+        'plot_max': plot_data['plot_max'],
+        'y_padding': plot_data['y_padding'],
+        'fontsize': 8.2
+    }
 
     axis.set_xticks(positions)
     axis.set_xticklabels(labels)
-    axis.set_ylabel('Indeks Keandalan, Beta (-)')
-    axis.set_title(f"Sketsa Beta Reliability | Element E{int(elem_id)}", fontsize=12, pad=12)
-    axis.set_ylim(plot_min, plot_max)
+    axis.set_xlabel('Limit State')
+    axis.set_ylabel(r'Reliability Index, $\beta$ (-)')
+    axis.set_title(f"Reliability Index Sketch | Element E{int(elem_id)}", fontsize=12, pad=12)
     axis.grid(True, axis='y', alpha=0.22, linestyle='--')
     axis.legend(loc='upper right', fontsize=8.4)
     fig.tight_layout()
+    refresh_output_reliability_beta_sketch_annotations(axis)
     return fig
+
+
+def build_output_reliability_all_elements_beta_sketch_figure(
+    element_reliability: Optional[Dict[str, Dict[int, Dict[str, Any]]]],
+    input_data: Optional[Dict],
+    target_beta: float = 3.0
+) -> Optional[plt.Figure]:
+    """Bangun 4 sketsa beta seluruh elemen untuk masing-masing jenis g(x)."""
+    state_specs = [
+        ('moment', 'g(x) Flexure'),
+        ('shear', 'g(x) Shear'),
+        ('axial', 'g(x) Axial Force'),
+        ('axial_moment', 'g(x) Axial-Flexural Interaction')
+    ]
+    state_tables = {
+        str(state_key): build_output_reliability_limit_state_beta_sketch_df(
+            element_reliability,
+            input_data,
+            state_key
+        )
+        for state_key, _ in state_specs
+    }
+    if not any(not state_tables[str(state_key)].empty for state_key, _ in state_specs):
+        return None
+
+    fig, axes = plt.subplots(len(state_specs), 1, figsize=(15.2, 18.6), dpi=180)
+    axes_list = list(np.atleast_1d(axes).reshape(-1))
+    present_levels = []
+
+    for axis, (state_key, state_title) in zip(axes_list, state_specs):
+        summary_df = state_tables.get(str(state_key), pd.DataFrame())
+        if summary_df is not None and not summary_df.empty:
+            present_levels.extend([
+                normalize_risk_level(level)
+                for level in summary_df['Level Risiko'].astype(str).tolist()
+            ])
+        draw_output_reliability_beta_sketch_axis(
+            axis,
+            summary_df=summary_df,
+            title=state_title,
+            x_label_column='Nomor Elemen',
+            x_axis_label='Element',
+            target_beta=target_beta,
+            font_scale=1.0
+        )
+
+    unique_present_levels = [
+        level for level in ('Kritis', 'Tinggi', 'Sedang', 'Rendah', 'Tidak Ada Data')
+        if level in set(present_levels)
+    ]
+    legend_handles = [
+        Patch(
+            facecolor=RISK_LEVEL_COLORS[level],
+            edgecolor='#0f172a',
+            linewidth=0.8,
+            label=get_risk_level_display_label(level, language='en')
+        )
+        for level in unique_present_levels
+    ]
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            title='Risk Level',
+            loc='upper center',
+            bbox_to_anchor=(0.5, 0.978),
+            ncol=min(len(legend_handles), 5),
+            framealpha=0.96
+        )
+
+    fig.suptitle(
+        "Reliability Index Sketch for All Elements by Limit-State Function Type",
+        fontsize=14,
+        y=0.995
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.945 if legend_handles else 0.97])
+    for axis in axes_list:
+        refresh_output_reliability_beta_sketch_annotations(axis)
+    return fig
+
+
+def render_output_reliability_all_elements_beta_sketch_section(
+    results_bundle: Dict[str, Any],
+    input_data: Optional[Dict],
+    heading_level: str = "####"
+) -> None:
+    """Render 4 grafik sketsa beta seluruh elemen per jenis g(x)."""
+    element_reliability = (results_bundle or {}).get('element_reliability', {}) or {}
+    if not element_reliability:
+        st.info("The all-element reliability-index sketch is not available because the reliability data have not been generated yet.")
+        return
+
+    st.markdown(f"{heading_level} All-Element Reliability Index Sketch by Limit-State Function")
+    st.caption(
+        "The following four charts summarize the reliability index `Beta` for all structural elements "
+        "with respect to each limit-state function `g(x)`: flexure, shear, axial force, and axial-flexural interaction."
+    )
+    st.caption(
+        "Bar colors follow the same risk-level classification used in the probabilistic risk map, "
+        "based on the interpretation of the corresponding `Pf` and `Beta` values for each limit state."
+    )
+    st.caption(
+        "The `Beta` and `Pf` labels are automatically kept within each plotting area to prevent overlap with the subplot boundaries."
+    )
+    st.caption(BETA_SKETCH_INFINITY_ASSUMPTION_NOTE)
+
+    overview_fig = build_output_reliability_all_elements_beta_sketch_figure(
+        element_reliability=element_reliability,
+        input_data=input_data,
+        target_beta=3.0
+    )
+    if overview_fig is None:
+        st.info("The all-element reliability-index sketch cannot be generated from the current results.")
+        return
+
+    render_plot(
+        overview_fig,
+        interactive=True,
+        viewer_key="output-reliability-beta-all-elements",
+        alt_text="Reliability index sketch for all elements by limit-state function type",
+        viewer_height=1660,
+        download_basename="all-element-reliability-index-sketch-by-limit-state-function"
+    )
 
 
 def render_output_reliability_beta_sketch_section(
@@ -10541,25 +11066,26 @@ def render_output_reliability_beta_sketch_section(
         for elem_id in (element_reliability.get(state_name, {}) or {}).keys()
     })
     if not available_element_ids:
-        st.info("Sketsa Beta belum tersedia karena data reliability per elemen belum ada.")
+        st.info("The element-level reliability-index sketch is not available because the element reliability data have not been generated yet.")
         return
 
-    st.markdown(f"{heading_level} Sketsa Beta per Elemen")
+    st.markdown(f"{heading_level} Element-Level Reliability Index Sketch")
     st.caption(
-        "Grafik ini memvisualkan nilai `Beta` yang sama dengan tabel `Output Reliability`, "
-        "sehingga perbandingan antar limit state pada satu elemen lebih cepat terbaca."
+        "This chart visualizes the same `Beta` values reported in the `Output Reliability` table, "
+        "so that comparisons among limit states for a selected structural element can be read more efficiently."
     )
     st.caption(
-        "Garis putus-putus `beta = 3.0` dipakai sebagai acuan target ULS. "
-        "Warna batang mengikuti level risiko yang diturunkan dari kombinasi `Pf/Beta`."
+        "The dashed line at `beta = 3.0` is used as the target reference for the ultimate limit state. "
+        "Bar colors follow the risk level derived from the corresponding `Pf/Beta` combination."
     )
+    st.caption(BETA_SKETCH_INFINITY_ASSUMPTION_NOTE)
 
     selected_element_id = st.selectbox(
-        "Pilih elemen untuk sketsa Beta",
+        "Select element for the reliability-index sketch",
         options=available_element_ids,
         format_func=lambda elem_id: (
             f"E{int(elem_id)} | "
-            f"{get_element_type_label(get_element_code_from_input(input_data, int(elem_id)))}"
+            f"{get_element_type_display_label(get_element_code_from_input(input_data, int(elem_id)), language='en')}"
         ),
         key="output_reliability_beta_selector"
     )
@@ -10573,24 +11099,36 @@ def render_output_reliability_beta_sketch_section(
             beta_fig,
             interactive=True,
             viewer_key=f"output-reliability-beta-e{int(selected_element_id)}",
-            alt_text=f"Sketsa beta reliability elemen {int(selected_element_id)}",
+            alt_text=f"Element-level reliability index sketch for element {int(selected_element_id)}",
             viewer_height=620,
-            download_basename=f"sketsa-beta-reliability-e{int(selected_element_id)}"
+            download_basename=f"element-level-reliability-index-sketch-e{int(selected_element_id)}"
         )
     else:
-        st.info("Sketsa Beta untuk elemen terpilih belum dapat dibentuk.")
+        st.info("The reliability-index sketch for the selected element cannot be generated from the current results.")
 
     beta_summary_df = build_output_reliability_beta_sketch_df(
         element_reliability,
         int(selected_element_id)
     )
     if beta_summary_df.empty:
-        st.info("Ringkasan Beta untuk elemen terpilih belum tersedia.")
+        st.info("The reliability-index summary for the selected element is not available.")
     else:
+        beta_summary_display_df = beta_summary_df.rename(
+            columns={
+                'Jumlah Gagal (-)': 'Number of Failures (-)'
+            }
+        ).copy()
+        beta_summary_display_df['Risk Level'] = beta_summary_display_df['Level Risiko'].map(
+            lambda value: get_risk_level_display_label(value, language='en')
+        )
+        beta_summary_display_df = beta_summary_display_df.drop(
+            columns=['Level Risiko'],
+            errors='ignore'
+        )
         render_input_table(
-            beta_summary_df,
+            beta_summary_display_df,
             styler=style_input_dataframe(
-                beta_summary_df,
+                beta_summary_display_df,
                 table_min_width_px=1050
             )
         )
@@ -10839,6 +11377,250 @@ def format_failure_cloud_variable_label(record: Dict[str, Any],
         f"{variable_name} | E{int(elem_id)} ({element_type}) | "
         f"{label} [{unit}]"
     )
+
+
+def build_failure_surface_response_axis_record(axis_name: str,
+                                               label: str,
+                                               unit: str,
+                                               values: np.ndarray,
+                                               elem_id: Optional[int],
+                                               element_code: str,
+                                               element_type: str) -> Dict[str, Any]:
+    """Bangun record sumbu respons agar bisa dipakai ulang oleh plot U-space."""
+    numeric_values = np.asarray(values, dtype=float).reshape(-1)
+    finite_values = numeric_values[np.isfinite(numeric_values)]
+    mean_value = (
+        float(np.mean(finite_values))
+        if finite_values.size > 0 else
+        None
+    )
+    stddev_value = (
+        float(np.std(finite_values))
+        if finite_values.size > 0 else
+        None
+    )
+    return {
+        'variable_name': str(axis_name),
+        'prefix': str(axis_name),
+        'element_id': None if elem_id is None else int(elem_id),
+        'element_code': str(element_code or '-'),
+        'element_type': str(element_type or '-'),
+        'label': str(label),
+        'unit': str(unit or '-'),
+        'distribution': 'normal',
+        'mean_input': mean_value,
+        'stddev_input': stddev_value,
+        'values': numeric_values.astype(float).tolist(),
+        'axis_group': 'response'
+    }
+
+
+def infer_limit_state_u_space_sample_indices(state_record: Dict[str, Any],
+                                             failure_cloud_data: Dict[str, Any]) -> np.ndarray:
+    """Ambil indeks sampel global yang sejajar dengan respons limit-state terpilih."""
+    raw_indices = np.asarray(
+        (state_record or {}).get('sample_indices', []),
+        dtype=float
+    ).reshape(-1)
+    valid_indices = raw_indices[np.isfinite(raw_indices)]
+    if valid_indices.size > 0:
+        return valid_indices.astype(int)
+
+    fallback_size = min(
+        int(np.asarray((state_record or {}).get('Q', []), dtype=float).size),
+        int(np.asarray((state_record or {}).get('R', []), dtype=float).size),
+        int(np.asarray((state_record or {}).get('failure_mask', []), dtype=bool).size)
+    )
+    if fallback_size <= 0:
+        return np.asarray([], dtype=int)
+
+    stored_sample_count = int(
+        (failure_cloud_data or {}).get('stored_sample_count', 0) or 0
+    )
+    if stored_sample_count == fallback_size:
+        return np.arange(fallback_size, dtype=int)
+
+    global_failure_mask_size = len((failure_cloud_data or {}).get('failure_mask', []) or [])
+    if global_failure_mask_size == fallback_size:
+        return np.arange(fallback_size, dtype=int)
+
+    return np.asarray([], dtype=int)
+
+
+def build_limit_state_u_space_failure_cloud_data(
+    failure_cloud_data: Dict[str, Any],
+    physical_cloud_data: Dict[str, Any],
+    elem_id: int,
+    limit_state: str
+) -> Dict[str, Any]:
+    """Bangun dataset U-space per elemen dan fungsi batas dengan sumbu Q/R atau variabel acak."""
+    state_record = get_probabilistic_limit_state_physical_cloud_record(
+        physical_cloud_data,
+        int(elem_id),
+        str(limit_state)
+    )
+    if not state_record:
+        return {}
+
+    element_record = (
+        (physical_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        or {}
+    )
+    q_values = np.asarray((state_record or {}).get('Q', []), dtype=float).reshape(-1)
+    r_values = np.asarray((state_record or {}).get('R', []), dtype=float).reshape(-1)
+    failure_mask = np.asarray((state_record or {}).get('failure_mask', []), dtype=bool).reshape(-1)
+    sample_indices = infer_limit_state_u_space_sample_indices(
+        state_record,
+        failure_cloud_data
+    )
+
+    common_sizes = [
+        int(q_values.size),
+        int(r_values.size),
+        int(failure_mask.size)
+    ]
+    if sample_indices.size > 0:
+        common_sizes.append(int(sample_indices.size))
+    common_size = min(common_sizes) if common_sizes else 0
+    if common_size <= 0:
+        return {}
+
+    q_values = q_values[:common_size]
+    r_values = r_values[:common_size]
+    failure_mask = failure_mask[:common_size]
+    if sample_indices.size > 0:
+        sample_indices = sample_indices[:common_size]
+
+    element_code = str(element_record.get('element_code', '-') or '-')
+    element_type = str(element_record.get('element_type', '-') or '-')
+    unit_label = str((state_record or {}).get('unit', '-') or '-')
+
+    variables: Dict[str, Dict[str, Any]] = {
+        'Q': build_failure_surface_response_axis_record(
+            axis_name='Q',
+            label='Demand Q',
+            unit=unit_label,
+            values=q_values,
+            elem_id=int(elem_id),
+            element_code=element_code,
+            element_type=element_type
+        ),
+        'R': build_failure_surface_response_axis_record(
+            axis_name='R',
+            label='Capacity R',
+            unit=unit_label,
+            values=r_values,
+            elem_id=int(elem_id),
+            element_code=element_code,
+            element_type=element_type
+        )
+    }
+
+    system_variable_records = (failure_cloud_data or {}).get('variables', {}) or {}
+    if sample_indices.size > 0:
+        for variable_name, variable_record in system_variable_records.items():
+            variable_elem_id = variable_record.get('element_id')
+            try:
+                variable_elem_id_int = int(variable_elem_id)
+            except (TypeError, ValueError):
+                continue
+            if variable_elem_id_int != int(elem_id):
+                continue
+
+            all_values = np.asarray(
+                (variable_record or {}).get('values', []),
+                dtype=float
+            ).reshape(-1)
+            if all_values.size == 0:
+                continue
+
+            subset_values = np.full(common_size, np.nan, dtype=float)
+            valid_position_mask = (
+                (sample_indices >= 0)
+                & (sample_indices < all_values.size)
+            )
+            if np.any(valid_position_mask):
+                subset_values[valid_position_mask] = all_values[
+                    sample_indices[valid_position_mask]
+                ]
+            if not np.any(np.isfinite(subset_values)):
+                continue
+
+            subset_record = dict(variable_record or {})
+            subset_record['values'] = subset_values.astype(float).tolist()
+            subset_record['axis_group'] = 'random_variable'
+            variables[str(variable_name)] = subset_record
+
+    stored_failure_count = int(np.sum(failure_mask))
+    return {
+        'num_simulations': int((state_record or {}).get('sample_count', common_size) or common_size),
+        'failures': stored_failure_count,
+        'analysis_failures': int((physical_cloud_data or {}).get('analysis_failures', 0) or 0),
+        'stored_sample_count': int(common_size),
+        'stored_failure_count': stored_failure_count,
+        'stored_safe_count': int(common_size - stored_failure_count),
+        'used_downsampling': bool((state_record or {}).get('used_downsampling', False)),
+        'failed_points_truncated': bool((state_record or {}).get('failed_points_truncated', False)),
+        'failure_mask': failure_mask.astype(bool).tolist(),
+        'variables': variables,
+        'sample_indices': sample_indices.astype(int).tolist(),
+        'supports_random_variable_axes': bool(sample_indices.size > 0),
+        'axis_mode': 'limit_state-response',
+        'element_id': int(elem_id),
+        'element_code': element_code,
+        'element_type': element_type,
+        'limit_state': str(limit_state),
+        'limit_state_label': str((state_record or {}).get('limit_state_label', str(limit_state)) or str(limit_state)),
+        'context_title': (
+            f"Element E{int(elem_id)} ({element_type}) | "
+            f"Limit State: {str((state_record or {}).get('limit_state_label', str(limit_state)) or str(limit_state))}"
+        )
+    }
+
+
+def get_limit_state_u_space_available_state_specs(physical_cloud_data: Dict[str, Any],
+                                                  elem_id: int) -> List[Dict[str, str]]:
+    """Daftar fungsi batas yang tersedia pada elemen terpilih untuk plot U-space."""
+    element_record = (
+        (physical_cloud_data or {}).get('elements', {}).get(str(int(elem_id)))
+        or {}
+    )
+    state_lookup = (element_record.get('states', {}) or {})
+    state_specs = []
+    for base_spec in get_probabilistic_limit_state_histogram_specs():
+        state_key = str(base_spec['key'])
+        state_record = state_lookup.get(state_key) or {}
+        if not state_record:
+            continue
+        state_specs.append({
+            'key': state_key,
+            'label': str(state_record.get('limit_state_label', base_spec['label']) or base_spec['label'])
+        })
+    return state_specs
+
+
+def get_limit_state_u_space_axis_names(limit_state_failure_cloud_data: Dict[str, Any]) -> List[str]:
+    """Urutkan opsi sumbu untuk mode U-space per elemen-limit-state."""
+    variable_records = (limit_state_failure_cloud_data or {}).get('variables', {}) or {}
+    if not variable_records:
+        return []
+
+    response_names = [
+        axis_name for axis_name in ('Q', 'R')
+        if axis_name in variable_records
+    ]
+    random_names = sorted(
+        [
+            variable_name
+            for variable_name in variable_records.keys()
+            if variable_name not in {'Q', 'R'}
+        ],
+        key=lambda variable_name: (
+            str((variable_records.get(variable_name) or {}).get('label', '')),
+            str(variable_name)
+        )
+    )
+    return response_names + random_names
 
 
 def prepare_failure_cloud_plot_data(failure_cloud_data: Dict[str, Any],
@@ -11097,10 +11879,15 @@ def transform_failure_cloud_values_to_standard_normal_space(values: np.ndarray,
     return (numeric_values - float(mean_value)) / float(stddev_value)
 
 
-def build_failure_surface_axis_label(record: Dict[str, Any]) -> str:
+def build_failure_surface_axis_label(record: Dict[str, Any],
+                                     axis_descriptor: Optional[str] = None) -> str:
     """Label sumbu ringkas untuk ruang normal baku `U`."""
     variable_name = str(record.get('variable_name', '-') or '-')
-    return f"u({variable_name}) (-)"
+    base_label = f"u({variable_name}) (-)"
+    descriptor = str(axis_descriptor or '').strip()
+    if not descriptor:
+        return base_label
+    return f"{descriptor} | {base_label}"
 
 
 def prepare_failure_surface_plot_data(failure_cloud_data: Dict[str, Any],
@@ -11245,9 +12032,124 @@ def build_nice_contour_step(max_abs_value: float,
     return float(factor * scale)
 
 
+def resolve_failure_surface_2d_mpp_from_zero_segment(
+    zero_segment: Optional[np.ndarray],
+    target_beta: Optional[float] = None,
+    target_beta_raw: Any = None
+) -> Optional[Dict[str, Any]]:
+    """Pilih titik pada cabang contour nol yang paling cocok untuk marker `MPP/Beta`."""
+    zero_segment_array = np.asarray(zero_segment, dtype=float)
+    if zero_segment_array.ndim != 2 or zero_segment_array.shape[0] < 2:
+        return None
+
+    vertices = zero_segment_array[:, :2]
+    valid_mask = np.isfinite(vertices).all(axis=1)
+    vertices = vertices[valid_mask]
+    if vertices.shape[0] < 2:
+        return None
+
+    target_beta_numeric = coerce_finite_float(target_beta)
+    candidate_points: List[np.ndarray] = []
+
+    def append_candidate(point: np.ndarray) -> None:
+        point_array = np.asarray(point, dtype=float).reshape(-1)
+        if point_array.size != 2 or not np.all(np.isfinite(point_array)):
+            return
+        for existing_point in candidate_points:
+            if np.allclose(point_array, existing_point, rtol=1e-9, atol=1e-9):
+                return
+        candidate_points.append(point_array.astype(float))
+
+    for start_point, end_point in zip(vertices[:-1], vertices[1:]):
+        segment = np.asarray(end_point - start_point, dtype=float)
+        segment_length_squared = float(np.dot(segment, segment))
+
+        append_candidate(start_point)
+        append_candidate(end_point)
+
+        if segment_length_squared <= 1e-18:
+            continue
+
+        t_min = float(
+            np.clip(
+                -np.dot(start_point, segment) / segment_length_squared,
+                0.0,
+                1.0
+            )
+        )
+        append_candidate(start_point + t_min * segment)
+
+        if target_beta_numeric is None or target_beta_numeric < 0.0:
+            continue
+
+        coefficient_a = segment_length_squared
+        coefficient_b = float(2.0 * np.dot(start_point, segment))
+        coefficient_c = float(np.dot(start_point, start_point) - (target_beta_numeric ** 2))
+        discriminant = float((coefficient_b ** 2) - (4.0 * coefficient_a * coefficient_c))
+        if discriminant < -1e-12:
+            continue
+
+        discriminant = max(discriminant, 0.0)
+        sqrt_discriminant = float(np.sqrt(discriminant))
+        for root in (
+            (-coefficient_b - sqrt_discriminant) / (2.0 * coefficient_a),
+            (-coefficient_b + sqrt_discriminant) / (2.0 * coefficient_a)
+        ):
+            if -1e-9 <= float(root) <= 1.0 + 1e-9:
+                root_clamped = float(np.clip(root, 0.0, 1.0))
+                append_candidate(start_point + root_clamped * segment)
+
+    if not candidate_points:
+        return None
+
+    candidate_array = np.asarray(candidate_points, dtype=float)
+    candidate_radii = np.linalg.norm(candidate_array, axis=1)
+    finite_mask = np.isfinite(candidate_radii)
+    if not np.any(finite_mask):
+        return None
+
+    candidate_array = candidate_array[finite_mask]
+    candidate_radii = candidate_radii[finite_mask]
+    if candidate_array.size == 0 or candidate_radii.size == 0:
+        return None
+
+    min_radius_index = int(np.nanargmin(candidate_radii))
+    min_radius_point = np.asarray(candidate_array[min_radius_index], dtype=float)
+
+    if target_beta_numeric is not None:
+        beta_distance = np.abs(candidate_radii - float(target_beta_numeric))
+        distance_to_min_radius_point = np.linalg.norm(
+            candidate_array - min_radius_point[np.newaxis, :],
+            axis=1
+        )
+        selected_index = int(
+            np.lexsort((candidate_radii, distance_to_min_radius_point, beta_distance))[0]
+        )
+        selection_method = 'zero-segment closest-to-beta-table'
+        display_beta = float(target_beta_numeric)
+        display_beta_raw = target_beta_raw if target_beta_raw is not None else target_beta_numeric
+    else:
+        selected_index = min_radius_index
+        selection_method = 'zero-segment min-u-radius'
+        display_beta = float(candidate_radii[selected_index])
+        display_beta_raw = float(candidate_radii[selected_index])
+
+    selected_point = np.asarray(candidate_array[selected_index], dtype=float)
+    selected_beta = float(candidate_radii[selected_index])
+    return {
+        'point': selected_point,
+        'beta': selected_beta,
+        'display_beta': float(display_beta),
+        'display_beta_raw': display_beta_raw,
+        'selection_method': str(selection_method)
+    }
+
+
 def estimate_failure_surface_2d_mpp_from_grid(grid_x: np.ndarray,
                                               grid_y: np.ndarray,
-                                              score_grid: np.ndarray) -> Optional[Dict[str, Any]]:
+                                              score_grid: np.ndarray,
+                                              target_beta: Optional[float] = None,
+                                              target_beta_raw: Any = None) -> Optional[Dict[str, Any]]:
     """Estimasi MPP 2D dari titik potong `g_hat(u)=0` yang terdekat ke origin."""
     x_array = np.asarray(grid_x, dtype=float)
     y_array = np.asarray(grid_y, dtype=float)
@@ -11321,12 +12223,27 @@ def estimate_failure_surface_2d_mpp_from_grid(grid_x: np.ndarray,
     if radii.size == 0 or not np.any(np.isfinite(radii)):
         return None
 
-    best_index = int(np.nanargmin(radii))
+    target_beta_numeric = coerce_finite_float(target_beta)
+    if target_beta_numeric is not None:
+        beta_distance = np.abs(radii - float(target_beta_numeric))
+        best_index = int(np.lexsort((radii, beta_distance))[0])
+        selection_method = 'grid closest-to-beta-table'
+        display_beta = float(target_beta_numeric)
+        display_beta_raw = target_beta_raw if target_beta_raw is not None else target_beta_numeric
+    else:
+        best_index = int(np.nanargmin(radii))
+        selection_method = 'grid min-u-radius'
+        display_beta = float(radii[best_index])
+        display_beta_raw = float(radii[best_index])
+
     best_point = np.asarray(candidate_array[best_index], dtype=float)
     beta_value = float(radii[best_index])
     return {
         'point': best_point,
-        'beta': beta_value
+        'beta': beta_value,
+        'display_beta': float(display_beta),
+        'display_beta_raw': display_beta_raw,
+        'selection_method': str(selection_method)
     }
 
 
@@ -11750,11 +12667,6 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
     estimator_method = str(surface_grid.get('estimator_method', 'unknown') or 'unknown')
     score_min = float(np.nanmin(score_grid))
     score_max = float(np.nanmax(score_grid))
-    estimated_mpp = estimate_failure_surface_2d_mpp_from_grid(
-        grid_x,
-        grid_y,
-        score_grid
-    )
     safe_count_full = int(surface_plot_data.get('safe_count', 0) or 0)
     failure_count_full = int(surface_plot_data.get('failure_count', 0) or 0)
     if not (score_min <= 0.0 <= score_max):
@@ -11768,6 +12680,32 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
 
     fig, axis = plt.subplots(figsize=(9.6, 7.2), dpi=180)
     axis.set_facecolor('#ffffff')
+    axis_mode = str(
+        (failure_cloud_data or {}).get('axis_mode', '') or ''
+    ).strip().lower()
+    context_title = str(
+        (failure_cloud_data or {}).get('context_title', '') or ''
+    ).strip()
+    selected_axis_names = {
+        str(x_record.get('variable_name', '') or '').strip().upper(),
+        str(y_record.get('variable_name', '') or '').strip().upper()
+    }
+    use_beta_table_anchor = (
+        axis_mode == 'limit_state-response'
+        and selected_axis_names == {'Q', 'R'}
+    )
+    target_beta_raw = (
+        (failure_cloud_data or {}).get('reliability_beta_raw')
+        if use_beta_table_anchor else
+        None
+    )
+    target_beta_numeric = (
+        coerce_finite_float((failure_cloud_data or {}).get('reliability_beta'))
+        if use_beta_table_anchor else
+        None
+    )
+    if target_beta_numeric is None and use_beta_table_anchor:
+        target_beta_numeric = coerce_finite_float(target_beta_raw)
 
     finite_margin = signed_margin_grid[np.isfinite(signed_margin_grid)]
     max_abs_margin = max(
@@ -11881,6 +12819,7 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
         reference_y=u_y
     )
     selected_zero_segment = zero_segment_info.get('selected_segment')
+    estimated_mpp = None
     if selected_zero_segment is not None:
         selected_zero_segment_array = np.asarray(selected_zero_segment, dtype=float)
         if (
@@ -11894,6 +12833,11 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
                 linewidth=2.4,
                 zorder=3
             )
+            estimated_mpp = resolve_failure_surface_2d_mpp_from_zero_segment(
+                selected_zero_segment_array,
+                target_beta=target_beta_numeric,
+                target_beta_raw=target_beta_raw
+            )
     axis.plot(
         [],
         [],
@@ -11901,18 +12845,43 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
         linewidth=2.4,
         label='Nonlinear contour, g_hat(u)=0'
     )
+    if estimated_mpp is None:
+        estimated_mpp = estimate_failure_surface_2d_mpp_from_grid(
+            grid_x,
+            grid_y,
+            score_grid,
+            target_beta=target_beta_numeric,
+            target_beta_raw=target_beta_raw
+        )
 
     if estimated_mpp is not None:
         mpp_point = np.asarray(estimated_mpp.get('point', []), dtype=float).reshape(-1)
         mpp_beta = coerce_finite_float(estimated_mpp.get('beta'))
+        mpp_display_beta_label = format_beta_table_display(
+            estimated_mpp.get('display_beta_raw', estimated_mpp.get('display_beta')),
+            4
+        )
+        use_beta_table_label = (
+            bool(use_beta_table_anchor and target_beta_numeric is not None)
+            and str(mpp_display_beta_label).strip() not in {'', '-'}
+        )
         if mpp_point.size == 2 and mpp_beta is not None:
+            if use_beta_table_label:
+                beta_line_label = f"Beta(table) Line, beta={mpp_display_beta_label}"
+                mpp_marker_label = f"MPP, Beta(table)={mpp_display_beta_label}"
+                mpp_annotation_text = f"MPP\nBeta(table)={mpp_display_beta_label}"
+            else:
+                beta_line_label = f"Estimated Beta Line, beta={mpp_beta:.2f}"
+                mpp_marker_label = f"Estimated MPP, beta={mpp_beta:.2f}"
+                mpp_annotation_text = f"MPP\nbeta={mpp_beta:.2f}"
+
             axis.plot(
                 [0.0, float(mpp_point[0])],
                 [0.0, float(mpp_point[1])],
                 linestyle='--',
                 linewidth=1.3,
                 color='#a21caf',
-                label=f"Estimated Beta Line, beta={mpp_beta:.2f}",
+                label=beta_line_label,
                 zorder=3
             )
             axis.scatter(
@@ -11923,11 +12892,11 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
                 color='#111827',
                 edgecolors='#ffffff',
                 linewidths=0.5,
-                label=f"Estimated MPP, beta={mpp_beta:.2f}",
+                label=mpp_marker_label,
                 zorder=4
             )
             axis.annotate(
-                f"MPP\nbeta={mpp_beta:.2f}",
+                mpp_annotation_text,
                 xy=(float(mpp_point[0]), float(mpp_point[1])),
                 xytext=(10, -12),
                 textcoords='offset points',
@@ -11966,13 +12935,35 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
     axis.set_xlim(*surface_grid['x_limits'])
     axis.set_ylim(*surface_grid['y_limits'])
     axis.set_aspect('equal', adjustable='box')
-    axis.set_xlabel(build_failure_surface_axis_label(x_record))
-    axis.set_ylabel(build_failure_surface_axis_label(y_record))
+    x_axis_descriptor = None
+    y_axis_descriptor = None
+    if axis_mode == 'limit_state-response':
+        axis_descriptor_lookup = {
+            'Q': 'Demand Q',
+            'R': 'Capacity R'
+        }
+        x_axis_descriptor = axis_descriptor_lookup.get(
+            str(x_record.get('variable_name', '') or '').strip().upper()
+        )
+        y_axis_descriptor = axis_descriptor_lookup.get(
+            str(y_record.get('variable_name', '') or '').strip().upper()
+        )
+    x_axis_label = build_failure_surface_axis_label(
+        x_record,
+        axis_descriptor=x_axis_descriptor
+    )
+    y_axis_label = build_failure_surface_axis_label(
+        y_record,
+        axis_descriptor=y_axis_descriptor
+    )
+    axis.set_xlabel(x_axis_label)
+    axis.set_ylabel(y_axis_label)
+    title_parts = ["Failure Cloud and Nonlinear Contour g_hat(u)=0"]
+    if context_title:
+        title_parts.append(context_title)
+    title_parts.append(f"Method: {estimator_method.upper()}")
     axis.set_title(
-        (
-            "Failure Cloud and Nonlinear Contour g_hat(u)=0 "
-            f"| Method: {estimator_method.upper()}"
-        ),
+        " | ".join(title_parts),
         fontsize=12,
         pad=12
     )
@@ -12030,10 +13021,20 @@ def build_failure_surface_figure_and_metadata(failure_cloud_data: Dict[str, Any]
         'score_min': score_min,
         'score_max': score_max,
         'estimated_mpp_beta': (
-            coerce_finite_float((estimated_mpp or {}).get('beta'))
+            coerce_finite_float(
+                (estimated_mpp or {}).get('display_beta')
+                if (use_beta_table_anchor and target_beta_numeric is not None) else
+                (estimated_mpp or {}).get('beta')
+            )
             if estimated_mpp is not None else
             None
-        )
+        ),
+        'estimated_mpp_beta_raw': (
+            (estimated_mpp or {}).get('display_beta_raw', (estimated_mpp or {}).get('display_beta'))
+            if estimated_mpp is not None else
+            None
+        ),
+        'used_beta_table_anchor': bool(use_beta_table_anchor and target_beta_numeric is not None)
     }
 
 
@@ -13178,6 +14179,7 @@ def build_failure_surface_unavailable_message(results_bundle: Dict[str, Any],
 
 def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[str, Any],
                                                       results_bundle: Dict[str, Any],
+                                                      physical_cloud_data: Optional[Dict[str, Any]] = None,
                                                       heading_level: str = "####") -> None:
     """Tampilkan tab failure surface pada ruang normal baku."""
     st.markdown(f"{heading_level} Failure Surface Ruang Normal Baku")
@@ -13185,39 +14187,43 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
         "Bagian berikut adalah visualisasi `failure surface` pada ruang normal baku `U`, "
         "yakni interpretasi geometrik yang paling dekat dengan konsep `beta` klasik."
     )
-    if not failure_cloud_data:
+    physical_cloud_data = physical_cloud_data or {}
+    system_variable_records = (failure_cloud_data or {}).get('variables', {}) or {}
+    has_system_variable_mode = len(system_variable_records) >= 2
+    has_limit_state_mode = bool((physical_cloud_data or {}).get('elements'))
+
+    if not has_system_variable_mode and not has_limit_state_mode:
         st.info(
             "Dataset failure surface ruang normal baku belum tersedia. Jalankan analisis "
             "probabilistik agar sampel Monte Carlo dapat diproyeksikan ke ruang dua variabel."
         )
         return
 
-    variable_records = (failure_cloud_data or {}).get('variables', {}) or {}
-    if len(variable_records) < 2:
-        st.info("Failure surface ruang normal baku memerlukan minimal dua variabel acak yang tersimpan.")
-        return
-
     sensitivity_results = (results_bundle or {}).get('sensitivity_results', {}) or {}
-    ordered_variable_names = get_failure_cloud_variable_sort_order(
-        failure_cloud_data,
-        sensitivity_results=sensitivity_results
-    )
-    default_x, default_y = get_failure_cloud_default_variable_names(
-        failure_cloud_data,
-        sensitivity_results=sensitivity_results
-    )
-    default_x_3d, default_y_3d, default_z_3d = get_failure_cloud_default_three_variable_names(
-        failure_cloud_data,
-        sensitivity_results=sensitivity_results
-    )
-    if default_x is None or default_y is None:
-        st.info("Variabel default failure cloud belum bisa ditentukan dari hasil saat ini.")
-        return
+    ordered_variable_names: List[str] = []
+    default_x = None
+    default_y = None
+    default_x_3d = None
+    default_y_3d = None
+    default_z_3d = None
+    if has_system_variable_mode:
+        ordered_variable_names = get_failure_cloud_variable_sort_order(
+            failure_cloud_data,
+            sensitivity_results=sensitivity_results
+        )
+        default_x, default_y = get_failure_cloud_default_variable_names(
+            failure_cloud_data,
+            sensitivity_results=sensitivity_results
+        )
+        default_x_3d, default_y_3d, default_z_3d = get_failure_cloud_default_three_variable_names(
+            failure_cloud_data,
+            sensitivity_results=sensitivity_results
+        )
 
     st.markdown(f"{heading_level} Nonlinear Contour g(x)=0")
     st.caption(
-        "Plot ini menampilkan `failure cloud` hasil Monte Carlo pada pasangan dua variabel "
-        "acak yang dipilih, setelah ditransformasikan ke ruang normal baku `U`."
+        "Plot ini menampilkan `failure cloud` hasil Monte Carlo pada pasangan dua sumbu "
+        "yang dipilih, setelah ditransformasikan ke ruang normal baku `U`."
     )
     st.caption(
         "Titik `biru` adalah sampel `safe`, titik `merah` adalah sampel `failed`, "
@@ -13228,6 +14234,247 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
         "Warna latar dan garis kontur tipis menunjukkan `signed margin g_hat(u)` hasil "
         "aproksimasi berbasis data SMC. Lingkar putus-putus `beta` dan titik origin "
         "ditampilkan agar pembacaan posisi cloud pada `standard normal space` lebih mudah."
+    )
+    mode_options = []
+    if has_system_variable_mode:
+        mode_options.append("Variabel Acak Sistem")
+    if has_limit_state_mode:
+        mode_options.append("Per Elemen + Fungsi Batas")
+    selected_mode = st.radio(
+        "Mode Plot 2D",
+        options=mode_options,
+        horizontal=True,
+        key="failure_surface_u_space_mode"
+    )
+
+    if selected_mode == "Per Elemen + Fungsi Batas":
+        st.caption(
+            "Mode ini memfilter cloud berdasarkan `elemen` dan `fungsi batas` tertentu. "
+            "Sumbu dapat dipilih dari `Demand Q`, `Capacity R`, dan variabel acak yang "
+            "terkait dengan elemen terpilih."
+        )
+        st.caption(
+            "Untuk sumbu `Q` dan `R`, transformasi ke `U-space` dibentuk dari `mean` dan "
+            "`simpangan baku` sampel respons Monte Carlo pada elemen-limit-state terpilih. "
+            "Dengan demikian koordinatnya bersifat `u-like standardization`, bukan basic random variable asli."
+        )
+
+        available_element_ids = [
+            int(elem_id)
+            for elem_id in ((physical_cloud_data or {}).get('element_ids', []) or [])
+        ]
+        if not available_element_ids:
+            st.info("Belum ada elemen yang memiliki data failure surface per fungsi batas.")
+            return
+
+        selector_cols = st.columns(4)
+        selected_elem_id = selector_cols[0].selectbox(
+            "Elemen",
+            options=available_element_ids,
+            format_func=lambda elem_id: (
+                f"E{int(elem_id)} | "
+                f"{str(((physical_cloud_data or {}).get('elements', {}).get(str(int(elem_id)), {}) or {}).get('element_type', '-'))}"
+            ),
+            key="failure_surface_limit_state_element_selector"
+        )
+
+        available_state_specs = get_limit_state_u_space_available_state_specs(
+            physical_cloud_data,
+            int(selected_elem_id)
+        )
+        if not available_state_specs:
+            st.info("Elemen terpilih belum memiliki data fungsi batas yang dapat diplot.")
+            return
+
+        state_lookup = {
+            str(spec['key']): str(spec['label'])
+            for spec in available_state_specs
+        }
+        selected_limit_state = selector_cols[1].selectbox(
+            "Fungsi Batas",
+            options=list(state_lookup.keys()),
+            format_func=lambda value: state_lookup.get(str(value), str(value)),
+            key="failure_surface_limit_state_selector"
+        )
+
+        limit_state_failure_cloud_data = build_limit_state_u_space_failure_cloud_data(
+            failure_cloud_data=failure_cloud_data,
+            physical_cloud_data=physical_cloud_data,
+            elem_id=int(selected_elem_id),
+            limit_state=str(selected_limit_state)
+        )
+        if not limit_state_failure_cloud_data:
+            st.info("Dataset U-space untuk elemen dan fungsi batas terpilih belum dapat dibentuk.")
+            return
+
+        element_reliability = (results_bundle or {}).get('element_reliability', {}) or {}
+        reliability_record = get_by_element_value(
+            element_reliability.get(str(selected_limit_state), {}),
+            int(selected_elem_id),
+            {}
+        ) or {}
+        limit_state_failure_cloud_data['reliability_beta'] = coerce_finite_float(
+            reliability_record.get('Beta')
+        )
+        limit_state_failure_cloud_data['reliability_beta_raw'] = reliability_record.get('Beta')
+
+        limit_state_variable_records = (
+            limit_state_failure_cloud_data.get('variables', {}) or {}
+        )
+        axis_names = get_limit_state_u_space_axis_names(limit_state_failure_cloud_data)
+        if len(axis_names) < 2:
+            st.info("Minimal dua sumbu valid diperlukan untuk membentuk contour limit state ini.")
+            return
+
+        default_axis_x = 'Q' if 'Q' in axis_names else axis_names[0]
+        if 'R' in axis_names and 'R' != default_axis_x:
+            default_axis_y = 'R'
+        else:
+            default_axis_y = next(
+                (
+                    axis_name for axis_name in axis_names
+                    if axis_name != default_axis_x
+                ),
+                axis_names[0]
+            )
+
+        x_axis_index = axis_names.index(default_axis_x)
+        y_axis_index = axis_names.index(default_axis_y)
+        x_variable_name = selector_cols[2].selectbox(
+            "Sumbu X",
+            options=axis_names,
+            index=x_axis_index,
+            format_func=lambda axis_name: format_failure_cloud_variable_label(
+                limit_state_variable_records.get(axis_name, {}),
+                short=False
+            ),
+            key=(
+                f"failure_surface_limit_state_x_"
+                f"e{int(selected_elem_id)}_{str(selected_limit_state)}"
+            )
+        )
+        y_variable_name = selector_cols[3].selectbox(
+            "Sumbu Y",
+            options=axis_names,
+            index=y_axis_index,
+            format_func=lambda axis_name: format_failure_cloud_variable_label(
+                limit_state_variable_records.get(axis_name, {}),
+                short=False
+            ),
+            key=(
+                f"failure_surface_limit_state_y_"
+                f"e{int(selected_elem_id)}_{str(selected_limit_state)}"
+            )
+        )
+
+        if not bool(limit_state_failure_cloud_data.get('supports_random_variable_axes', False)):
+            st.caption(
+                "Untuk hasil analisis yang disimpan sebelum pembaruan ini, mode per-elemen "
+                "mungkin baru menyediakan sumbu `Q` dan `R`. Jalankan ulang analisis bila "
+                "ingin mengaktifkan pilihan variabel acak pada mode ini."
+            )
+
+        if str(x_variable_name) == str(y_variable_name):
+            st.warning("Pilih sumbu `X` dan `Y` yang berbeda agar contour limit state informatif.")
+            return
+
+        if {str(x_variable_name), str(y_variable_name)} == {'Q', 'R'}:
+            beta_table_label = format_beta_table_display(
+                limit_state_failure_cloud_data.get('reliability_beta_raw'),
+                4
+            )
+            if (
+                coerce_finite_float(limit_state_failure_cloud_data.get('reliability_beta')) is not None
+                and str(beta_table_label).strip() not in {'', '-'}
+            ):
+                st.caption(
+                    f"Untuk pasangan sumbu `Q-R`, marker `MPP` dan garis `beta` "
+                    f"ditambatkan ke `Beta(table) = {beta_table_label}` dari tabel reliability elemen ini."
+                )
+
+        failure_surface_fig, failure_surface_meta = build_failure_surface_figure_and_metadata(
+            limit_state_failure_cloud_data,
+            x_variable_name=str(x_variable_name),
+            y_variable_name=str(y_variable_name)
+        )
+        if failure_surface_fig is not None:
+            render_plot(
+                failure_surface_fig,
+                interactive=True,
+                viewer_key=(
+                    "failure-surface-limit-state-"
+                    f"e{int(selected_elem_id)}-{sanitize_dom_id(str(selected_limit_state))}-"
+                    f"{sanitize_dom_id(str(x_variable_name))}-{sanitize_dom_id(str(y_variable_name))}"
+                ),
+                alt_text=(
+                    f"Failure surface U-space elemen {int(selected_elem_id)} "
+                    f"fungsi batas {str(selected_limit_state)}"
+                ),
+                viewer_height=700,
+                download_basename=(
+                    f"failure-surface-u-space-e{int(selected_elem_id)}-"
+                    f"{selected_limit_state}-{x_variable_name}-vs-{y_variable_name}"
+                )
+            )
+        else:
+            diagnostic_parts = []
+            estimator_method = str(
+                (failure_surface_meta or {}).get('estimator_method', '')
+            ).strip()
+            if estimator_method:
+                diagnostic_parts.append(f"estimator terakhir: `{estimator_method.upper()}`")
+            score_min = coerce_finite_float((failure_surface_meta or {}).get('score_min'))
+            score_max = coerce_finite_float((failure_surface_meta or {}).get('score_max'))
+            if score_min is not None and score_max is not None:
+                diagnostic_parts.append(
+                    f"rentang score grid: `{score_min:.4f}` s.d. `{score_max:.4f}`"
+                )
+
+            limit_state_failures = int(limit_state_failure_cloud_data.get('failures', 0) or 0)
+            limit_state_samples = int(limit_state_failure_cloud_data.get('stored_sample_count', 0) or 0)
+            limit_state_safe = max(limit_state_samples - limit_state_failures, 0)
+            if limit_state_failures < 2:
+                st.info(
+                    "Failure surface belum dapat dibentuk karena sampel gagal untuk "
+                    "elemen-limit-state ini masih terlalu sedikit."
+                )
+            elif limit_state_safe < 2:
+                st.info(
+                    "Failure surface belum dapat dibentuk karena sampel aman untuk "
+                    "elemen-limit-state ini masih terlalu sedikit."
+                )
+            else:
+                st.info(
+                    "Failure surface belum dapat dibentuk untuk pasangan sumbu ini. "
+                    "Biasanya ini terjadi bila sebaran data terlalu degenerat untuk "
+                    "estimasi batas 2D."
+                )
+            st.caption(
+                f"Detail limit state: `N valid = {limit_state_samples:,}` | "
+                f"`fail = {limit_state_failures:,}` | `safe = {limit_state_safe:,}`"
+            )
+            if diagnostic_parts:
+                st.caption("Diagnostik: " + " | ".join(diagnostic_parts))
+
+        st.markdown(f"{heading_level} Failure Surface 3D")
+        st.info(
+            "Plot `3D Failure Surface` saat ini tetap tersedia pada mode `Variabel Acak Sistem`. "
+            "Mode `Per Elemen + Fungsi Batas` difokuskan pada panel 2D agar pembacaan "
+            "`Demand Q` dan `Capacity R` per elemen-limit-state tetap jelas."
+        )
+        return
+
+    if default_x is None or default_y is None:
+        st.info("Variabel default failure cloud belum bisa ditentukan dari hasil saat ini.")
+        return
+
+    st.caption(
+        "Mode ini mempertahankan perilaku lama, yaitu membangun contour dari pasangan "
+        "dua variabel acak sistem yang dipilih pengguna."
+    )
+    st.caption(
+        "Pada mode ini, label sumbu ditampilkan langsung sebagai nama variabel acak "
+        "yang telah diproyeksikan ke ruang normal baku, misalnya `u(qDL_E7) (-)`."
     )
 
     if failure_cloud_data.get('used_downsampling'):
@@ -13241,6 +14488,7 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
             "jumlah kejadian gagal melebihi batas penyimpanan visual."
         )
 
+    variable_records = system_variable_records
     x_index = ordered_variable_names.index(default_x)
     y_index = ordered_variable_names.index(default_y)
     selector_cols = st.columns(3)
@@ -17893,6 +19141,11 @@ elif active_dashboard_tab == "Output Reliability":
                 )
             )
         if is_probabilistic:
+            render_output_reliability_all_elements_beta_sketch_section(
+                results_bundle=results_bundle or {},
+                input_data=input_data,
+                heading_level="####"
+            )
             render_output_reliability_beta_sketch_section(
                 results_bundle=results_bundle or {},
                 input_data=input_data,
@@ -17972,6 +19225,7 @@ elif active_dashboard_tab == "Failure Cloud U-Space":
         render_probabilistic_failure_cloud_output_section(
             failure_cloud_data=failure_cloud_data or {},
             results_bundle=results_bundle,
+            physical_cloud_data=limit_state_physical_cloud_data or {},
             heading_level="####"
         )
 
