@@ -8159,23 +8159,6 @@ def build_limit_state_function_physical_space_figure(physical_cloud_data: Dict[s
                 zorder=6,
                 label=f"Projected beta line, Beta(table)={material_space_display_beta_label}"
             )
-            if (
-                material_space_sample_x is not None
-                and material_space_sample_y is not None
-                and not (
-                    np.isclose(material_space_sample_x, material_space_mpp_x, atol=1e-9, rtol=1e-9)
-                    and np.isclose(material_space_sample_y, material_space_mpp_y, atol=1e-9, rtol=1e-9)
-                )
-            ):
-                axis.plot(
-                    [float(material_space_sample_x), float(material_space_mpp_x)],
-                    [float(material_space_sample_y), float(material_space_mpp_y)],
-                    linestyle=':',
-                    linewidth=1.0,
-                    color='#d946ef',
-                    alpha=0.88,
-                    zorder=6
-                )
             axis.scatter(
                 [float(material_space_mpp_x)],
                 [float(material_space_mpp_y)],
@@ -8502,23 +8485,6 @@ def build_limit_state_function_demand_material_space_figure(physical_cloud_data:
                 zorder=6,
                 label=f"Projected beta line, Beta(table)={demand_material_display_beta_label}"
             )
-            if (
-                demand_material_sample_x is not None
-                and demand_material_sample_y is not None
-                and not (
-                    np.isclose(demand_material_sample_x, demand_material_mpp_x, atol=1e-9, rtol=1e-9)
-                    and np.isclose(demand_material_sample_y, demand_material_mpp_y, atol=1e-9, rtol=1e-9)
-                )
-            ):
-                axis.plot(
-                    [float(demand_material_sample_x), float(demand_material_mpp_x)],
-                    [float(demand_material_sample_y), float(demand_material_mpp_y)],
-                    linestyle=':',
-                    linewidth=1.0,
-                    color='#d946ef',
-                    alpha=0.88,
-                    zorder=6
-                )
             axis.scatter(
                 [float(demand_material_mpp_x)],
                 [float(demand_material_mpp_y)],
@@ -8881,23 +8847,6 @@ def build_axial_moment_custom_axis_figure(axial_moment_pm_cloud_data: Dict[str, 
             zorder=6,
             label=f"Projected beta line, Beta(table)={axial_moment_display_beta_label}"
         )
-        if (
-            axial_moment_sample_x is not None
-            and axial_moment_sample_y is not None
-            and not (
-                np.isclose(axial_moment_sample_x, axial_moment_mpp_x, atol=1e-9, rtol=1e-9)
-                and np.isclose(axial_moment_sample_y, axial_moment_mpp_y, atol=1e-9, rtol=1e-9)
-            )
-        ):
-            axis.plot(
-                [float(axial_moment_sample_x), float(axial_moment_mpp_x)],
-                [float(axial_moment_sample_y), float(axial_moment_mpp_y)],
-                linestyle=':',
-                linewidth=1.0,
-                color='#d946ef',
-                alpha=0.88,
-                zorder=6
-            )
         axis.scatter(
             [float(axial_moment_mpp_x)],
             [float(axial_moment_mpp_y)],
@@ -9372,23 +9321,6 @@ def build_limit_state_function_custom_axis_figure(physical_cloud_data: Dict[str,
             zorder=6,
             label=f"Projected beta line, Beta(table)={custom_map_display_beta_label}"
         )
-        if (
-            custom_map_sample_x is not None
-            and custom_map_sample_y is not None
-            and not (
-                np.isclose(custom_map_sample_x, custom_map_mpp_x, atol=1e-9, rtol=1e-9)
-                and np.isclose(custom_map_sample_y, custom_map_mpp_y, atol=1e-9, rtol=1e-9)
-            )
-        ):
-            axis.plot(
-                [float(custom_map_sample_x), float(custom_map_mpp_x)],
-                [float(custom_map_sample_y), float(custom_map_mpp_y)],
-                linestyle=':',
-                linewidth=1.0,
-                color='#d946ef',
-                alpha=0.88,
-                zorder=6
-            )
         axis.scatter(
             [float(custom_map_mpp_x)],
             [float(custom_map_mpp_y)],
@@ -9710,8 +9642,9 @@ def render_physical_limit_state_function_map_section(physical_cloud_data: Dict[s
         st.caption(
             "Pada mode ini, demand dipatok pada nilai rata-rata cloud Monte Carlo valid, "
             "lalu `g(x)` dievaluasi langsung terhadap pasangan variabel material fisik. "
-            "Marker `MPP` dan `projected beta line` berbasis `Beta(table)` juga ditampilkan "
-            "pada contour `g=0` agar konsisten dengan panel Failure Cloud di Ruang Fisik."
+            "Marker `MPP` dan `projected beta line` berbasis `Beta(table)` juga "
+            "ditampilkan pada contour `g=0` agar konsisten dengan panel Failure Cloud "
+            "di Ruang Fisik."
         )
         figure = build_limit_state_function_physical_space_figure(
             physical_cloud_data=physical_cloud_data,
@@ -14046,6 +13979,122 @@ def build_failure_surface_3d_plotly_figure(failure_cloud_data: Dict[str, Any],
     return figure
 
 
+def render_failure_surface_3d_panel(failure_cloud_data: Dict[str, Any],
+                                    variable_records: Dict[str, Dict[str, Any]],
+                                    ordered_variable_names: List[str],
+                                    x_variable_name: str,
+                                    y_variable_name: str,
+                                    z_variable_name: Optional[str],
+                                    viewer_key_prefix: str,
+                                    alt_text: str,
+                                    download_basename_prefix: str,
+                                    heading_level: str = "####",
+                                    intro_captions: Optional[List[str]] = None,
+                                    unavailable_message: Optional[str] = None,
+                                    unavailable_detail: Optional[str] = None) -> None:
+    """Render panel 3D failure surface untuk dataset U-space aktif."""
+    st.markdown(f"{heading_level} Failure Surface 3D")
+    captions = intro_captions or [
+        (
+            "Panel ini menampilkan `failure cloud` tiga dimensi pada `(u1, u2, u3)` "
+            "beserta permukaan aproksimasi batas `g(u)=0`, seperti inset perspektif 3D pada contoh."
+        ),
+        (
+            "Jika data memadai, permukaan 3D dibentuk sebagai `surface kuadratik/nonlinear`. "
+            "Jika tidak, plot otomatis fallback ke bidang linear. Titik `MPP` estimasi dan "
+            "garis `beta` dari origin ke MPP juga ditampilkan pada panel ini."
+        )
+    ]
+    for caption_text in captions:
+        if str(caption_text).strip():
+            st.caption(str(caption_text))
+
+    if len(ordered_variable_names) < 3 or z_variable_name is None:
+        st.info("Plot 3D belum tersedia karena sumbu valid yang tersimpan masih kurang dari 3.")
+        return
+
+    resolved_z_variable_name = str(z_variable_name)
+    if resolved_z_variable_name in {str(x_variable_name), str(y_variable_name)}:
+        auto_z_variable_name = get_first_distinct_failure_cloud_variable_name(
+            ordered_variable_names,
+            excluded_names=[str(x_variable_name), str(y_variable_name)]
+        )
+        if auto_z_variable_name is None:
+            st.info("Plot 3D belum dapat dibentuk karena tidak ada sumbu `Z` yang berbeda.")
+            return
+        resolved_z_variable_name = str(auto_z_variable_name)
+        resolved_z_label = format_failure_cloud_variable_label(
+            variable_records.get(resolved_z_variable_name, {}),
+            short=False
+        )
+        st.caption(
+            f"Sumbu `Z` otomatis dialihkan ke `{resolved_z_label}` agar berbeda dari `X` dan `Y`."
+        )
+
+    plotly_figure_key = (
+        f"{viewer_key_prefix}-"
+        f"{sanitize_dom_id(str(x_variable_name))}-"
+        f"{sanitize_dom_id(str(y_variable_name))}-"
+        f"{sanitize_dom_id(str(resolved_z_variable_name))}"
+    )
+    failure_surface_3d_plotly_fig = build_failure_surface_3d_plotly_figure(
+        failure_cloud_data,
+        x_variable_name=str(x_variable_name),
+        y_variable_name=str(y_variable_name),
+        z_variable_name=str(resolved_z_variable_name)
+    )
+    if failure_surface_3d_plotly_fig is not None:
+        st.caption(
+            "Gunakan mouse untuk eksplorasi: `drag` untuk memutar, `scroll` untuk zoom, "
+            "dan gunakan toolbar grafik untuk reset atau mode kamera lainnya."
+        )
+        st.plotly_chart(
+            failure_surface_3d_plotly_fig,
+            use_container_width=True,
+            key=plotly_figure_key,
+            config={
+                'displaylogo': False,
+                'scrollZoom': True,
+                'responsive': True
+            }
+        )
+        return
+
+    if go is None:
+        st.caption(
+            "Viewer 3D interaktif belum aktif karena `plotly` tidak tersedia pada "
+            "environment ini, sehingga panel memakai fallback gambar statis."
+        )
+
+    failure_surface_3d_fig = build_failure_surface_3d_figure(
+        failure_cloud_data,
+        x_variable_name=str(x_variable_name),
+        y_variable_name=str(y_variable_name),
+        z_variable_name=str(resolved_z_variable_name)
+    )
+    if failure_surface_3d_fig is not None:
+        render_plot(
+            failure_surface_3d_fig,
+            interactive=True,
+            viewer_key=plotly_figure_key,
+            alt_text=alt_text,
+            viewer_height=760,
+            tight_bbox=False,
+            download_basename=(
+                f"{download_basename_prefix}-"
+                f"{x_variable_name}-{y_variable_name}-{resolved_z_variable_name}"
+            )
+        )
+        return
+
+    st.info(
+        unavailable_message
+        or "Failure surface 3D belum dapat dibentuk untuk kombinasi sumbu ini."
+    )
+    if unavailable_detail:
+        st.caption(unavailable_detail)
+
+
 def get_failure_surface_candidate_pairs(variable_names: List[str],
                                         preferred_pair: Optional[Tuple[str, str]] = None,
                                         max_variables: int = 10,
@@ -14267,7 +14316,7 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
             st.info("Belum ada elemen yang memiliki data failure surface per fungsi batas.")
             return
 
-        selector_cols = st.columns(4)
+        selector_cols = st.columns(5)
         selected_elem_id = selector_cols[0].selectbox(
             "Elemen",
             options=available_element_ids,
@@ -14456,11 +14505,71 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
             if diagnostic_parts:
                 st.caption("Diagnostik: " + " | ".join(diagnostic_parts))
 
-        st.markdown(f"{heading_level} Failure Surface 3D")
-        st.info(
-            "Plot `3D Failure Surface` saat ini tetap tersedia pada mode `Variabel Acak Sistem`. "
-            "Mode `Per Elemen + Fungsi Batas` difokuskan pada panel 2D agar pembacaan "
-            "`Demand Q` dan `Capacity R` per elemen-limit-state tetap jelas."
+        limit_state_z_variable_name = None
+        if len(axis_names) >= 3:
+            default_axis_z = get_first_distinct_failure_cloud_variable_name(
+                axis_names,
+                excluded_names=[str(x_variable_name), str(y_variable_name)]
+            )
+            if default_axis_z is not None:
+                limit_state_z_variable_name = selector_cols[4].selectbox(
+                    "Sumbu Z",
+                    options=axis_names,
+                    index=axis_names.index(default_axis_z),
+                    format_func=lambda axis_name: format_failure_cloud_variable_label(
+                        limit_state_variable_records.get(axis_name, {}),
+                        short=False
+                    ),
+                    key=(
+                        f"failure_surface_limit_state_z_"
+                        f"e{int(selected_elem_id)}_{str(selected_limit_state)}"
+                    )
+                )
+
+        limit_state_failures = int(limit_state_failure_cloud_data.get('failures', 0) or 0)
+        limit_state_samples = int(limit_state_failure_cloud_data.get('stored_sample_count', 0) or 0)
+        limit_state_safe = max(limit_state_samples - limit_state_failures, 0)
+        render_failure_surface_3d_panel(
+            failure_cloud_data=limit_state_failure_cloud_data,
+            variable_records=limit_state_variable_records,
+            ordered_variable_names=axis_names,
+            x_variable_name=str(x_variable_name),
+            y_variable_name=str(y_variable_name),
+            z_variable_name=(
+                None if limit_state_z_variable_name is None else str(limit_state_z_variable_name)
+            ),
+            viewer_key_prefix=(
+                "failure-surface-3d-limit-state-"
+                f"e{int(selected_elem_id)}-{sanitize_dom_id(str(selected_limit_state))}"
+            ),
+            alt_text=(
+                f"Failure surface 3D U-space elemen {int(selected_elem_id)} "
+                f"fungsi batas {str(selected_limit_state)}"
+            ),
+            download_basename_prefix=(
+                f"failure-surface-3d-u-space-e{int(selected_elem_id)}-{selected_limit_state}"
+            ),
+            heading_level=heading_level,
+            intro_captions=[
+                (
+                    "Panel ini menampilkan `failure cloud` tiga dimensi untuk elemen dan "
+                    "fungsi batas terpilih pada kombinasi sumbu yang dipilih dari `Q`, `R`, "
+                    "dan variabel acak elemen terkait."
+                ),
+                (
+                    "Berbeda dari panel 2D yang bisa memakai `KDE`, panel 3D saat ini "
+                    "menggunakan surrogate `quadratic/nonlinear` lalu fallback ke "
+                    "`plane/linear` untuk mengaproksimasi boundary `g(u)=0`."
+                )
+            ],
+            unavailable_message=(
+                "Failure surface 3D belum dapat dibentuk untuk elemen-limit-state "
+                "dan kombinasi sumbu ini."
+            ),
+            unavailable_detail=(
+                f"Detail limit state: `N valid = {limit_state_samples:,}` | "
+                f"`fail = {limit_state_failures:,}` | `safe = {limit_state_safe:,}`"
+            )
         )
         return
 
@@ -14599,98 +14708,24 @@ def render_probabilistic_failure_cloud_output_section(failure_cloud_data: Dict[s
         if diagnostic_parts:
             st.caption("Diagnostik: " + " | ".join(diagnostic_parts))
 
-    st.markdown(f"{heading_level} Failure Surface 3D")
-    st.caption(
-        "Panel ini menampilkan `failure cloud` tiga dimensi pada `(u1, u2, u3)` "
-        "beserta permukaan aproksimasi batas `g(u)=0`, seperti inset perspektif 3D pada contoh."
+    unavailable_message, unavailable_detail = build_failure_surface_unavailable_message(
+        results_bundle,
+        failure_cloud_data
     )
-    st.caption(
-        "Jika data memadai, permukaan 3D dibentuk sebagai `surface kuadratik/nonlinear`. "
-        "Jika tidak, plot otomatis fallback ke bidang linear. Titik `MPP` estimasi dan "
-        "garis `beta` dari origin ke MPP juga ditampilkan pada panel ini."
-    )
-    if len(ordered_variable_names) < 3 or z_variable_name is None:
-        st.info("Plot 3D belum tersedia karena variabel acak yang tersimpan kurang dari 3.")
-        return
-
-    resolved_z_variable_name = str(z_variable_name)
-    if resolved_z_variable_name in {str(x_variable_name), str(y_variable_name)}:
-        auto_z_variable_name = get_first_distinct_failure_cloud_variable_name(
-            ordered_variable_names,
-            excluded_names=[str(x_variable_name), str(y_variable_name)]
-        )
-        if auto_z_variable_name is None:
-            st.info("Plot 3D belum dapat dibentuk karena tidak ada variabel `Z` yang berbeda.")
-            return
-        resolved_z_variable_name = str(auto_z_variable_name)
-        resolved_z_label = format_failure_cloud_variable_label(
-            variable_records.get(resolved_z_variable_name, {}),
-            short=False
-        )
-        st.caption(
-            f"Sumbu `Z` otomatis dialihkan ke `{resolved_z_label}` agar berbeda dari `X` dan `Y`."
-        )
-
-    plotly_figure_key = (
-        "failure-surface-3d-"
-        f"{sanitize_dom_id(str(x_variable_name))}-"
-        f"{sanitize_dom_id(str(y_variable_name))}-"
-        f"{sanitize_dom_id(str(resolved_z_variable_name))}"
-    )
-    failure_surface_3d_plotly_fig = build_failure_surface_3d_plotly_figure(
-        failure_cloud_data,
+    render_failure_surface_3d_panel(
+        failure_cloud_data=failure_cloud_data,
+        variable_records=variable_records,
+        ordered_variable_names=ordered_variable_names,
         x_variable_name=str(x_variable_name),
         y_variable_name=str(y_variable_name),
-        z_variable_name=str(resolved_z_variable_name)
+        z_variable_name=None if z_variable_name is None else str(z_variable_name),
+        viewer_key_prefix="failure-surface-3d",
+        alt_text="Failure surface 3D probabilistik Monte Carlo",
+        download_basename_prefix="failure-surface-3d",
+        heading_level=heading_level,
+        unavailable_message=unavailable_message,
+        unavailable_detail=unavailable_detail
     )
-    if failure_surface_3d_plotly_fig is not None:
-        st.caption(
-            "Gunakan mouse untuk eksplorasi: `drag` untuk memutar, `scroll` untuk zoom, "
-            "dan gunakan toolbar grafik untuk reset atau mode kamera lainnya."
-        )
-        st.plotly_chart(
-            failure_surface_3d_plotly_fig,
-            use_container_width=True,
-            key=plotly_figure_key,
-            config={
-                'displaylogo': False,
-                'scrollZoom': True,
-                'responsive': True
-            }
-        )
-    else:
-        if go is None:
-            st.caption(
-                "Viewer 3D interaktif belum aktif karena `plotly` tidak tersedia pada "
-                "environment ini, sehingga panel memakai fallback gambar statis."
-            )
-        failure_surface_3d_fig = build_failure_surface_3d_figure(
-            failure_cloud_data,
-            x_variable_name=str(x_variable_name),
-            y_variable_name=str(y_variable_name),
-            z_variable_name=str(resolved_z_variable_name)
-        )
-        if failure_surface_3d_fig is not None:
-            render_plot(
-                failure_surface_3d_fig,
-                interactive=True,
-                viewer_key=plotly_figure_key,
-                alt_text="Failure surface 3D probabilistik Monte Carlo",
-                viewer_height=760,
-                tight_bbox=False,
-                download_basename=(
-                    f"failure-surface-3d-{x_variable_name}-"
-                    f"{y_variable_name}-{resolved_z_variable_name}"
-                )
-            )
-        else:
-            unavailable_message, unavailable_detail = build_failure_surface_unavailable_message(
-                results_bundle,
-                failure_cloud_data
-            )
-            st.info(unavailable_message)
-            if unavailable_detail:
-                st.caption(unavailable_detail)
 
 
 def get_probabilistic_mc_convergence_state_specs() -> List[Dict[str, str]]:
